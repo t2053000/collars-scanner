@@ -1,4 +1,4 @@
-​​​​​​​​​​​​​​​​"""
+"""
 bot.py
 Telegram bot — command handlers + app factory.
 """

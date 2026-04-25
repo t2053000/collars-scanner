@@ -67,7 +67,7 @@ def main():
     schwab.initialize()
     scanner = CollarScanner(schwab)
 
-app =bot_module.build_app(os.environ["TELEGRAM_BOT_TOKEN"], scanner, schwab_client)
+    app = bot_module.build_app(os.environ["TELEGRAM_BOT_TOKEN"], scanner, schwab)
 
     logging.info("Bot starting – polling Telegram…")
     app.run_polling(allowed_updates=["message"])

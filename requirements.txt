@@ -1,0 +1,5 @@
+schwab-py>=1.5.0
+python-telegram-bot>=20.7
+PyGithub>=2.1.1
+python-dotenv>=1.0.0
+httpx>=0.26.0

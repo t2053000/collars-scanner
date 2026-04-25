@@ -1,17 +1,6 @@
 """
 scanner.py
 Scans a ticker for positive-expectancy collar opportunities.
-
-For every expiration (up to MAX_EXPIRATIONS):
-  - Sell the nearest call ABOVE current price  → collect call_mid
-  - Buy  the nearest put  BELOW current price  → pay    put_mid
-
-Edge math (per expiration):
-    net_edge      = (call_mid - put_mid) - (spot - put_strike)     [$ / share]
-    monthly_yield = net_edge / spot * (30 / dte) * 100              [%]
-
-Alert if monthly_yield > MIN_MONTHLY_YIELD_PCT.
-Skip strikes where bid or ask is <= 0 (no market).
 """
 
 import logging
@@ -20,12 +9,10 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 MAX_EXPIRATIONS       = 10
-MIN_MONTHLY_YIELD_PCT = 1.0     # > 1 % / month
+MIN_MONTHLY_YIELD_PCT = 1.0
 
 
-# ---------------------------------------------------------------------------
 def _mid_or_none(option: dict) -> float | None:
-    """Return (bid+ask)/2 – None if either side has no market."""
     bid = option.get("bid") or 0.0
     ask = option.get("ask") or 0.0
     if bid <= 0 or ask <= 0:
@@ -46,20 +33,17 @@ def _find_key(options_dict: dict, target: float) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
 class CollarScanner:
     def __init__(self, schwab_client):
         self.schwab = schwab_client
 
-    # -----------------------------------------------------------------------
     def scan_ticker(self, ticker: str) -> list[dict]:
         results = []
-
         try:
             chain = self.schwab.get_option_chain(ticker)
         except Exception as e:
             logger.error(f"[{ticker}] option chain fetch failed: {e}")
-            raise  # re-raise so caller can record it as an error
+            raise
 
         spot = chain.get("underlyingPrice")
         if not spot or spot <= 0:
@@ -106,9 +90,8 @@ class CollarScanner:
             if call_mid is None or put_mid is None:
                 continue
 
-            # ---------- math ------------------------------------------------
-            gap      = spot - put_strike                        # unprotected gap
-            net_edge = (call_mid - put_mid) - gap               # $ per share
+            gap      = spot - put_strike
+            net_edge = (call_mid - put_mid) - gap
             exp_dt   = datetime.strptime(exp_date, "%Y-%m-%d")
             dte      = (exp_dt - datetime.now()).days
             if dte < 1:
@@ -132,7 +115,6 @@ class CollarScanner:
 
         return results
 
-    # -----------------------------------------------------------------------
     @staticmethod
     def format_hit(r: dict) -> str:
         return (
@@ -144,14 +126,18 @@ class CollarScanner:
         )
 
     @staticmethod
-    def format_summary(all_hits: list[dict], scanned: int, errors: list[str]) -> list[str]:
-        """One-shot summary, sorted by monthly_yield_pct desc, chunked <4096 chars."""
+    def format_summary(all_hits, scanned, successful, errors):
         header = (
             f"🔎 *Collar Scan Complete*\n"
-            f"Scanned {scanned} tickers → *{len(all_hits)} opportunities*\n"
+            f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
+            f"Opportunities: *{len(all_hits)}*\n"
         )
         if errors:
-            header += f"⚠️ Errors on: {', '.join(errors)}\n"
+            err_block = "\n".join(f"  • {e}" for e in errors)
+            if len(err_block) > 1500:
+                tickers_only = ", ".join(e.split(":")[0] for e in errors)
+                err_block = f"  {tickers_only}\n_(use_ `/logs` _for details)_"
+            header += f"\n⚠️ *Errors:*\n{err_block}\n"
         header += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
         if not all_hits:

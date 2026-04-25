@@ -174,4 +174,3 @@ def build_app(telegram_token: str, scanner: CollarScanner) -> Application:
     app.add_handler(CommandHandler("scan",   cmd_scan))
     app.add_handler(CommandHandler("logs",   cmd_logs))
     return app
-

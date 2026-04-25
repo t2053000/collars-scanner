@@ -1,20 +1,11 @@
-"""
+​​​​​​​​​​​​​​​​"""
 bot.py
 Telegram bot — command handlers + app factory.
-
-Commands
---------
-/start, /help          – help text
-/scan                  – scan every ticker in the GitHub list (parallel),
-                         reply with a single summary sorted by monthly-yield %
-/list                  – list current tickers
-/add  AAPL TSLA ...    – add ticker(s) to the GitHub list
-/remove AAPL ...       – remove ticker(s) from the GitHub list
-/whoami                – show your Telegram user-id (useful for whitelisting)
 """
 
 import asyncio
 import logging
+from collections import deque
 from functools import wraps
 
 from telegram import Update
@@ -26,10 +17,11 @@ from scanner import CollarScanner
 
 logger = logging.getLogger(__name__)
 
-SCAN_CONCURRENCY = 5      # Schwab allows ~120 req/min → 5 parallel is safe
+SCAN_CONCURRENCY = 5
+
+_LAST_ERRORS: deque = deque(maxlen=30)
 
 
-# ---------------------------------------------------------------------------
 def authorized_only(func):
     @wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -45,7 +37,6 @@ def authorized_only(func):
     return wrapper
 
 
-# ---------------------------------------------------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Collar Scanner Bot*\n\n"
@@ -62,6 +53,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/list` – show current tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
+        "`/logs` – show recent scan errors\n"
         "`/whoami` – show your Telegram ID",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -105,6 +97,20 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
+async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _LAST_ERRORS:
+        await update.message.reply_text("_No recent errors._", parse_mode=ParseMode.MARKDOWN)
+        return
+    body = "\n".join(_LAST_ERRORS)
+    if len(body) > 3800:
+        body = body[-3800:]
+    await update.message.reply_text(
+        "*Recent error details (most recent last):*\n```\n" + body + "\n```",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+@authorized_only
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tickers = github_store.get_tickers()
     if not tickers:
@@ -121,25 +127,40 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_hits: list[dict] = []
     errors:   list[str]  = []
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+    successful = 0
 
     async def scan_one(tk: str):
+        nonlocal successful
         async with sem:
             try:
                 hits = await loop.run_in_executor(None, scanner.scan_ticker, tk)
                 all_hits.extend(hits)
-            except Exception:
+                ok = True
+            except Exception as e:
                 logger.exception(f"scan error for {tk}")
-                errors.append(tk)
+                err_type = type(e).__name__
+                short    = str(e)[:120].replace("\n", " ")
+                full     = str(e)[:400].replace("\n", " ")
+                errors.append(f"{tk}: {err_type} – {short}")
+                _LAST_ERRORS.append(f"{tk}: {err_type} – {full}")
+                ok = False
+
+        if ok:
+            successful += 1
 
     await asyncio.gather(*(scan_one(t) for t in tickers))
 
-    messages = CollarScanner.format_summary(all_hits, len(tickers), errors)
+    messages = CollarScanner.format_summary(
+        all_hits=all_hits,
+        scanned=len(tickers),
+        successful=successful,
+        errors=errors,
+    )
     await status_msg.edit_text(messages[0], parse_mode=ParseMode.MARKDOWN)
     for extra in messages[1:]:
         await update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)
 
 
-# ---------------------------------------------------------------------------
 def build_app(telegram_token: str, scanner: CollarScanner) -> Application:
     app = Application.builder().token(telegram_token).build()
     app.bot_data["scanner"] = scanner
@@ -151,4 +172,6 @@ def build_app(telegram_token: str, scanner: CollarScanner) -> Application:
     app.add_handler(CommandHandler("add",    cmd_add))
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("scan",   cmd_scan))
+    app.add_handler(CommandHandler("logs",   cmd_logs))
     return app
+

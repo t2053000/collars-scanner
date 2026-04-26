@@ -1,6 +1,23 @@
 """
 scanner.py
 Scans a ticker for positive-expectancy collar opportunities.
+
+For each ticker, for each of the next 10 expirations (same expiry both legs):
+  - Sell nearest call strike ABOVE spot
+  - Buy  nearest put  strike BELOW spot
+  - Skip legs with no market (bid<=0 or ask<=0)
+
+Three yearly-yield scenarios are computed:
+  net_premium = call_mid - put_mid
+  POS = if stock >= call_strike at expiry
+        ((call_strike - spot) + net_premium) / spot * 365/dte * 100
+  NEU = if stock unchanged at expiry
+        net_premium / spot * 365/dte * 100
+  NEG = if stock <= put_strike at expiry
+        ((put_strike - spot) + net_premium) / spot * 365/dte * 100
+
+Filter: keep hits where NEG yearly > MIN_NEG_YEARLY_PCT (= 12%, ~1%/mo).
+Sort:   by NEG yearly descending.
 """
 
 import logging
@@ -8,8 +25,8 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-MAX_EXPIRATIONS       = 10
-MIN_MONTHLY_YIELD_PCT = 1.0
+MAX_EXPIRATIONS     = 10
+MIN_NEG_YEARLY_PCT  = 12.0   # roughly 1% per month
 
 
 def _mid_or_none(option: dict) -> float | None:
@@ -20,11 +37,11 @@ def _mid_or_none(option: dict) -> float | None:
     return (bid + ask) / 2.0
 
 
-def _find_key(options_dict: dict, target: float) -> str | None:
+def _find_key(d: dict, target: float) -> str | None:
     for fmt in (str(target), f"{target:.1f}", f"{target:.2f}", f"{int(target)}"):
-        if fmt in options_dict:
+        if fmt in d:
             return fmt
-    for k in options_dict:
+    for k in d:
         try:
             if abs(float(k) - target) < 0.01:
                 return k
@@ -47,7 +64,6 @@ class CollarScanner:
 
         spot = chain.get("underlyingPrice")
         if not spot or spot <= 0:
-            logger.warning(f"[{ticker}] no underlying price.")
             return results
 
         call_map: dict = chain.get("callExpDateMap", {})
@@ -75,13 +91,13 @@ class CollarScanner:
             call_strike = call_strikes[0]
             put_strike  = put_strikes[0]
 
-            call_key = _find_key(calls, call_strike)
-            put_key  = _find_key(puts,  put_strike)
-            if not call_key or not put_key:
+            ck = _find_key(calls, call_strike)
+            pk = _find_key(puts,  put_strike)
+            if not ck or not pk:
                 continue
 
-            call_contracts = calls[call_key]
-            put_contracts  = puts[put_key]
+            call_contracts = calls[ck]
+            put_contracts  = puts[pk]
             if not call_contracts or not put_contracts:
                 continue
 
@@ -90,16 +106,19 @@ class CollarScanner:
             if call_mid is None or put_mid is None:
                 continue
 
-            gap      = spot - put_strike
-            net_edge = (call_mid - put_mid) - gap
-            exp_dt   = datetime.strptime(exp_date, "%Y-%m-%d")
-            dte      = (exp_dt - datetime.now()).days
+            exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            dte    = (exp_dt - datetime.now()).days
             if dte < 1:
                 continue
 
-            monthly_yield_pct = (net_edge / spot) * (30.0 / dte) * 100.0
+            net_premium = call_mid - put_mid
+            ann_factor  = 365.0 / dte
 
-            if monthly_yield_pct > MIN_MONTHLY_YIELD_PCT:
+            pos_yearly = ((call_strike - spot) + net_premium) / spot * ann_factor * 100.0
+            neu_yearly = net_premium                          / spot * ann_factor * 100.0
+            neg_yearly = ((put_strike  - spot) + net_premium) / spot * ann_factor * 100.0
+
+            if neg_yearly > MIN_NEG_YEARLY_PCT:
                 results.append(dict(
                     ticker=ticker,
                     exp_date=exp_date,
@@ -109,8 +128,10 @@ class CollarScanner:
                     call_mid=round(call_mid, 2),
                     put_strike=put_strike,
                     put_mid=round(put_mid, 2),
-                    net_edge=round(net_edge, 2),
-                    monthly_yield_pct=round(monthly_yield_pct, 2),
+                    net_premium=round(net_premium, 2),
+                    pos_yearly=round(pos_yearly, 1),
+                    neu_yearly=round(neu_yearly, 1),
+                    neg_yearly=round(neg_yearly, 1),
                 ))
 
         return results
@@ -118,11 +139,11 @@ class CollarScanner:
     @staticmethod
     def format_hit(r: dict) -> str:
         return (
-            f"*{r['ticker']}*  @ ${r['spot']}   —   *{r['monthly_yield_pct']}%/mo*\n"
+            f"*{r['ticker']}*  @ ${r['spot']}\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
             f"  📞 sell C ${r['call_strike']} @ ${r['call_mid']}\n"
             f"  🛡️ buy  P ${r['put_strike']} @ ${r['put_mid']}\n"
-            f"  💰 edge ${r['net_edge']}/sh"
+            f"  📈 POS/NEU/NEG yearly:  *{r['pos_yearly']}% / {r['neu_yearly']}% / {r['neg_yearly']}%*"
         )
 
     @staticmethod
@@ -130,7 +151,7 @@ class CollarScanner:
         header = (
             f"🔎 *Collar Scan Complete*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
-            f"Opportunities: *{len(all_hits)}*\n"
+            f"Opportunities (NEG yearly > {MIN_NEG_YEARLY_PCT:g}%): *{len(all_hits)}*\n"
         )
         if errors:
             err_block = "\n".join(f"  • {e}" for e in errors)
@@ -143,7 +164,7 @@ class CollarScanner:
         if not all_hits:
             return [header + "_No positive-edge collars found._"]
 
-        all_hits.sort(key=lambda r: r["monthly_yield_pct"], reverse=True)
+        all_hits.sort(key=lambda r: r["neg_yearly"], reverse=True)
 
         chunks, current = [], header
         for hit in all_hits:

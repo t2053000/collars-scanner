@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars + token refresh.
+Telegram bot — collars + spreads + token refresh.
 """
 
 import asyncio
@@ -14,6 +14,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 
 import github_store
 from scanner import CollarScanner
+from spreads import SpreadScanner
 
 logger = logging.getLogger(__name__)
 
@@ -38,9 +39,9 @@ def authorized_only(func):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *Collar Scanner Bot*\n\n"
-        "`/scan` – find positive-edge collars\n"
-        "`/refresh_token` – refresh the Schwab token\n"
+        "👋 *Options Scanner Bot*\n\n"
+        "`/scan` – positive-edge collars\n"
+        "`/spreads` – cheap bull-call & bear-put spreads\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -49,13 +50,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Commands*\n"
-        "`/scan` – scan watchlist for collars\n"
+        "`/scan` – collar scan\n"
+        "`/spreads` – cheap vertical debit spreads\n"
         "`/list` – show tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
-        "`/logs` – recent scan errors\n"
-        "`/refresh_token` – start Schwab token refresh\n"
-        "`/submit_token URL` – complete refresh\n"
+        "`/logs` – recent errors\n"
         "`/whoami` – your Telegram ID",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -112,8 +112,7 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@authorized_only
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
     tickers = github_store.get_tickers()
     if not tickers:
         await update.message.reply_text("_Watchlist is empty – add some tickers first._",
@@ -121,10 +120,9 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     status_msg = await update.message.reply_text(
-        f"🔎 Scanning {len(tickers)} tickers…", parse_mode=ParseMode.MARKDOWN
+        f"{label_emoji} Scanning {len(tickers)} tickers…", parse_mode=ParseMode.MARKDOWN
     )
 
-    scanner: CollarScanner = context.application.bot_data["scanner"]
     loop = asyncio.get_running_loop()
     all_hits: list[dict] = []
     errors:   list[str]  = []
@@ -151,7 +149,7 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await asyncio.gather(*(scan_one(t) for t in tickers))
 
-    messages = CollarScanner.format_summary(
+    messages = format_summary_fn(
         all_hits=all_hits,
         scanned=len(tickers),
         successful=successful,
@@ -162,77 +160,32 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)
 
 
-# ---------------------------------------------------------------------------
-# Token refresh
-# ---------------------------------------------------------------------------
-
 @authorized_only
-async def cmd_refresh_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    schwab_client = context.application.bot_data["schwab_client"]
-    auth_url = schwab_client.build_authorize_url()
-    await update.message.reply_text(
-        "🔐 *Schwab Token Refresh*\n\n"
-        "1️⃣ Tap this URL to open Schwab login:\n"
-        f"{auth_url}\n\n"
-        "2️⃣ Log in with your Schwab brokerage account → click *Allow*\n\n"
-        "3️⃣ Browser redirects to `https://127.0.0.1/?code=...` "
-        "(page won't load — that's fine!)\n\n"
-        "4️⃣ Copy the *entire* redirected URL from your browser address bar\n\n"
-        "5️⃣ Send it back to me as:\n"
-        "`/submit_token <paste URL>`",
-        parse_mode=ParseMode.MARKDOWN,
-        disable_web_page_preview=True,
-    )
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scanner: CollarScanner = context.application.bot_data["collar_scanner"]
+    await _run_scan(update, context, scanner, "🔎", CollarScanner.format_summary)
 
 
 @authorized_only
-async def cmd_submit_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    schwab_client = context.application.bot_data["schwab_client"]
-    text = update.message.text or ""
-    # Strip the command itself; everything after the first whitespace is the URL
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
-        await update.message.reply_text(
-            "Usage: `/submit_token https://127.0.0.1/?code=...`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-    redirect_url = parts[1].strip()
-
-    try:
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, schwab_client.exchange_code_for_token, redirect_url
-        )
-    except Exception as e:
-        logger.exception("token exchange failed")
-        await update.message.reply_text(
-            f"❌ Token exchange failed:\n`{type(e).__name__}: {str(e)[:300]}`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    await update.message.reply_text(
-        "✅ *Token refreshed successfully!*\n"
-        "Try `/scan` to confirm everything works.",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+async def cmd_spreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scanner: SpreadScanner = context.application.bot_data["spread_scanner"]
+    await _run_scan(update, context, scanner, "💸", SpreadScanner.format_summary)
 
 
-# ---------------------------------------------------------------------------
-def build_app(telegram_token: str, scanner: CollarScanner, schwab_client) -> Application:
+def build_app(telegram_token: str,
+              collar_scanner: CollarScanner,
+              spread_scanner: SpreadScanner) -> Application:
     app = Application.builder().token(telegram_token).build()
-    app.bot_data["scanner"]       = scanner
-    app.bot_data["schwab_client"] = schwab_client
+    app.bot_data["collar_scanner"] = collar_scanner
+    app.bot_data["spread_scanner"] = spread_scanner
 
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("help",          cmd_help))
-    app.add_handler(CommandHandler("whoami",        cmd_whoami))
-    app.add_handler(CommandHandler("list",          cmd_list))
-    app.add_handler(CommandHandler("add",           cmd_add))
-    app.add_handler(CommandHandler("remove",        cmd_remove))
-    app.add_handler(CommandHandler("scan",          cmd_scan))
-    app.add_handler(CommandHandler("logs",          cmd_logs))
-    app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
-    app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("whoami",  cmd_whoami))
+    app.add_handler(CommandHandler("list",    cmd_list))
+    app.add_handler(CommandHandler("add",     cmd_add))
+    app.add_handler(CommandHandler("remove",  cmd_remove))
+    app.add_handler(CommandHandler("scan",    cmd_scan))
+    app.add_handler(CommandHandler("spreads", cmd_spreads))
+    app.add_handler(CommandHandler("logs",    cmd_logs))
     return app

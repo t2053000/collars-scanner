@@ -1,11 +1,11 @@
 """
 bot.py
-Telegram bot — collars + spreads + token refresh.
+Telegram bot — collars + spreads (debug mode).
 """
 
 import asyncio
 import logging
-from collections import deque
+from collections import Counter, deque
 from functools import wraps
 
 from telegram import Update
@@ -115,12 +115,15 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
     tickers = github_store.get_tickers()
     if not tickers:
-        await update.message.reply_text("_Watchlist is empty – add some tickers first._",
-                                        parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "_Watchlist is empty – add some tickers first._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
         return
 
     status_msg = await update.message.reply_text(
-        f"{label_emoji} Scanning {len(tickers)} tickers…", parse_mode=ParseMode.MARKDOWN
+        f"{label_emoji} Scanning {len(tickers)} tickers…",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
     loop = asyncio.get_running_loop()
@@ -128,19 +131,27 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
     errors:   list[str]  = []
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
     successful = 0
+    debug_totals: Counter = Counter()
 
     async def scan_one(tk: str):
         nonlocal successful
         async with sem:
             try:
-                hits = await loop.run_in_executor(None, scanner.scan_ticker, tk)
+                result = await loop.run_in_executor(
+                    None, scanner.scan_ticker, tk
+                )
+                if isinstance(result, tuple):
+                    hits, debug = result
+                    debug_totals.update(debug)
+                else:
+                    hits = result
                 all_hits.extend(hits)
                 ok = True
             except Exception as e:
                 logger.exception(f"scan error for {tk}")
                 err_type = type(e).__name__
-                short    = str(e)[:120].replace("\n", " ")
-                full     = str(e)[:400].replace("\n", " ")
+                short = str(e)[:120].replace("\n", " ")
+                full  = str(e)[:400].replace("\n", " ")
                 errors.append(f"{tk}: {err_type} – {short}")
                 _LAST_ERRORS.append(f"{tk}: {err_type} – {full}")
                 ok = False
@@ -149,12 +160,20 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
 
     await asyncio.gather(*(scan_one(t) for t in tickers))
 
-    messages = format_summary_fn(
+    kwargs = dict(
         all_hits=all_hits,
         scanned=len(tickers),
         successful=successful,
         errors=errors,
     )
+    if debug_totals:
+        kwargs["debug_totals"] = dict(debug_totals)
+    try:
+        messages = format_summary_fn(**kwargs)
+    except TypeError:
+        kwargs.pop("debug_totals", None)
+        messages = format_summary_fn(**kwargs)
+
     await status_msg.edit_text(messages[0], parse_mode=ParseMode.MARKDOWN)
     for extra in messages[1:]:
         await update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)

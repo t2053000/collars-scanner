@@ -1,4 +1,4 @@
-​​​​​​​​​​​​​​​​"""
+"""
 scanner.py
 Collar scanner — uses REALISTIC fills (sell call at bid, buy put at ask)
 to avoid false positives from mid-price math.
@@ -14,7 +14,7 @@ Three yearly-yield scenarios (using realistic net_premium):
   NEU = net_premium                          / spot * 365/dte * 100
   NEG = ((put_strike  - spot) + net_premium) / spot * 365/dte * 100
 
-Filter: keep hits where NEG yearly > MIN_NEG_YEARLY_PCT (= 12%, ~1%/mo).
+Filter: keep hits where NEG yearly > MIN_NEG_YEARLY_PCT (= 6%, ~0.5%/mo).
 Sort:   by NEG yearly descending.
 """
 
@@ -24,7 +24,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 MAX_EXPIRATIONS     = 10
-MIN_NEG_YEARLY_PCT  = 12.0
+MIN_NEG_YEARLY_PCT  = 6.0
 
 
 def _has_market(option: dict) -> bool:

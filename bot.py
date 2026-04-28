@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars + spreads (debug mode).
+Telegram bot — collars + spreads + deep-ITM buy-writes.
 """
 
 import asyncio
@@ -13,8 +13,9 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import github_store
-from scanner import CollarScanner
-from spreads import SpreadScanner
+from scanner  import CollarScanner
+from spreads  import SpreadScanner
+from deepcall import DeepCallScanner, clamp_cushion, DEFAULT_CUSHION_PCT, MIN_CUSHION_PCT, MAX_CUSHION_PCT
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Options Scanner Bot*\n\n"
         "`/scan` – positive-edge collars\n"
         "`/spreads` – cheap bull-call & bear-put spreads\n"
+        "`/deepcall [N]` – deep-ITM buy-writes (N=cushion%, default 30)\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -52,6 +54,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Commands*\n"
         "`/scan` – collar scan\n"
         "`/spreads` – cheap vertical debit spreads\n"
+        "`/deepcall [N]` – deep-ITM buy-write, N=min cushion% (default 30)\n"
         "`/list` – show tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
@@ -112,7 +115,8 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
+async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
+                    scan_kwargs=None, summary_kwargs=None):
     tickers = github_store.get_tickers()
     if not tickers:
         await update.message.reply_text(
@@ -132,13 +136,14 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
     successful = 0
     debug_totals: Counter = Counter()
+    scan_kwargs = scan_kwargs or {}
 
     async def scan_one(tk: str):
         nonlocal successful
         async with sem:
             try:
                 result = await loop.run_in_executor(
-                    None, scanner.scan_ticker, tk
+                    None, lambda: scanner.scan_ticker(tk, **scan_kwargs)
                 )
                 if isinstance(result, tuple):
                     hits, debug = result
@@ -166,13 +171,20 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn):
         successful=successful,
         errors=errors,
     )
+    if summary_kwargs:
+        kwargs.update(summary_kwargs)
     if debug_totals:
         kwargs["debug_totals"] = dict(debug_totals)
     try:
         messages = format_summary_fn(**kwargs)
     except TypeError:
         kwargs.pop("debug_totals", None)
-        messages = format_summary_fn(**kwargs)
+        try:
+            messages = format_summary_fn(**kwargs)
+        except TypeError:
+            for k in list(summary_kwargs or {}):
+                kwargs.pop(k, None)
+            messages = format_summary_fn(**kwargs)
 
     await status_msg.edit_text(messages[0], parse_mode=ParseMode.MARKDOWN)
     for extra in messages[1:]:
@@ -191,20 +203,58 @@ async def cmd_spreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_scan(update, context, scanner, "💸", SpreadScanner.format_summary)
 
 
+@authorized_only
+async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scanner: DeepCallScanner = context.application.bot_data["deepcall_scanner"]
+
+    cushion_pct = DEFAULT_CUSHION_PCT
+    notice = ""
+    if context.args:
+        try:
+            requested = float(context.args[0])
+            clamped, was_clamped = clamp_cushion(requested)
+            cushion_pct = clamped
+            if was_clamped:
+                notice = (
+                    f"⚠️ Cushion `{requested}` outside range "
+                    f"`{MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}` — using *{clamped:g}%*\n\n"
+                )
+        except ValueError:
+            await update.message.reply_text(
+                f"Usage: `/deepcall [N]`  where N is cushion% "
+                f"({MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}, default {DEFAULT_CUSHION_PCT:g}).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    if notice:
+        await update.message.reply_text(notice, parse_mode=ParseMode.MARKDOWN)
+
+    await _run_scan(
+        update, context, scanner, "🛡️", DeepCallScanner.format_summary,
+        scan_kwargs={"cushion_pct": cushion_pct},
+        summary_kwargs={"cushion_pct": cushion_pct},
+    )
+
+
 def build_app(telegram_token: str,
               collar_scanner: CollarScanner,
-              spread_scanner: SpreadScanner) -> Application:
+              spread_scanner: SpreadScanner,
+              deepcall_scanner: DeepCallScanner) -> Application:
     app = Application.builder().token(telegram_token).build()
-    app.bot_data["collar_scanner"] = collar_scanner
-    app.bot_data["spread_scanner"] = spread_scanner
+    app.bot_data["collar_scanner"]   = collar_scanner
+    app.bot_data["spread_scanner"]   = spread_scanner
+    app.bot_data["deepcall_scanner"] = deepcall_scanner
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_help))
-    app.add_handler(CommandHandler("whoami",  cmd_whoami))
-    app.add_handler(CommandHandler("list",    cmd_list))
-    app.add_handler(CommandHandler("add",     cmd_add))
-    app.add_handler(CommandHandler("remove",  cmd_remove))
-    app.add_handler(CommandHandler("scan",    cmd_scan))
-    app.add_handler(CommandHandler("spreads", cmd_spreads))
-    app.add_handler(CommandHandler("logs",    cmd_logs))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("whoami",    cmd_whoami))
+    app.add_handler(CommandHandler("list",      cmd_list))
+    app.add_handler(CommandHandler("add",       cmd_add))
+    app.add_handler(CommandHandler("remove",    cmd_remove))
+    app.add_handler(CommandHandler("scan",      cmd_scan))
+    app.add_handler(CommandHandler("spreads",   cmd_spreads))
+    app.add_handler(CommandHandler("deepcall",  cmd_deepcall))
+    app.add_handler(CommandHandler("deepcalls", cmd_deepcall))
+    app.add_handler(CommandHandler("logs",      cmd_logs))
     return app

@@ -13,6 +13,7 @@ load_dotenv()
 from schwab_client import SchwabClient
 from scanner       import CollarScanner
 from spreads       import SpreadScanner
+from deepcall      import DeepCallScanner
 import bot as bot_module
 
 
@@ -52,13 +53,15 @@ def main():
     schwab = SchwabClient()
     schwab.initialize()
 
-    collar_scanner = CollarScanner(schwab)
-    spread_scanner = SpreadScanner(schwab)
+    collar_scanner   = CollarScanner(schwab)
+    spread_scanner   = SpreadScanner(schwab)
+    deepcall_scanner = DeepCallScanner(schwab)
 
     app = bot_module.build_app(
         os.environ["TELEGRAM_BOT_TOKEN"],
         collar_scanner,
         spread_scanner,
+        deepcall_scanner,
     )
 
     log.info("Bot starting – polling Telegram…")

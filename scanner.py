@@ -24,7 +24,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 MAX_EXPIRATIONS     = 10
-MIN_NEG_YEARLY_PCT  = 3.0
+MIN_NEG_YEARLY_PCT  = 2.0
 
 
 def _has_market(option: dict) -> bool:

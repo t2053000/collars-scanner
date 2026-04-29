@@ -1,15 +1,19 @@
 """
 scanner.py
-Collar scanner — uses REALISTIC fills (sell call at bid, buy put at ask)
-to avoid false positives from mid-price math.
+Collar scanner — uses MID-ADJUSTED fills (15% of spread away from mid,
+in the conservative direction) for better fill probability than mid
+while still being more realistic than ask/bid.
+
+Sell call:  receive  mid_call - 0.15 * (ask_call - bid_call)
+Buy  put:   pay      mid_put  + 0.15 * (ask_put  - bid_put)
 
 For each ticker, for each of the next 10 expirations:
-  - Sell nearest call strike ABOVE spot   → receive call_bid
-  - Buy  nearest put  strike BELOW spot   → pay     put_ask
+  - Sell nearest call strike ABOVE spot
+  - Buy  nearest put  strike BELOW spot
   - Skip legs with no market (bid<=0 or ask<=0)
 
-Three yearly-yield scenarios (using realistic net_premium):
-  net_premium = call_bid - put_ask
+Three yearly-yield scenarios:
+  net_premium = call_credit - put_cost
   POS = ((call_strike - spot) + net_premium) / spot * 365/dte * 100
   NEU = net_premium                          / spot * 365/dte * 100
   NEG = ((put_strike  - spot) + net_premium) / spot * 365/dte * 100
@@ -24,7 +28,8 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 MAX_EXPIRATIONS     = 10
-MIN_NEG_YEARLY_PCT  = 2.0
+MIN_NEG_YEARLY_PCT  = 6.0
+MID_ADJUST_FRAC     = 0.15   # nudge from mid toward bid/ask by 15% of spread
 
 
 def _has_market(option: dict) -> bool:
@@ -39,6 +44,30 @@ def _bid(option: dict) -> float:
 
 def _ask(option: dict) -> float:
     return float(option.get("ask") or 0.0)
+
+
+def _sell_price_adjusted(option: dict) -> float:
+    """
+    What you'd realistically receive when SELLING the option.
+    Start at mid, then move toward the bid by MID_ADJUST_FRAC of the spread.
+    """
+    bid = _bid(option)
+    ask = _ask(option)
+    mid = (bid + ask) / 2.0
+    spread = ask - bid
+    return mid - MID_ADJUST_FRAC * spread
+
+
+def _buy_price_adjusted(option: dict) -> float:
+    """
+    What you'd realistically pay when BUYING the option.
+    Start at mid, then move toward the ask by MID_ADJUST_FRAC of the spread.
+    """
+    bid = _bid(option)
+    ask = _ask(option)
+    mid = (bid + ask) / 2.0
+    spread = ask - bid
+    return mid + MID_ADJUST_FRAC * spread
 
 
 def _find_key(d: dict, target: float) -> str | None:
@@ -111,11 +140,9 @@ class CollarScanner:
             if not _has_market(call_opt) or not _has_market(put_opt):
                 continue
 
-            # REALISTIC FILLS:
-            # Selling the call → you receive the BID
-            # Buying  the put  → you pay     the ASK
-            call_credit = _bid(call_opt)
-            put_cost    = _ask(put_opt)
+            # MID-ADJUSTED FILLS:
+            call_credit = _sell_price_adjusted(call_opt)
+            put_cost    = _buy_price_adjusted(put_opt)
 
             exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
             dte    = (exp_dt - datetime.now()).days
@@ -152,8 +179,8 @@ class CollarScanner:
         return (
             f"*{r['ticker']}*  @ ${r['spot']}\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
-            f"  📞 sell C ${r['call_strike']} @ ${r['call_credit']} (bid)\n"
-            f"  🛡️ buy  P ${r['put_strike']} @ ${r['put_cost']} (ask)\n"
+            f"  📞 sell C ${r['call_strike']} @ ${r['call_credit']} (mid-15%)\n"
+            f"  🛡️ buy  P ${r['put_strike']} @ ${r['put_cost']} (mid+15%)\n"
             f"  💰 net premium: *${r['net_premium']}*\n"
             f"  📈 POS/NEU/NEG yearly:  *{r['pos_yearly']}% / {r['neu_yearly']}% / {r['neg_yearly']}%*"
         )
@@ -163,7 +190,7 @@ class CollarScanner:
         header = (
             f"🔎 *Collar Scan Complete*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
-            f"Realistic-fill opportunities (NEG yearly > {MIN_NEG_YEARLY_PCT:g}%): *{len(all_hits)}*\n"
+            f"Mid-adjusted-fill opportunities (NEG yearly > {MIN_NEG_YEARLY_PCT:g}%): *{len(all_hits)}*\n"
         )
         if errors:
             err_block = "\n".join(f"  • {e}" for e in errors)
@@ -174,7 +201,7 @@ class CollarScanner:
         header += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
         if not all_hits:
-            return [header + "_No realistic-fill collars found._"]
+            return [header + "_No mid-adjusted-fill collars found._"]
 
         all_hits.sort(key=lambda r: r["neg_yearly"], reverse=True)
 

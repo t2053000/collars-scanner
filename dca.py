@@ -1,9 +1,10 @@
 """
 dca.py
-Dividend Collar Arbitrage scanner.
+Dividend Collar Arbitrage scanner — debug mode, OI requirement removed.
 """
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
@@ -13,7 +14,6 @@ DTE_MAX              = 730
 MIN_STRIKE_PCT_SPOT  = 0.80
 MAX_STRIKE_PCT_SPOT  = 1.00
 MID_ADJUST_FRAC      = 0.15
-MIN_OI               = 1
 
 
 _FREQ_DAYS = {
@@ -79,6 +79,7 @@ class DcaScanner:
 
     def scan_ticker(self, ticker):
         results = []
+        debug = Counter()
         ticker = ticker.upper()
         freq = self.ticker_freqs.get(ticker, "Q")
 
@@ -90,7 +91,8 @@ class DcaScanner:
 
         spot = chain.get("underlyingPrice")
         if not spot or spot <= 0:
-            return results
+            debug["no_spot"] += 1
+            return results, debug
 
         try:
             fundamentals = self.schwab.get_fundamentals(ticker)
@@ -104,7 +106,8 @@ class DcaScanner:
             annual_div = (div_yield / 100.0) * spot if div_yield > 1 else div_yield * spot
 
         if annual_div <= 0:
-            return results
+            debug["no_dividend_data"] += 1
+            return results, debug
 
         last_ex_div_str = fundamentals.get("exDividendDate")
         last_ex_div = None
@@ -117,7 +120,8 @@ class DcaScanner:
         call_map = chain.get("callExpDateMap", {})
         put_map = chain.get("putExpDateMap", {})
         if not call_map or not put_map:
-            return results
+            debug["empty_chain"] += 1
+            return results, debug
 
         strike_floor = spot * MIN_STRIKE_PCT_SPOT
         strike_ceil = spot * MAX_STRIKE_PCT_SPOT
@@ -132,6 +136,7 @@ class DcaScanner:
                 continue
             dte = (exp_dt - datetime.utcnow()).days
             if dte < DTE_MIN or dte > DTE_MAX:
+                debug["dte_out_of_range"] += 1
                 continue
 
             ck = next((k for k in call_map if k.startswith(exp_date + ":")), None)
@@ -152,19 +157,23 @@ class DcaScanner:
                     pass
 
             for strike_str in common_strikes:
+                debug["candidates"] += 1
                 strike = float(strike_str)
 
                 call_contracts = calls.get(strike_str, [])
                 put_contracts = puts.get(strike_str, [])
                 if not call_contracts or not put_contracts:
+                    debug["empty_contracts"] += 1
                     continue
 
                 call_opt = call_contracts[0]
                 put_opt = put_contracts[0]
 
-                if not _has_market(call_opt) or not _has_market(put_opt):
+                if not _has_market(call_opt):
+                    debug["call_no_market"] += 1
                     continue
-                if _oi(call_opt) < MIN_OI or _oi(put_opt) < MIN_OI:
+                if not _has_market(put_opt):
+                    debug["put_no_market"] += 1
                     continue
 
                 call_credit = _sell_price(call_opt)
@@ -172,6 +181,7 @@ class DcaScanner:
 
                 net_premium = call_credit - put_cost
                 if net_premium <= 0:
+                    debug["non_positive_net"] += 1
                     continue
 
                 intrinsic = max(spot - strike, 0)
@@ -181,10 +191,12 @@ class DcaScanner:
 
                 num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
                 if num_ex_divs == 0:
+                    debug["no_ex_div_in_window"] += 1
                     continue
 
                 score = (annual_div / call_time_value) * num_ex_divs
 
+                debug["passed"] += 1
                 results.append(dict(
                     ticker=ticker,
                     exp_date=exp_date,
@@ -199,9 +211,11 @@ class DcaScanner:
                     num_ex_divs=num_ex_divs,
                     freq=freq,
                     score=round(score, 2),
+                    call_oi=_oi(call_opt),
+                    put_oi=_oi(put_opt),
                 ))
 
-        return results
+        return results, debug
 
     @staticmethod
     def format_hit(r):
@@ -213,17 +227,33 @@ class DcaScanner:
             f"  💵 Net premium credit: *${r['net_premium']}*/sh\n"
             f"  ⏳ Call time value: ${r['call_time_value']}\n"
             f"  💸 Annual div: ${r['annual_div']} · {r['num_ex_divs']} ex-divs in option life\n"
+            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
             f"  🎯 Score: *{r['score']}*"
         )
 
     @staticmethod
-    def format_summary(all_hits, scanned, successful, errors):
+    def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
         header = (
             f"💰 *Dividend Collar Arbitrage Scan*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
             f"Same-strike collars (80-100% of spot, {DTE_MIN}-{DTE_MAX}d, net credit > 0)\n"
-            f"Opportunities: *{len(all_hits)}*\n"
         )
+        if debug_totals:
+            d = debug_totals
+            header += (
+                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
+                f"  · empty contracts:   {d.get('empty_contracts', 0):,}\n"
+                f"  · call no market:    {d.get('call_no_market', 0):,}\n"
+                f"  · put no market:     {d.get('put_no_market', 0):,}\n"
+                f"  · non-positive net:  {d.get('non_positive_net', 0):,}\n"
+                f"  · no ex-div in window:{d.get('no_ex_div_in_window', 0):,}\n"
+                f"  · ✅ passed:         {d.get('passed', 0):,}\n"
+                f"  · DTE skipped (informational): {d.get('dte_out_of_range', 0):,}\n"
+                f"  · no spot price (tickers): {d.get('no_spot', 0):,}\n"
+                f"  · no div data (tickers):   {d.get('no_dividend_data', 0):,}\n"
+                f"  · empty chain (tickers):   {d.get('empty_chain', 0):,}\n"
+            )
+        header += f"\nOpportunities: *{len(all_hits)}*\n"
         if errors:
             err_block = "\n".join(f"  • {e}" for e in errors[:20])
             if len(err_block) > 1500:

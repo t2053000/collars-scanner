@@ -1,6 +1,6 @@
 """
 dca.py
-Dividend Collar Arbitrage scanner — debug mode, OI requirement removed.
+Dividend Collar Arbitrage scanner — fallback when ex-div date missing.
 """
 
 import logging
@@ -58,13 +58,22 @@ def _buy_price(option):
 
 
 def _project_ex_div_dates(last_ex_div, freq, until):
-    if not last_ex_div:
-        return 0
+    """
+    Count ex-div dates between today and `until`.
+    If last_ex_div is None, assume the next one is today + freq_interval/2
+    (a reasonable midpoint guess given we don't know where in the cycle we are).
+    """
     interval = _FREQ_DAYS.get(freq, 91)
     today = datetime.utcnow()
-    next_div = last_ex_div + timedelta(days=interval)
-    while next_div < today:
-        next_div += timedelta(days=interval)
+
+    if last_ex_div:
+        next_div = last_ex_div + timedelta(days=interval)
+        while next_div < today:
+            next_div += timedelta(days=interval)
+    else:
+        # Fallback: assume next ex-div is half a cycle from today
+        next_div = today + timedelta(days=interval // 2)
+
     count = 0
     while next_div <= until:
         count += 1
@@ -109,13 +118,16 @@ class DcaScanner:
             debug["no_dividend_data"] += 1
             return results, debug
 
-        last_ex_div_str = fundamentals.get("exDividendDate")
+        last_ex_div_str = fundamentals.get("exDividendDate") or fundamentals.get("dividendDate")
         last_ex_div = None
         if last_ex_div_str:
             try:
                 last_ex_div = datetime.strptime(last_ex_div_str[:10], "%Y-%m-%d")
             except ValueError:
                 pass
+
+        if last_ex_div is None:
+            debug["ex_div_estimated"] += 1
 
         call_map = chain.get("callExpDateMap", {})
         put_map = chain.get("putExpDateMap", {})
@@ -213,12 +225,14 @@ class DcaScanner:
                     score=round(score, 2),
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
+                    ex_div_estimated=last_ex_div is None,
                 ))
 
         return results, debug
 
     @staticmethod
     def format_hit(r):
+        est_marker = " ~" if r.get("ex_div_estimated") else ""
         return (
             f"💰 *{r['ticker']}* @ ${r['spot']}  ·  freq *{r['freq']}*\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
@@ -226,7 +240,7 @@ class DcaScanner:
             f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
             f"  💵 Net premium credit: *${r['net_premium']}*/sh\n"
             f"  ⏳ Call time value: ${r['call_time_value']}\n"
-            f"  💸 Annual div: ${r['annual_div']} · {r['num_ex_divs']} ex-divs in option life\n"
+            f"  💸 Annual div: ${r['annual_div']} · {r['num_ex_divs']}{est_marker} ex-divs in option life\n"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
             f"  🎯 Score: *{r['score']}*"
         )
@@ -242,16 +256,13 @@ class DcaScanner:
             d = debug_totals
             header += (
                 f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
-                f"  · empty contracts:   {d.get('empty_contracts', 0):,}\n"
-                f"  · call no market:    {d.get('call_no_market', 0):,}\n"
-                f"  · put no market:     {d.get('put_no_market', 0):,}\n"
-                f"  · non-positive net:  {d.get('non_positive_net', 0):,}\n"
+                f"  · empty contracts:    {d.get('empty_contracts', 0):,}\n"
+                f"  · call no market:     {d.get('call_no_market', 0):,}\n"
+                f"  · put no market:      {d.get('put_no_market', 0):,}\n"
+                f"  · non-positive net:   {d.get('non_positive_net', 0):,}\n"
                 f"  · no ex-div in window:{d.get('no_ex_div_in_window', 0):,}\n"
-                f"  · ✅ passed:         {d.get('passed', 0):,}\n"
-                f"  · DTE skipped (informational): {d.get('dte_out_of_range', 0):,}\n"
-                f"  · no spot price (tickers): {d.get('no_spot', 0):,}\n"
-                f"  · no div data (tickers):   {d.get('no_dividend_data', 0):,}\n"
-                f"  · empty chain (tickers):   {d.get('empty_chain', 0):,}\n"
+                f"  · ✅ passed:          {d.get('passed', 0):,}\n"
+                f"  · ex-div estimated:   {d.get('ex_div_estimated', 0):,} tickers\n"
             )
         header += f"\nOpportunities: *{len(all_hits)}*\n"
         if errors:

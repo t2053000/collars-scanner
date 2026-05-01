@@ -1,42 +1,33 @@
-# High-yield optionable stocks for /dca scanner
-# Format: TICKER:FREQUENCY  (M=monthly, Q=quarterly, S=semi-annual, A=annual)
+# Dividend tickers under $43 — for /dca
+# Format: TICKER:FREQUENCY  (M=monthly, Q=quarterly, W=weekly)
 
-# === Quarterly traditional dividend stocks ===
-MO:Q
-VZ:Q
+# Quarterly traditional
 T:Q
+VZ:Q
 PFE:Q
 KO:Q
 PEP:Q
-MMM:Q
-IBM:Q
-XOM:Q
-CVX:Q
 BTI:Q
-PM:Q
 
-# === Monthly REITs ===
+# Monthly REITs
 O:M
 STAG:M
 EPR:M
 LTC:M
 
-# === REITs (quarterly) ===
+# REITs (quarterly)
 OHI:Q
-WPC:Q
-SPG:Q
 KIM:Q
 MPW:Q
-ARE:Q
 
-# === mREITs (monthly) ===
+# mREITs
 AGNC:M
 NLY:Q
 ARI:Q
 RC:Q
 TWO:Q
 
-# === BDCs ===
+# BDCs
 ARCC:Q
 MAIN:M
 PFLT:M
@@ -44,15 +35,13 @@ GAIN:M
 HRZN:M
 PSEC:M
 
-# === Energy/utilities ===
+# Energy/utilities
 ENB:Q
-EPD:Q
 KMI:Q
 WMB:Q
 OKE:Q
-TGT:Q
 
-# === YieldMax single-stock options ETFs (very high yield, NAV decay risk) ===
+# YieldMax single-stock ETFs (high yield, NAV decay risk)
 TSLY:M
 NVDY:M
 MSTY:M

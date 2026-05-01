@@ -1,6 +1,6 @@
 """
 dca.py
-Dividend Collar Arbitrage scanner — fallback when ex-div date missing.
+Dividend Collar Arbitrage scanner.
 """
 
 import logging
@@ -14,6 +14,7 @@ DTE_MAX              = 730
 MIN_STRIKE_PCT_SPOT  = 0.80
 MAX_STRIKE_PCT_SPOT  = 1.00
 MID_ADJUST_FRAC      = 0.15
+MAX_PRICE            = 43.0
 
 
 _FREQ_DAYS = {
@@ -58,11 +59,6 @@ def _buy_price(option):
 
 
 def _project_ex_div_dates(last_ex_div, freq, until):
-    """
-    Count ex-div dates between today and `until`.
-    If last_ex_div is None, assume the next one is today + freq_interval/2
-    (a reasonable midpoint guess given we don't know where in the cycle we are).
-    """
     interval = _FREQ_DAYS.get(freq, 91)
     today = datetime.utcnow()
 
@@ -71,7 +67,6 @@ def _project_ex_div_dates(last_ex_div, freq, until):
         while next_div < today:
             next_div += timedelta(days=interval)
     else:
-        # Fallback: assume next ex-div is half a cycle from today
         next_div = today + timedelta(days=interval // 2)
 
     count = 0
@@ -101,6 +96,10 @@ class DcaScanner:
         spot = chain.get("underlyingPrice")
         if not spot or spot <= 0:
             debug["no_spot"] += 1
+            return results, debug
+
+        if spot > MAX_PRICE:
+            debug["price_above_max"] += 1
             return results, debug
 
         try:
@@ -251,6 +250,7 @@ class DcaScanner:
             f"💰 *Dividend Collar Arbitrage Scan*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
             f"Same-strike collars (80-100% of spot, {DTE_MIN}-{DTE_MAX}d, net credit > 0)\n"
+            f"Max price: ${MAX_PRICE:g}\n"
         )
         if debug_totals:
             d = debug_totals
@@ -262,6 +262,7 @@ class DcaScanner:
                 f"  · non-positive net:   {d.get('non_positive_net', 0):,}\n"
                 f"  · no ex-div in window:{d.get('no_ex_div_in_window', 0):,}\n"
                 f"  · ✅ passed:          {d.get('passed', 0):,}\n"
+                f"  · price > ${MAX_PRICE:g}:    {d.get('price_above_max', 0):,} tickers\n"
                 f"  · ex-div estimated:   {d.get('ex_div_estimated', 0):,} tickers\n"
             )
         header += f"\nOpportunities: *{len(all_hits)}*\n"

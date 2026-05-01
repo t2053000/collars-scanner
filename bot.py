@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars + spreads + deep-ITM buy-writes.
+Telegram bot — collars, spreads, deep-ITM, DCA.
 """
 
 import asyncio
@@ -16,6 +16,7 @@ import github_store
 from scanner  import CollarScanner
 from spreads  import SpreadScanner
 from deepcall import DeepCallScanner, clamp_cushion, DEFAULT_CUSHION_PCT, MIN_CUSHION_PCT, MAX_CUSHION_PCT
+from dca      import DcaScanner
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Options Scanner Bot*\n\n"
         "`/scan` – positive-edge collars\n"
         "`/spreads` – cheap bull-call & bear-put spreads\n"
-        "`/deepcall [N]` – deep-ITM buy-writes (N=cushion%, default 30)\n"
+        "`/deepcall [N]` – deep-ITM buy-writes\n"
+        "`/dca` – dividend collar arbitrage\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -53,8 +55,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Commands*\n"
         "`/scan` – collar scan\n"
-        "`/spreads` – cheap vertical debit spreads\n"
-        "`/deepcall [N]` – deep-ITM buy-write, N=min cushion% (default 30)\n"
+        "`/spreads [TICKER]` – cheap vertical debit spreads\n"
+        "`/deepcall [N]` – deep-ITM buy-write\n"
+        "`/dca` – dividend collar arbitrage\n"
         "`/list` – show tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
@@ -116,8 +119,8 @@ async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
-                    scan_kwargs=None, summary_kwargs=None):
-    tickers = github_store.get_tickers()
+                    tickers_override=None, scan_kwargs=None, summary_kwargs=None):
+    tickers = tickers_override if tickers_override is not None else github_store.get_tickers()
     if not tickers:
         await update.message.reply_text(
             "_Watchlist is empty – add some tickers first._",
@@ -200,6 +203,13 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @authorized_only
 async def cmd_spreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scanner: SpreadScanner = context.application.bot_data["spread_scanner"]
+    if context.args:
+        sym = context.args[0].upper().strip()
+        if sym.isalpha() and 1 <= len(sym) <= 6:
+            await _run_scan(update, context, scanner, "💸",
+                            SpreadScanner.format_summary,
+                            tickers_override=[sym])
+            return
     await _run_scan(update, context, scanner, "💸", SpreadScanner.format_summary)
 
 
@@ -208,27 +218,23 @@ async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scanner: DeepCallScanner = context.application.bot_data["deepcall_scanner"]
 
     cushion_pct = DEFAULT_CUSHION_PCT
-    notice = ""
     if context.args:
         try:
             requested = float(context.args[0])
             clamped, was_clamped = clamp_cushion(requested)
             cushion_pct = clamped
             if was_clamped:
-                notice = (
+                await update.message.reply_text(
                     f"⚠️ Cushion `{requested}` outside range "
-                    f"`{MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}` — using *{clamped:g}%*\n\n"
+                    f"`{MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}` — using *{clamped:g}%*",
+                    parse_mode=ParseMode.MARKDOWN,
                 )
         except ValueError:
             await update.message.reply_text(
-                f"Usage: `/deepcall [N]`  where N is cushion% "
-                f"({MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}, default {DEFAULT_CUSHION_PCT:g}).",
+                f"Usage: `/deepcall [N]` (cushion%, default {DEFAULT_CUSHION_PCT:g})",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-
-    if notice:
-        await update.message.reply_text(notice, parse_mode=ParseMode.MARKDOWN)
 
     await _run_scan(
         update, context, scanner, "🛡️", DeepCallScanner.format_summary,
@@ -237,14 +243,35 @@ async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@authorized_only
+async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scanner: DcaScanner = context.application.bot_data["dca_scanner"]
+    div_tickers = github_store.get_div_tickers()
+    if not div_tickers:
+        await update.message.reply_text(
+            "_div_tickers.txt is empty in the data repo. Add entries like_ `MO:Q`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    # refresh scanner's frequency map in case GitHub changed
+    scanner.ticker_freqs = div_tickers
+    tickers = sorted(div_tickers.keys())
+    await _run_scan(
+        update, context, scanner, "💰", DcaScanner.format_summary,
+        tickers_override=tickers,
+    )
+
+
 def build_app(telegram_token: str,
               collar_scanner: CollarScanner,
               spread_scanner: SpreadScanner,
-              deepcall_scanner: DeepCallScanner) -> Application:
+              deepcall_scanner: DeepCallScanner,
+              dca_scanner: DcaScanner) -> Application:
     app = Application.builder().token(telegram_token).build()
     app.bot_data["collar_scanner"]   = collar_scanner
     app.bot_data["spread_scanner"]   = spread_scanner
     app.bot_data["deepcall_scanner"] = deepcall_scanner
+    app.bot_data["dca_scanner"]      = dca_scanner
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
@@ -256,5 +283,6 @@ def build_app(telegram_token: str,
     app.add_handler(CommandHandler("spreads",   cmd_spreads))
     app.add_handler(CommandHandler("deepcall",  cmd_deepcall))
     app.add_handler(CommandHandler("deepcalls", cmd_deepcall))
+    app.add_handler(CommandHandler("dca",       cmd_dca))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     return app

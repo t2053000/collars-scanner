@@ -282,3 +282,8 @@ LVS
 TCOM
 MRNA
 ELF
+KVUE-d
+HRL-d
+BF.B-d
+BEN-d
+AMCR​​​​​​​​​​​​​​​​-d

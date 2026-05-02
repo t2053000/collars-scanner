@@ -10,6 +10,7 @@ from functools import wraps
 
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import github_store
@@ -21,6 +22,7 @@ from dca      import DcaScanner
 logger = logging.getLogger(__name__)
 
 SCAN_CONCURRENCY = 5
+TG_MAX_LEN = 4000
 _LAST_ERRORS: deque = deque(maxlen=30)
 
 
@@ -37,6 +39,46 @@ def authorized_only(func):
             return
         return await func(update, context)
     return wrapper
+
+
+def _truncate(text: str, limit: int = TG_MAX_LEN) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit - 30] + "\n\n_(truncated…)_"
+
+
+async def _send_robust(send_callable, text: str):
+    """
+    Try sending with Markdown. On BadRequest (markdown parse / too long),
+    truncate and/or strip markdown and retry. Never raises.
+    """
+    safe = _truncate(text)
+    try:
+        await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
+        return
+    except BadRequest as e:
+        logger.warning(f"Telegram BadRequest with markdown: {e} — retrying plain text")
+    try:
+        plain = safe.replace("*", "").replace("_", "").replace("`", "")
+        plain = _truncate(plain)
+        await send_callable(plain)
+    except BadRequest as e:
+        logger.error(f"Telegram BadRequest even on plain text: {e}")
+
+
+async def _edit_robust(message, text: str):
+    safe = _truncate(text)
+    try:
+        await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN)
+        return
+    except BadRequest as e:
+        logger.warning(f"Edit BadRequest with markdown: {e} — retrying plain text")
+    try:
+        plain = safe.replace("*", "").replace("_", "").replace("`", "")
+        plain = _truncate(plain)
+        await message.edit_text(plain)
+    except BadRequest as e:
+        logger.error(f"Edit BadRequest even on plain text: {e}")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -189,9 +231,9 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
                 kwargs.pop(k, None)
             messages = format_summary_fn(**kwargs)
 
-    await status_msg.edit_text(messages[0], parse_mode=ParseMode.MARKDOWN)
+    await _edit_robust(status_msg, messages[0])
     for extra in messages[1:]:
-        await update.message.reply_text(extra, parse_mode=ParseMode.MARKDOWN)
+        await _send_robust(update.message.reply_text, extra)
 
 
 @authorized_only
@@ -253,7 +295,6 @@ async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         return
-    # refresh scanner's frequency map in case GitHub changed
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
     await _run_scan(

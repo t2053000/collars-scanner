@@ -3,12 +3,11 @@ dca.py
 Dividend Collar Arbitrage scanner.
 
 Score formula:
-  safety     = net_premium / max(spot - strike, 0.01), capped at 2.0
-  div_income = annual_div * (dte / 365)
-  score      = safety * div_income
-
-Higher safety = premium covers more of the unprotected gap.
-Higher div_income = more dividends collected during option life.
+  gap            = max(spot - strike, 0)
+  safety_dollars = net_premium - gap        (negative = uncovered loss)
+  safety_apy     = (safety_dollars / spot) * (365/dte) * 100
+  div_yield_apy  = (annual_div / spot) * 100
+  score          = safety_apy + div_yield_apy
 """
 
 import logging
@@ -23,7 +22,6 @@ MIN_STRIKE_PCT_SPOT  = 0.80
 MAX_STRIKE_PCT_SPOT  = 1.00
 MID_ADJUST_FRAC      = 0.15
 MAX_PRICE            = 43.0
-SAFETY_CAP           = 2.0
 
 
 _FREQ_DAYS = {
@@ -204,24 +202,15 @@ class DcaScanner:
                     debug["non_positive_net"] += 1
                     continue
 
-                intrinsic = max(spot - strike, 0)
-                gap = max(spot - strike, 0.01)
+                gap = max(spot - strike, 0)
+                safety_dollars = net_premium - gap
+                safety_apy = (safety_dollars / spot) * (365.0 / dte) * 100.0
 
-                # Safety: how well does premium cover the unprotected gap?
-                if strike >= spot:
-                    safety = SAFETY_CAP
-                else:
-                    safety = min(net_premium / gap, SAFETY_CAP)
-
-                # Dividend income earned during option life
-                div_income = annual_div * (dte / 365.0)
+                div_yield_apy = (annual_div / spot) * 100.0
 
                 num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
 
-                score = safety * div_income
-
-                # Unprotected loss if call NEVER assigned and stock at strike
-                worst_case_loss = max(intrinsic - net_premium, 0)
+                score = safety_apy + div_yield_apy
 
                 debug["passed"] += 1
                 results.append(dict(
@@ -233,13 +222,14 @@ class DcaScanner:
                     call_credit=round(call_credit, 2),
                     put_cost=round(put_cost, 2),
                     net_premium=round(net_premium, 2),
+                    gap=round(gap, 2),
+                    safety_dollars=round(safety_dollars, 2),
+                    safety_apy=round(safety_apy, 1),
                     annual_div=round(annual_div, 2),
-                    div_income=round(div_income, 2),
-                    safety=round(safety, 2),
-                    worst_case_loss=round(worst_case_loss, 2),
+                    div_yield_apy=round(div_yield_apy, 1),
                     num_ex_divs=num_ex_divs,
                     freq=freq,
-                    score=round(score, 2),
+                    score=round(score, 1),
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
                     ex_div_estimated=last_ex_div is None,
@@ -250,17 +240,17 @@ class DcaScanner:
     @staticmethod
     def format_hit(r):
         est_marker = " ~" if r.get("ex_div_estimated") else ""
+        safety_sign = "+" if r["safety_dollars"] >= 0 else ""
         return (
             f"💰 *{r['ticker']}* @ ${r['spot']}  ·  freq *{r['freq']}*\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
             f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
             f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
-            f"  💵 Net premium: *${r['net_premium']}*/sh · 🛡 Safety: *{r['safety']}*\n"
-            f"  ⚠️ Worst-case loss if not assigned: ${r['worst_case_loss']}/sh\n"
-            f"  💸 Annual div: ${r['annual_div']} · Income over life: *${r['div_income']}*\n"
-            f"  📅 {r['num_ex_divs']}{est_marker} ex-divs in option life\n"
+            f"  💵 Net premium: ${r['net_premium']}/sh · Gap: ${r['gap']}/sh\n"
+            f"  🛡 Safety: *{safety_sign}${r['safety_dollars']}/sh* ({r['safety_apy']}% APY)\n"
+            f"  💸 Annual div: ${r['annual_div']} ({r['div_yield_apy']}% APY) · {r['num_ex_divs']}{est_marker} ex-divs\n"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
-            f"  🎯 Score: *{r['score']}*"
+            f"  🎯 Score (safety+div APY): *{r['score']}%*"
         )
 
     @staticmethod
@@ -269,7 +259,8 @@ class DcaScanner:
             f"💰 *Dividend Collar Arbitrage Scan*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
             f"Same-strike collars (80-100% of spot, {DTE_MIN}-{DTE_MAX}d, net credit > 0)\n"
-            f"Score = safety × div_income · Max price ${MAX_PRICE:g}\n"
+            f"Score = safety APY + dividend yield APY · Max price ${MAX_PRICE:g}\n"
+            f"_Best deals at the BOTTOM_\n"
         )
         if debug_totals:
             d = debug_totals
@@ -295,7 +286,8 @@ class DcaScanner:
         if not all_hits:
             return [header + "_No qualifying same-strike collars found._"]
 
-        all_hits.sort(key=lambda r: r["score"], reverse=True)
+        # Reverse sort: worst at top, best at bottom
+        all_hits.sort(key=lambda r: r["score"])
 
         chunks, current = [], header
         for hit in all_hits:

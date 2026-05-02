@@ -1,6 +1,14 @@
 """
 dca.py
 Dividend Collar Arbitrage scanner.
+
+Score formula:
+  safety     = net_premium / max(spot - strike, 0.01), capped at 2.0
+  div_income = annual_div * (dte / 365)
+  score      = safety * div_income
+
+Higher safety = premium covers more of the unprotected gap.
+Higher div_income = more dividends collected during option life.
 """
 
 import logging
@@ -15,6 +23,7 @@ MIN_STRIKE_PCT_SPOT  = 0.80
 MAX_STRIKE_PCT_SPOT  = 1.00
 MID_ADJUST_FRAC      = 0.15
 MAX_PRICE            = 43.0
+SAFETY_CAP           = 2.0
 
 
 _FREQ_DAYS = {
@@ -196,16 +205,23 @@ class DcaScanner:
                     continue
 
                 intrinsic = max(spot - strike, 0)
-                call_time_value = call_credit - intrinsic
-                if call_time_value <= 0.01:
-                    call_time_value = 0.01
+                gap = max(spot - strike, 0.01)
+
+                # Safety: how well does premium cover the unprotected gap?
+                if strike >= spot:
+                    safety = SAFETY_CAP
+                else:
+                    safety = min(net_premium / gap, SAFETY_CAP)
+
+                # Dividend income earned during option life
+                div_income = annual_div * (dte / 365.0)
 
                 num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
-                if num_ex_divs == 0:
-                    debug["no_ex_div_in_window"] += 1
-                    continue
 
-                score = (annual_div / call_time_value) * num_ex_divs
+                score = safety * div_income
+
+                # Unprotected loss if call NEVER assigned and stock at strike
+                worst_case_loss = max(intrinsic - net_premium, 0)
 
                 debug["passed"] += 1
                 results.append(dict(
@@ -217,8 +233,10 @@ class DcaScanner:
                     call_credit=round(call_credit, 2),
                     put_cost=round(put_cost, 2),
                     net_premium=round(net_premium, 2),
-                    call_time_value=round(call_time_value, 2),
                     annual_div=round(annual_div, 2),
+                    div_income=round(div_income, 2),
+                    safety=round(safety, 2),
+                    worst_case_loss=round(worst_case_loss, 2),
                     num_ex_divs=num_ex_divs,
                     freq=freq,
                     score=round(score, 2),
@@ -237,9 +255,10 @@ class DcaScanner:
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
             f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
             f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
-            f"  💵 Net premium credit: *${r['net_premium']}*/sh\n"
-            f"  ⏳ Call time value: ${r['call_time_value']}\n"
-            f"  💸 Annual div: ${r['annual_div']} · {r['num_ex_divs']}{est_marker} ex-divs in option life\n"
+            f"  💵 Net premium: *${r['net_premium']}*/sh · 🛡 Safety: *{r['safety']}*\n"
+            f"  ⚠️ Worst-case loss if not assigned: ${r['worst_case_loss']}/sh\n"
+            f"  💸 Annual div: ${r['annual_div']} · Income over life: *${r['div_income']}*\n"
+            f"  📅 {r['num_ex_divs']}{est_marker} ex-divs in option life\n"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
             f"  🎯 Score: *{r['score']}*"
         )
@@ -250,7 +269,7 @@ class DcaScanner:
             f"💰 *Dividend Collar Arbitrage Scan*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
             f"Same-strike collars (80-100% of spot, {DTE_MIN}-{DTE_MAX}d, net credit > 0)\n"
-            f"Max price: ${MAX_PRICE:g}\n"
+            f"Score = safety × div_income · Max price ${MAX_PRICE:g}\n"
         )
         if debug_totals:
             d = debug_totals
@@ -260,7 +279,6 @@ class DcaScanner:
                 f"  · call no market:     {d.get('call_no_market', 0):,}\n"
                 f"  · put no market:      {d.get('put_no_market', 0):,}\n"
                 f"  · non-positive net:   {d.get('non_positive_net', 0):,}\n"
-                f"  · no ex-div in window:{d.get('no_ex_div_in_window', 0):,}\n"
                 f"  · ✅ passed:          {d.get('passed', 0):,}\n"
                 f"  · price > ${MAX_PRICE:g}:    {d.get('price_above_max', 0):,} tickers\n"
                 f"  · ex-div estimated:   {d.get('ex_div_estimated', 0):,} tickers\n"

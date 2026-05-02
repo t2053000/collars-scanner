@@ -14,11 +14,14 @@ O:M
 STAG:M
 EPR:M
 LTC:M
+ADC:M
 
 # REITs (quarterly)
 OHI:Q
 KIM:Q
 MPW:Q
+GTY:Q
+SLG:Q
 
 # mREITs
 AGNC:M
@@ -40,6 +43,25 @@ ENB:Q
 KMI:Q
 WMB:Q
 OKE:Q
+DVN:Q
+
+# Banks/financials
+F:Q
+BAC:Q
+KEY:Q
+RF:Q
+HBAN:Q
+CFG:Q
+
+# Telecom/utilities/misc
+LUMN:Q
+NU:Q
+WBD:Q
+
+# Mining/materials
+NEM:Q
+GOLD:Q
+HL:Q
 
 # YieldMax single-stock ETFs (high yield, NAV decay risk)
 TSLY:M
@@ -48,3 +70,9 @@ MSTY:M
 APLY:M
 YMAG:M
 ULTY:W
+CONY:M
+QQQY:M
+JEPY:M
+XYLD:M
+QYLD:M
+RYLD:M

@@ -15,6 +15,7 @@ from scanner       import CollarScanner
 from spreads       import SpreadScanner
 from deepcall      import DeepCallScanner
 from dca           import DcaScanner
+from csp           import CspScanner
 import github_store
 import bot as bot_module
 
@@ -55,7 +56,6 @@ def main():
     schwab = SchwabClient()
     schwab.initialize()
 
-    # Load div_tickers.txt once at startup; will be refreshed inside /dca handler
     initial_div_freqs = github_store.get_div_tickers()
     log.info(f"Loaded {len(initial_div_freqs)} dividend tickers from GitHub")
 
@@ -63,6 +63,7 @@ def main():
     spread_scanner   = SpreadScanner(schwab)
     deepcall_scanner = DeepCallScanner(schwab)
     dca_scanner      = DcaScanner(schwab, initial_div_freqs)
+    csp_scanner      = CspScanner(schwab)
 
     app = bot_module.build_app(
         os.environ["TELEGRAM_BOT_TOKEN"],
@@ -70,6 +71,7 @@ def main():
         spread_scanner,
         deepcall_scanner,
         dca_scanner,
+        csp_scanner,
     )
 
     log.info("Bot starting – polling Telegram…")

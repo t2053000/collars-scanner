@@ -72,6 +72,7 @@ def main():
         deepcall_scanner,
         dca_scanner,
         csp_scanner,
+        schwab,
     )
 
     log.info("Bot starting – polling Telegram…")

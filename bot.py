@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars, spreads, deep-ITM, DCA, CSP.
+Telegram bot — collars, spreads, deep-ITM, DCA, CSP, token refresh.
 """
 
 import asyncio
@@ -54,7 +54,7 @@ async def _send_robust(send_callable, text: str):
         await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
         return
     except BadRequest as e:
-        logger.warning(f"Telegram BadRequest with markdown: {e} — retrying plain text")
+        logger.warning(f"Telegram BadRequest with markdown: {e}")
     try:
         plain = safe.replace("*", "").replace("_", "").replace("`", "")
         plain = _truncate(plain)
@@ -69,7 +69,7 @@ async def _edit_robust(message, text: str):
         await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN)
         return
     except BadRequest as e:
-        logger.warning(f"Edit BadRequest with markdown: {e} — retrying plain text")
+        logger.warning(f"Edit BadRequest with markdown: {e}")
     try:
         plain = safe.replace("*", "").replace("_", "").replace("`", "")
         plain = _truncate(plain)
@@ -86,6 +86,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/deepcall [N]` – deep-ITM buy-writes\n"
         "`/dca` – dividend collar arbitrage\n"
         "`/csp` – bull put credit spreads\n"
+        "`/refresh_token` – refresh Schwab token\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -103,6 +104,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
         "`/logs` – recent errors\n"
+        "`/refresh_token` – start Schwab token refresh\n"
+        "`/submit_token URL_OR_CODE` – complete refresh\n"
         "`/whoami` – your Telegram ID",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -290,7 +293,7 @@ async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     div_tickers = github_store.get_div_tickers()
     if not div_tickers:
         await update.message.reply_text(
-            "_div_tickers.txt is empty in the data repo. Add entries like_ `MO:Q`",
+            "_div_tickers.txt is empty in the data repo._",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -319,30 +322,91 @@ async def cmd_csp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------------------------------------------------------------------
+# Token refresh
+# ---------------------------------------------------------------------------
+
+@authorized_only
+async def cmd_refresh_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    schwab_client = context.application.bot_data["schwab_client"]
+    auth_url = schwab_client.build_authorize_url()
+    await update.message.reply_text(
+        "🔐 *Schwab Token Refresh*\n\n"
+        "⚡ *Auth codes expire in ~10 sec* — be ready!\n\n"
+        "1️⃣ FIRST: type `/submit_token ` (with space) in this chat — "
+        "DO NOT SEND YET\n\n"
+        "2️⃣ Tap this URL:\n"
+        f"{auth_url}\n\n"
+        "3️⃣ Log in → tap *Allow*\n\n"
+        "4️⃣ Browser shows broken `https://127.0.0.1/?code=...` page\n\n"
+        "5️⃣ Long-press address bar → Copy URL\n\n"
+        "6️⃣ Switch back to Telegram → long-press in message field → Paste → Send IMMEDIATELY",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+
+@authorized_only
+async def cmd_submit_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    schwab_client = context.application.bot_data["schwab_client"]
+    text = update.message.text or ""
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        await update.message.reply_text(
+            "Usage: `/submit_token <full URL or just the code>`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    payload = parts[1].strip()
+
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, schwab_client.exchange_code_for_token, payload
+        )
+    except Exception as e:
+        logger.exception("token exchange failed")
+        await update.message.reply_text(
+            f"❌ Token exchange failed:\n`{type(e).__name__}: {str(e)[:300]}`\n\n"
+            "Most common cause: auth code already expired (>10 sec). Try `/refresh_token` again — be faster this time.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    await update.message.reply_text(
+        "✅ *Token refreshed successfully!*\nTry `/scan` to confirm.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 def build_app(telegram_token: str,
               collar_scanner: CollarScanner,
               spread_scanner: SpreadScanner,
               deepcall_scanner: DeepCallScanner,
               dca_scanner: DcaScanner,
-              csp_scanner: CspScanner) -> Application:
+              csp_scanner: CspScanner,
+              schwab_client) -> Application:
     app = Application.builder().token(telegram_token).build()
     app.bot_data["collar_scanner"]   = collar_scanner
     app.bot_data["spread_scanner"]   = spread_scanner
     app.bot_data["deepcall_scanner"] = deepcall_scanner
     app.bot_data["dca_scanner"]      = dca_scanner
     app.bot_data["csp_scanner"]      = csp_scanner
+    app.bot_data["schwab_client"]    = schwab_client
 
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("whoami",    cmd_whoami))
-    app.add_handler(CommandHandler("list",      cmd_list))
-    app.add_handler(CommandHandler("add",       cmd_add))
-    app.add_handler(CommandHandler("remove",    cmd_remove))
-    app.add_handler(CommandHandler("scan",      cmd_scan))
-    app.add_handler(CommandHandler("spreads",   cmd_spreads))
-    app.add_handler(CommandHandler("deepcall",  cmd_deepcall))
-    app.add_handler(CommandHandler("deepcalls", cmd_deepcall))
-    app.add_handler(CommandHandler("dca",       cmd_dca))
-    app.add_handler(CommandHandler("csp",       cmd_csp))
-    app.add_handler(CommandHandler("logs",      cmd_logs))
+    app.add_handler(CommandHandler("start",         cmd_start))
+    app.add_handler(CommandHandler("help",          cmd_help))
+    app.add_handler(CommandHandler("whoami",        cmd_whoami))
+    app.add_handler(CommandHandler("list",          cmd_list))
+    app.add_handler(CommandHandler("add",           cmd_add))
+    app.add_handler(CommandHandler("remove",        cmd_remove))
+    app.add_handler(CommandHandler("scan",          cmd_scan))
+    app.add_handler(CommandHandler("spreads",       cmd_spreads))
+    app.add_handler(CommandHandler("deepcall",      cmd_deepcall))
+    app.add_handler(CommandHandler("deepcalls",     cmd_deepcall))
+    app.add_handler(CommandHandler("dca",           cmd_dca))
+    app.add_handler(CommandHandler("csp",           cmd_csp))
+    app.add_handler(CommandHandler("logs",          cmd_logs))
+    app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
+    app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
     return app

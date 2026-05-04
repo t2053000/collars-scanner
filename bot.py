@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars, spreads, deep-ITM, DCA.
+Telegram bot — collars, spreads, deep-ITM, DCA, CSP.
 """
 
 import asyncio
@@ -18,6 +18,7 @@ from scanner  import CollarScanner
 from spreads  import SpreadScanner
 from deepcall import DeepCallScanner, clamp_cushion, DEFAULT_CUSHION_PCT, MIN_CUSHION_PCT, MAX_CUSHION_PCT
 from dca      import DcaScanner
+from csp      import CspScanner
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,6 @@ def _truncate(text: str, limit: int = TG_MAX_LEN) -> str:
 
 
 async def _send_robust(send_callable, text: str):
-    """
-    Try sending with Markdown. On BadRequest (markdown parse / too long),
-    truncate and/or strip markdown and retry. Never raises.
-    """
     safe = _truncate(text)
     try:
         await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
@@ -88,6 +85,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/spreads` – cheap bull-call & bear-put spreads\n"
         "`/deepcall [N]` – deep-ITM buy-writes\n"
         "`/dca` – dividend collar arbitrage\n"
+        "`/csp` – bull put credit spreads\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -100,6 +98,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/spreads [TICKER]` – cheap vertical debit spreads\n"
         "`/deepcall [N]` – deep-ITM buy-write\n"
         "`/dca` – dividend collar arbitrage\n"
+        "`/csp` – bull put credit spreads (Δ 0.80-0.85)\n"
         "`/list` – show tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
@@ -303,16 +302,35 @@ async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@authorized_only
+async def cmd_csp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scanner: CspScanner = context.application.bot_data["csp_scanner"]
+    div_tickers = github_store.get_div_tickers()
+    if not div_tickers:
+        await update.message.reply_text(
+            "_div_tickers.txt is empty in the data repo._",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    tickers = sorted(div_tickers.keys())
+    await _run_scan(
+        update, context, scanner, "💵", CspScanner.format_summary,
+        tickers_override=tickers,
+    )
+
+
 def build_app(telegram_token: str,
               collar_scanner: CollarScanner,
               spread_scanner: SpreadScanner,
               deepcall_scanner: DeepCallScanner,
-              dca_scanner: DcaScanner) -> Application:
+              dca_scanner: DcaScanner,
+              csp_scanner: CspScanner) -> Application:
     app = Application.builder().token(telegram_token).build()
     app.bot_data["collar_scanner"]   = collar_scanner
     app.bot_data["spread_scanner"]   = spread_scanner
     app.bot_data["deepcall_scanner"] = deepcall_scanner
     app.bot_data["dca_scanner"]      = dca_scanner
+    app.bot_data["csp_scanner"]      = csp_scanner
 
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
@@ -325,5 +343,6 @@ def build_app(telegram_token: str,
     app.add_handler(CommandHandler("deepcall",  cmd_deepcall))
     app.add_handler(CommandHandler("deepcalls", cmd_deepcall))
     app.add_handler(CommandHandler("dca",       cmd_dca))
+    app.add_handler(CommandHandler("csp",       cmd_csp))
     app.add_handler(CommandHandler("logs",      cmd_logs))
     return app

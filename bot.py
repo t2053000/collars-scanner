@@ -99,7 +99,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/spreads [TICKER]` – cheap vertical debit spreads\n"
         "`/deepcall [N]` – deep-ITM buy-write\n"
         "`/dca` – dividend collar arbitrage\n"
-        "`/csp` – bull put credit spreads (Δ 0.80-0.85)\n"
+        "`/csp` – bull put credit spreads (Δ 0.20-0.30 OTM)\n"
         "`/list` – show tickers\n"
         "`/add  AAPL TSLA` – add tickers\n"
         "`/remove AAPL` – remove tickers\n"
@@ -315,6 +315,7 @@ async def cmd_csp(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN,
         )
         return
+    scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
     await _run_scan(
         update, context, scanner, "💵", CspScanner.format_summary,

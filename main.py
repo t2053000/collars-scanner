@@ -63,7 +63,7 @@ def main():
     spread_scanner   = SpreadScanner(schwab)
     deepcall_scanner = DeepCallScanner(schwab)
     dca_scanner      = DcaScanner(schwab, initial_div_freqs)
-    csp_scanner      = CspScanner(schwab)
+    csp_scanner      = CspScanner(schwab, initial_div_freqs)
 
     app = bot_module.build_app(
         os.environ["TELEGRAM_BOT_TOKEN"],

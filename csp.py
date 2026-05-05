@@ -2,15 +2,9 @@
 csp.py
 Bull Put Credit Spread scanner.
 
-For each ticker × each expiration in DTE_MIN..DTE_MAX:
-  - Find a put with abs(delta) in [DELTA_MIN, DELTA_MAX]
-  - Use it as SHORT leg
-  - Use the strike WIDTH below as LONG leg
-  - Mid-adjusted fills (sell mid-15%, buy mid+15%)
-  - net_credit = short_credit - long_cost
-  - max_risk = width - net_credit (per share)
-  - apy_on_risk = (net_credit / max_risk) * 365/dte * 100
-  - Skip if apy < MIN_APY_PCT
+Designed for high-delta short puts (0.80-0.85) — high probability of being
+assigned the stock at a discount. APY shown is "if NOT assigned" (max profit
+scenario). If assigned (more likely), you own the stock at effective_buy_price.
 """
 
 import logging
@@ -180,15 +174,22 @@ class CspScanner:
                     continue
 
                 max_risk = actual_width - net_credit
+                # Strictly require positive max_risk (filter broken quotes
+                # where credit > width — that's not free money, that's bad data)
                 if max_risk <= 0:
-                    debug["risk_free"] += 1
-                    apy_on_risk = 9999.0
-                else:
-                    apy_on_risk = (net_credit / max_risk) * (365.0 / dte) * 100.0
+                    debug["broken_quote_negative_risk"] += 1
+                    continue
 
-                if apy_on_risk < MIN_APY_PCT:
+                apy_if_not_assigned = (net_credit / max_risk) * (365.0 / dte) * 100.0
+                if apy_if_not_assigned < MIN_APY_PCT:
                     debug["below_min_apy"] += 1
                     continue
+
+                # If assigned: you'd be obligated to buy stock at short strike
+                # but the credit you collected reduces effective basis.
+                # Long put offsets if stock falls below long strike.
+                effective_buy_price = short_strike - net_credit
+                discount_pct = (spot - effective_buy_price) / spot * 100.0
 
                 debug["passed"] += 1
                 results.append(dict(
@@ -203,7 +204,9 @@ class CspScanner:
                     long_cost=round(long_cost, 2),
                     net_credit=round(net_credit, 2),
                     max_risk=round(max_risk, 2),
-                    apy_on_risk=round(apy_on_risk, 1),
+                    apy_if_not_assigned=round(apy_if_not_assigned, 1),
+                    effective_buy_price=round(effective_buy_price, 2),
+                    discount_pct=round(discount_pct, 1),
                     short_delta=round(d, 2),
                     short_oi=_oi(short_opt),
                     long_oi=_oi(long_opt),
@@ -214,6 +217,7 @@ class CspScanner:
 
     @staticmethod
     def format_hit(r):
+        discount_str = f"premium {-r['discount_pct']}%" if r['discount_pct'] < 0 else f"discount {r['discount_pct']}%"
         return (
             f"💵 *{r['ticker']}* @ ${r['spot']}\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
@@ -221,8 +225,9 @@ class CspScanner:
             f"  🛡️ Buy  P ${r['long_strike']:g} @ ${r['long_cost']}\n"
             f"  💰 Net credit: ${r['net_credit']}/sh · Width: ${r['width']}\n"
             f"  ⚠️ Max risk: ${r['max_risk']}/sh\n"
+            f"  🎁 If assigned: buy @ ${r['effective_buy_price']} ({discount_str} vs spot)\n"
             f"  📊 OI short/long: {r['short_oi']}/{r['long_oi']}\n"
-            f"  🎯 APY on risk: *{r['apy_on_risk']}%*"
+            f"  🎯 APY if not assigned: *{r['apy_if_not_assigned']}%*"
         )
 
     @staticmethod
@@ -243,6 +248,7 @@ class CspScanner:
                 f"  · no long leg:      {d.get('no_long_leg', 0):,}\n"
                 f"  · long no market:   {d.get('long_no_market', 0):,}\n"
                 f"  · non-positive credit:{d.get('non_positive_credit', 0):,}\n"
+                f"  · broken quote (risk≤0):{d.get('broken_quote_negative_risk', 0):,}\n"
                 f"  · below min APY:    {d.get('below_min_apy', 0):,}\n"
                 f"  · ✅ passed:        {d.get('passed', 0):,}\n"
                 f"  · price > ${MAX_PRICE:g}:  {d.get('price_above_max', 0):,} tickers\n"
@@ -259,7 +265,7 @@ class CspScanner:
         if not all_hits:
             return [header + "_No qualifying spreads found._"]
 
-        all_hits.sort(key=lambda r: r["apy_on_risk"])
+        all_hits.sort(key=lambda r: r["apy_if_not_assigned"])
 
         chunks, current = [], header
         for hit in all_hits:

@@ -13,8 +13,8 @@ For each ticker × each expiration in DTE_MIN..DTE_MAX:
   - Mid-adjusted fills (sell mid-15%, buy mid+15%)
   - net_credit = short_credit - long_cost
   - max_risk = width - net_credit
-  - apy_if_not_assigned = (net_credit / max_risk) * 365/dte * 100
-  - Filter: max_risk > 0, apy >= MIN_APY_PCT
+  - return_on_risk = (net_credit / max_risk) * 100   (per-contract, NOT annualized)
+  - Filter: max_risk > 0, return_on_risk >= MIN_RETURN_PCT
 """
 
 import logging
@@ -23,13 +23,13 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-DTE_MIN              = 30
-DTE_MAX              = 90
+DTE_MIN              = 1
+DTE_MAX              = 21
 DELTA_MIN            = 0.20
 DELTA_MAX            = 0.30
 WIDTH                = 2.50
 MID_ADJUST_FRAC      = 0.15
-MIN_APY_PCT          = 12.0
+MIN_RETURN_PCT       = 5.0
 MAX_PRICE            = 43.0
 
 
@@ -189,9 +189,9 @@ class CspScanner:
                     debug["broken_quote_negative_risk"] += 1
                     continue
 
-                apy_if_not_assigned = (net_credit / max_risk) * (365.0 / dte) * 100.0
-                if apy_if_not_assigned < MIN_APY_PCT:
-                    debug["below_min_apy"] += 1
+                return_on_risk = (net_credit / max_risk) * 100.0
+                if return_on_risk < MIN_RETURN_PCT:
+                    debug["below_min_return"] += 1
                     continue
 
                 effective_buy_price = short_strike - net_credit
@@ -210,7 +210,7 @@ class CspScanner:
                     long_cost=round(long_cost, 2),
                     net_credit=round(net_credit, 2),
                     max_risk=round(max_risk, 2),
-                    apy_if_not_assigned=round(apy_if_not_assigned, 1),
+                    return_on_risk=round(return_on_risk, 1),
                     effective_buy_price=round(effective_buy_price, 2),
                     discount_pct=round(discount_pct, 1),
                     short_delta=round(d, 2),
@@ -236,7 +236,7 @@ class CspScanner:
             f"  ⚠️ Max risk: ${r['max_risk']}/sh\n"
             f"  🎁 If assigned: own stock @ ${r['effective_buy_price']} ({assignment_str})\n"
             f"  📊 OI short/long: {r['short_oi']}/{r['long_oi']}\n"
-            f"  🎯 APY if not assigned: *{r['apy_if_not_assigned']}%*"
+            f"  🎯 Return on risk: *{r['return_on_risk']}%* per contract"
         )
 
     @staticmethod
@@ -244,7 +244,7 @@ class CspScanner:
         header = (
             f"💵 *Bull Put Credit Spread Scan (OTM)*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
-            f"Δ {DELTA_MIN}-{DELTA_MAX} (OTM) · width ${WIDTH:g} · {DTE_MIN}-{DTE_MAX}d · APY ≥ {MIN_APY_PCT:g}%\n"
+            f"Δ {DELTA_MIN}-{DELTA_MAX} (OTM) · width ${WIDTH:g} · {DTE_MIN}-{DTE_MAX}d · return ≥ {MIN_RETURN_PCT:g}%\n"
             f"Max price ${MAX_PRICE:g}\n"
             f"_Best deals at the BOTTOM_\n"
         )
@@ -258,7 +258,7 @@ class CspScanner:
                 f"  · long no market:   {d.get('long_no_market', 0):,}\n"
                 f"  · non-positive credit:{d.get('non_positive_credit', 0):,}\n"
                 f"  · broken quote (risk≤0):{d.get('broken_quote_negative_risk', 0):,}\n"
-                f"  · below min APY:    {d.get('below_min_apy', 0):,}\n"
+                f"  · below min return: {d.get('below_min_return', 0):,}\n"
                 f"  · ✅ passed:        {d.get('passed', 0):,}\n"
                 f"  · price > ${MAX_PRICE:g}:  {d.get('price_above_max', 0):,} tickers\n"
             )
@@ -274,7 +274,7 @@ class CspScanner:
         if not all_hits:
             return [header + "_No qualifying spreads found._"]
 
-        all_hits.sort(key=lambda r: r["apy_if_not_assigned"])
+        all_hits.sort(key=lambda r: r["return_on_risk"])
 
         chunks, current = [], header
         for hit in all_hits:

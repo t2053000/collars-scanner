@@ -97,4 +97,5 @@ class CspScanner:
             annual_div = float(fundamentals.get("dividendAmount") or 0.0)
             if annual_div <= 0:
                 div_yield = float(fundamentals.get("dividendYield") or 0.0)
-                annual_div = (div_yield / 100.0) * spot if div_yield > 1 else div_yield *
+                                annual_div = (div_yield / 100.0) * spot if div_yield > 1 else div_yield * spot
+

@@ -285,7 +285,7 @@ ELF
 KVUE
 HRL
 BEN
-AMCR​​​​​​​
+AMCR​​​​​​
 AMSC
 OSS
 TE

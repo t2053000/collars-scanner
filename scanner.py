@@ -19,8 +19,8 @@ logger = logging.getLogger(__name__)
 MAX_EXPIRATIONS     = 10
 MIN_NEG_YEARLY_PCT  = 6.0
 MID_ADJUST_FRAC     = 0.15
-MIN_OI              = 50
-MAX_SPREAD_PCT      = 0.40
+MIN_OI              = 25
+MAX_SPREAD_PCT      = 0.50
 
 
 def _has_market(option):

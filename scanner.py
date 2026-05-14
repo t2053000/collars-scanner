@@ -2,13 +2,6 @@
 scanner.py
 Collar scanner — uses MID-ADJUSTED fills (15% of spread away from mid)
 with liquidity filters: minimum open interest and maximum bid-ask spread.
-
-For each ticker, for each of the next 10 expirations:
-  - Sell nearest call strike ABOVE spot
-  - Buy  nearest put  strike BELOW spot
-  - Skip legs with no market (bid<=0 or ask<=0)
-  - Skip legs with OI < MIN_OI
-  - Skip legs where (ask - bid) / mid > MAX_SPREAD_PCT
 """
 
 import logging
@@ -19,8 +12,8 @@ logger = logging.getLogger(__name__)
 MAX_EXPIRATIONS     = 10
 MIN_NEG_YEARLY_PCT  = 6.0
 MID_ADJUST_FRAC     = 0.15
-MIN_OI              = 25
-MAX_SPREAD_PCT      = 0.50
+MIN_OI              = 10
+MAX_SPREAD_PCT      = 0.75
 
 
 def _has_market(option):
@@ -136,7 +129,6 @@ class CollarScanner:
             if not _has_market(call_opt) or not _has_market(put_opt):
                 continue
 
-            # Liquidity filters
             if _oi(call_opt) < MIN_OI or _oi(put_opt) < MIN_OI:
                 continue
             if _spread_too_wide(call_opt) or _spread_too_wide(put_opt):

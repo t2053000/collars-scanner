@@ -2,9 +2,11 @@
 scanner.py
 Collar scanner — uses MID-ADJUSTED fills (15% of spread away from mid)
 with liquidity filters: minimum open interest and maximum bid-ask spread.
+Now with debug counters to see what's filtering hits.
 """
 
 import logging
+from collections import Counter
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -34,13 +36,13 @@ def _oi(option):
     return int(option.get("openInterest") or 0)
 
 
-def _spread_too_wide(option):
+def _spread_pct(option):
     bid = _bid(option)
     ask = _ask(option)
     mid = (bid + ask) / 2.0
     if mid <= 0:
-        return True
-    return (ask - bid) / mid > MAX_SPREAD_PCT
+        return 99.0
+    return (ask - bid) / mid
 
 
 def _sell_price_adjusted(option):
@@ -76,8 +78,9 @@ class CollarScanner:
     def __init__(self, schwab_client):
         self.schwab = schwab_client
 
-    def scan_ticker(self, ticker: str) -> list[dict]:
+    def scan_ticker(self, ticker: str):
         results = []
+        debug = Counter()
         try:
             chain = self.schwab.get_option_chain(ticker)
         except Exception as e:
@@ -86,7 +89,8 @@ class CollarScanner:
 
         spot = chain.get("underlyingPrice")
         if not spot or spot <= 0:
-            return results
+            debug["no_spot"] += 1
+            return results, debug
 
         call_map = chain.get("callExpDateMap", {})
         put_map  = chain.get("putExpDateMap",  {})
@@ -97,6 +101,7 @@ class CollarScanner:
         )[:MAX_EXPIRATIONS]
 
         for exp_date in sorted_exps:
+            debug["expirations"] += 1
             call_exp_key = next((k for k in call_map if k.startswith(exp_date + ":")), None)
             put_exp_key  = next((k for k in put_map  if k.startswith(exp_date + ":")), None)
             if not call_exp_key or not put_exp_key:
@@ -108,6 +113,7 @@ class CollarScanner:
             call_strikes = sorted(float(s) for s in calls if float(s) > spot)
             put_strikes  = sorted((float(s) for s in puts if float(s) < spot), reverse=True)
             if not call_strikes or not put_strikes:
+                debug["no_otm_strikes"] += 1
                 continue
 
             call_strike = call_strikes[0]
@@ -126,12 +132,24 @@ class CollarScanner:
             call_opt = call_contracts[0]
             put_opt  = put_contracts[0]
 
+            debug["candidates"] += 1
+
             if not _has_market(call_opt) or not _has_market(put_opt):
+                debug["no_market"] += 1
                 continue
 
-            if _oi(call_opt) < MIN_OI or _oi(put_opt) < MIN_OI:
+            if _oi(call_opt) < MIN_OI:
+                debug["call_oi_low"] += 1
                 continue
-            if _spread_too_wide(call_opt) or _spread_too_wide(put_opt):
+            if _oi(put_opt) < MIN_OI:
+                debug["put_oi_low"] += 1
+                continue
+
+            if _spread_pct(call_opt) > MAX_SPREAD_PCT:
+                debug["call_spread_wide"] += 1
+                continue
+            if _spread_pct(put_opt) > MAX_SPREAD_PCT:
+                debug["put_spread_wide"] += 1
                 continue
 
             call_credit = _sell_price_adjusted(call_opt)
@@ -149,25 +167,29 @@ class CollarScanner:
             neu_yearly = net_premium                          / spot * ann_factor * 100.0
             neg_yearly = ((put_strike  - spot) + net_premium) / spot * ann_factor * 100.0
 
-            if neg_yearly > MIN_NEG_YEARLY_PCT:
-                results.append(dict(
-                    ticker=ticker,
-                    exp_date=exp_date,
-                    dte=dte,
-                    spot=round(spot, 2),
-                    call_strike=call_strike,
-                    call_credit=round(call_credit, 2),
-                    put_strike=put_strike,
-                    put_cost=round(put_cost, 2),
-                    net_premium=round(net_premium, 2),
-                    pos_yearly=round(pos_yearly, 1),
-                    neu_yearly=round(neu_yearly, 1),
-                    neg_yearly=round(neg_yearly, 1),
-                    call_oi=_oi(call_opt),
-                    put_oi=_oi(put_opt),
-                ))
+            if neg_yearly <= MIN_NEG_YEARLY_PCT:
+                debug["below_neg_threshold"] += 1
+                continue
 
-        return results
+            debug["passed"] += 1
+            results.append(dict(
+                ticker=ticker,
+                exp_date=exp_date,
+                dte=dte,
+                spot=round(spot, 2),
+                call_strike=call_strike,
+                call_credit=round(call_credit, 2),
+                put_strike=put_strike,
+                put_cost=round(put_cost, 2),
+                net_premium=round(net_premium, 2),
+                pos_yearly=round(pos_yearly, 1),
+                neu_yearly=round(neu_yearly, 1),
+                neg_yearly=round(neg_yearly, 1),
+                call_oi=_oi(call_opt),
+                put_oi=_oi(put_opt),
+            ))
+
+        return results, debug
 
     @staticmethod
     def format_hit(r):
@@ -182,13 +204,27 @@ class CollarScanner:
         )
 
     @staticmethod
-    def format_summary(all_hits, scanned, successful, errors):
+    def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
         header = (
             f"🔎 *Collar Scan Complete*\n"
             f"Tickers: {scanned} total  ·  ✅ {successful} scanned  ·  ⚠️ {len(errors)} errored\n"
-            f"OI ≥ {MIN_OI} both legs · spread ≤ {int(MAX_SPREAD_PCT*100)}% of mid\n"
-            f"Fillable opportunities (NEG yearly > {MIN_NEG_YEARLY_PCT:g}%): *{len(all_hits)}*\n"
+            f"OI ≥ {MIN_OI} both legs · spread ≤ {int(MAX_SPREAD_PCT*100)}% of mid · NEG ≥ {MIN_NEG_YEARLY_PCT:g}%\n"
+            f"Fillable opportunities: *{len(all_hits)}*\n"
         )
+        if debug_totals:
+            d = debug_totals
+            header += (
+                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
+                f"  · no market:          {d.get('no_market', 0):,}\n"
+                f"  · call OI < {MIN_OI}:        {d.get('call_oi_low', 0):,}\n"
+                f"  · put OI < {MIN_OI}:         {d.get('put_oi_low', 0):,}\n"
+                f"  · call spread wide:   {d.get('call_spread_wide', 0):,}\n"
+                f"  · put spread wide:    {d.get('put_spread_wide', 0):,}\n"
+                f"  · NEG below threshold:{d.get('below_neg_threshold', 0):,}\n"
+                f"  · ✅ passed:          {d.get('passed', 0):,}\n"
+                f"  · no spot price:      {d.get('no_spot', 0):,} tickers\n"
+                f"  · no OTM strikes:     {d.get('no_otm_strikes', 0):,} expirations\n"
+            )
         if errors:
             err_block = "\n".join(f"  • {e}" for e in errors)
             if len(err_block) > 1500:

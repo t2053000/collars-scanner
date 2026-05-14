@@ -2,7 +2,6 @@
 scanner.py
 Collar scanner — uses MID-ADJUSTED fills (15% of spread away from mid)
 with liquidity filters: minimum open interest and maximum bid-ask spread.
-Now with debug counters to see what's filtering hits.
 """
 
 import logging
@@ -12,7 +11,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 MAX_EXPIRATIONS     = 10
-MIN_NEG_YEARLY_PCT  = 6.0
+MIN_NEG_YEARLY_PCT  = 0.4
 MID_ADJUST_FRAC     = 0.15
 MIN_OI              = 10
 MAX_SPREAD_PCT      = 0.75
@@ -222,8 +221,6 @@ class CollarScanner:
                 f"  · put spread wide:    {d.get('put_spread_wide', 0):,}\n"
                 f"  · NEG below threshold:{d.get('below_neg_threshold', 0):,}\n"
                 f"  · ✅ passed:          {d.get('passed', 0):,}\n"
-                f"  · no spot price:      {d.get('no_spot', 0):,} tickers\n"
-                f"  · no OTM strikes:     {d.get('no_otm_strikes', 0):,} expirations\n"
             )
         if errors:
             err_block = "\n".join(f"  • {e}" for e in errors)

@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars, spreads, deep-ITM, DCA, CSP, ITM, token refresh.
+Telegram bot — collars, spreads, deep-ITM, DCA, CSP, ITM, RITM, token refresh.
 """
 
 import asyncio
@@ -20,6 +20,7 @@ from deepcall import DeepCallScanner, clamp_cushion, DEFAULT_CUSHION_PCT, MIN_CU
 from dca      import DcaScanner
 from csp      import CspScanner
 from itm      import ItmScanner
+from ritm     import RitmScanner
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,7 @@ async def _edit_robust(message, text):
 async def cmd_start(update, context):
     await update.message.reply_text(
         "👋 *Options Scanner Bot*\n\n"
-        "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm`\n"
+        "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/refresh_token` to refresh Schwab.\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
@@ -95,8 +96,9 @@ async def cmd_help(update, context):
         "`/spreads [TICKER]` – cheap vertical debit spreads\n"
         "`/deepcall [N]` – deep-ITM buy-write\n"
         "`/dca` – dividend collar arbitrage\n"
-        "`/csp` – bull put credit spreads (Δ 0.20-0.30)\n"
-        "`/itm` – ITM conversion (same-strike call+put, strike below spot)\n"
+        "`/csp` – bull put credit spreads (OTM)\n"
+        "`/itm` – ITM conversion (long stock + sell call + buy put)\n"
+        "`/ritm` – reverse ITM conversion (short stock + buy call + sell put)\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`",
         parse_mode=ParseMode.MARKDOWN,
@@ -251,7 +253,6 @@ async def cmd_spreads(update, context):
 @authorized_only
 async def cmd_deepcall(update, context):
     scanner = context.application.bot_data["deepcall_scanner"]
-
     cushion_pct = DEFAULT_CUSHION_PCT
     if context.args:
         try:
@@ -270,7 +271,6 @@ async def cmd_deepcall(update, context):
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
-
     await _run_scan(
         update, context, scanner, "🛡️", DeepCallScanner.format_summary,
         scan_kwargs={"cushion_pct": cushion_pct},
@@ -307,7 +307,6 @@ async def cmd_csp(update, context):
 @authorized_only
 async def cmd_itm(update, context):
     scanner = context.application.bot_data["itm_scanner"]
-    # combine watchlist + dividend universe (dedup)
     div_tickers = github_store.get_div_tickers()
     watchlist = github_store.get_tickers()
     combined = sorted(set(watchlist) | set(div_tickers.keys()))
@@ -316,6 +315,20 @@ async def cmd_itm(update, context):
         return
     scanner.ticker_freqs = div_tickers
     await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
+                    tickers_override=combined)
+
+
+@authorized_only
+async def cmd_ritm(update, context):
+    scanner = context.application.bot_data["ritm_scanner"]
+    div_tickers = github_store.get_div_tickers()
+    watchlist = github_store.get_tickers()
+    combined = sorted(set(watchlist) | set(div_tickers.keys()))
+    if not combined:
+        await update.message.reply_text("_No tickers to scan._", parse_mode=ParseMode.MARKDOWN)
+        return
+    scanner.ticker_freqs = div_tickers
+    await _run_scan(update, context, scanner, "🔄", RitmScanner.format_summary,
                     tickers_override=combined)
 
 
@@ -346,7 +359,6 @@ async def cmd_submit_token(update, context):
         await update.message.reply_text("Usage: /submit_token <URL or code>")
         return
     payload = parts[1].strip()
-
     try:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
@@ -359,7 +371,6 @@ async def cmd_submit_token(update, context):
             "Most common cause: auth code already expired. Try /refresh_token again."
         )
         return
-
     await update.message.reply_text("✅ Token refreshed! Try /scan to confirm.")
 
 
@@ -370,6 +381,7 @@ def build_app(telegram_token,
               dca_scanner,
               csp_scanner,
               itm_scanner,
+              ritm_scanner,
               schwab_client):
     app = Application.builder().token(telegram_token).build()
     app.bot_data["collar_scanner"]   = collar_scanner
@@ -378,6 +390,7 @@ def build_app(telegram_token,
     app.bot_data["dca_scanner"]      = dca_scanner
     app.bot_data["csp_scanner"]      = csp_scanner
     app.bot_data["itm_scanner"]      = itm_scanner
+    app.bot_data["ritm_scanner"]     = ritm_scanner
     app.bot_data["schwab_client"]    = schwab_client
 
     app.add_handler(CommandHandler("start",         cmd_start))
@@ -393,6 +406,7 @@ def build_app(telegram_token,
     app.add_handler(CommandHandler("dca",           cmd_dca))
     app.add_handler(CommandHandler("csp",           cmd_csp))
     app.add_handler(CommandHandler("itm",           cmd_itm))
+    app.add_handler(CommandHandler("ritm",          cmd_ritm))
     app.add_handler(CommandHandler("logs",          cmd_logs))
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token",  cmd_submit_token))

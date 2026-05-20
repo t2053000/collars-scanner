@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — collars, spreads, deep-ITM, DCA, CSP, token refresh.
+Telegram bot — collars, spreads, deep-ITM, DCA, CSP, ITM, token refresh.
 """
 
 import asyncio
@@ -19,6 +19,7 @@ from spreads  import SpreadScanner
 from deepcall import DeepCallScanner, clamp_cushion, DEFAULT_CUSHION_PCT, MIN_CUSHION_PCT, MAX_CUSHION_PCT
 from dca      import DcaScanner
 from csp      import CspScanner
+from itm      import ItmScanner
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,7 @@ def authorized_only(func):
         user = update.effective_user
         if not user or not github_store.is_authorized(user.id):
             await update.message.reply_text(
-                f"❌ You are not authorized.\nYour Telegram ID: `{user.id if user else '?'}`\n"
-                "Ask the admin to add you to whitelist.txt in the GitHub repo.",
+                f"❌ You are not authorized.\nYour Telegram ID: `{user.id if user else '?'}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -42,13 +42,13 @@ def authorized_only(func):
     return wrapper
 
 
-def _truncate(text: str, limit: int = TG_MAX_LEN) -> str:
+def _truncate(text, limit=TG_MAX_LEN):
     if len(text) <= limit:
         return text
     return text[:limit - 30] + "\n\n_(truncated…)_"
 
 
-async def _send_robust(send_callable, text: str):
+async def _send_robust(send_callable, text):
     safe = _truncate(text)
     try:
         await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
@@ -63,7 +63,7 @@ async def _send_robust(send_callable, text: str):
         logger.error(f"Telegram BadRequest even on plain text: {e}")
 
 
-async def _edit_robust(message, text: str):
+async def _edit_robust(message, text):
     safe = _truncate(text)
     try:
         await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN)
@@ -78,40 +78,32 @@ async def _edit_robust(message, text: str):
         logger.error(f"Edit BadRequest even on plain text: {e}")
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update, context):
     await update.message.reply_text(
         "👋 *Options Scanner Bot*\n\n"
-        "`/scan` – positive-edge collars\n"
-        "`/spreads` – cheap bull-call & bear-put spreads\n"
-        "`/deepcall [N]` – deep-ITM buy-writes\n"
-        "`/dca` – dividend collar arbitrage\n"
-        "`/csp` – bull put credit spreads\n"
-        "`/refresh_token` – refresh Schwab token\n"
+        "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm`\n"
+        "`/refresh_token` to refresh Schwab.\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update, context):
     await update.message.reply_text(
         "*Commands*\n"
         "`/scan` – collar scan\n"
         "`/spreads [TICKER]` – cheap vertical debit spreads\n"
         "`/deepcall [N]` – deep-ITM buy-write\n"
         "`/dca` – dividend collar arbitrage\n"
-        "`/csp` – bull put credit spreads (Δ 0.20-0.30 OTM)\n"
-        "`/list` – show tickers\n"
-        "`/add  AAPL TSLA` – add tickers\n"
-        "`/remove AAPL` – remove tickers\n"
-        "`/logs` – recent errors\n"
-        "`/refresh_token` – start Schwab token refresh\n"
-        "`/submit_token URL_OR_CODE` – complete refresh\n"
-        "`/whoami` – your Telegram ID",
+        "`/csp` – bull put credit spreads (Δ 0.20-0.30)\n"
+        "`/itm` – ITM conversion (same-strike call+put, strike below spot)\n"
+        "`/list` `/add` `/remove` `/logs` `/whoami`\n"
+        "`/refresh_token` `/submit_token`",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
-async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_whoami(update, context):
     u = update.effective_user
     await update.message.reply_text(
         f"👤 `{u.id}`  —  {u.full_name}", parse_mode=ParseMode.MARKDOWN
@@ -119,7 +111,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_list(update, context):
     tickers = github_store.get_tickers()
     if not tickers:
         await update.message.reply_text("_Watchlist is empty._", parse_mode=ParseMode.MARKDOWN)
@@ -131,7 +123,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_add(update, context):
     if not context.args:
         await update.message.reply_text("Usage: `/add AAPL TSLA`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -140,7 +132,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_remove(update, context):
     if not context.args:
         await update.message.reply_text("Usage: `/remove AAPL`", parse_mode=ParseMode.MARKDOWN)
         return
@@ -149,7 +141,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_logs(update, context):
     if not _LAST_ERRORS:
         await update.message.reply_text("_No recent errors._", parse_mode=ParseMode.MARKDOWN)
         return
@@ -167,8 +159,7 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     tickers = tickers_override if tickers_override is not None else github_store.get_tickers()
     if not tickers:
         await update.message.reply_text(
-            "_Watchlist is empty – add some tickers first._",
-            parse_mode=ParseMode.MARKDOWN,
+            "_Watchlist is empty._", parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -178,14 +169,14 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     )
 
     loop = asyncio.get_running_loop()
-    all_hits: list[dict] = []
-    errors:   list[str]  = []
+    all_hits = []
+    errors = []
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
     successful = 0
-    debug_totals: Counter = Counter()
+    debug_totals = Counter()
     scan_kwargs = scan_kwargs or {}
 
-    async def scan_one(tk: str):
+    async def scan_one(tk):
         nonlocal successful
         async with sem:
             try:
@@ -203,7 +194,7 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
                 logger.exception(f"scan error for {tk}")
                 err_type = type(e).__name__
                 short = str(e)[:120].replace("\n", " ")
-                full  = str(e)[:400].replace("\n", " ")
+                full = str(e)[:400].replace("\n", " ")
                 errors.append(f"{tk}: {err_type} – {short}")
                 _LAST_ERRORS.append(f"{tk}: {err_type} – {full}")
                 ok = False
@@ -239,14 +230,14 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 
 
 @authorized_only
-async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scanner: CollarScanner = context.application.bot_data["collar_scanner"]
+async def cmd_scan(update, context):
+    scanner = context.application.bot_data["collar_scanner"]
     await _run_scan(update, context, scanner, "🔎", CollarScanner.format_summary)
 
 
 @authorized_only
-async def cmd_spreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scanner: SpreadScanner = context.application.bot_data["spread_scanner"]
+async def cmd_spreads(update, context):
+    scanner = context.application.bot_data["spread_scanner"]
     if context.args:
         sym = context.args[0].upper().strip()
         if sym.isalpha() and 1 <= len(sym) <= 6:
@@ -258,8 +249,8 @@ async def cmd_spreads(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scanner: DeepCallScanner = context.application.bot_data["deepcall_scanner"]
+async def cmd_deepcall(update, context):
+    scanner = context.application.bot_data["deepcall_scanner"]
 
     cushion_pct = DEFAULT_CUSHION_PCT
     if context.args:
@@ -275,7 +266,7 @@ async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         except ValueError:
             await update.message.reply_text(
-                f"Usage: `/deepcall [N]` (cushion%, default {DEFAULT_CUSHION_PCT:g})",
+                f"Usage: `/deepcall [N]` (default {DEFAULT_CUSHION_PCT:g})",
                 parse_mode=ParseMode.MARKDOWN,
             )
             return
@@ -288,72 +279,71 @@ async def cmd_deepcall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @authorized_only
-async def cmd_dca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scanner: DcaScanner = context.application.bot_data["dca_scanner"]
+async def cmd_dca(update, context):
+    scanner = context.application.bot_data["dca_scanner"]
     div_tickers = github_store.get_div_tickers()
     if not div_tickers:
-        await update.message.reply_text(
-            "_div_tickers.txt is empty in the data repo._",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text("_div_tickers.txt empty._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
-    await _run_scan(
-        update, context, scanner, "💰", DcaScanner.format_summary,
-        tickers_override=tickers,
-    )
+    await _run_scan(update, context, scanner, "💰", DcaScanner.format_summary,
+                    tickers_override=tickers)
 
 
 @authorized_only
-async def cmd_csp(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scanner: CspScanner = context.application.bot_data["csp_scanner"]
+async def cmd_csp(update, context):
+    scanner = context.application.bot_data["csp_scanner"]
     div_tickers = github_store.get_div_tickers()
     if not div_tickers:
-        await update.message.reply_text(
-            "_div_tickers.txt is empty in the data repo._",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text("_div_tickers.txt empty._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
-    await _run_scan(
-        update, context, scanner, "💵", CspScanner.format_summary,
-        tickers_override=tickers,
-    )
+    await _run_scan(update, context, scanner, "💵", CspScanner.format_summary,
+                    tickers_override=tickers)
 
-
-# ---------------------------------------------------------------------------
-# Token refresh
-# ---------------------------------------------------------------------------
 
 @authorized_only
-async def cmd_refresh_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_itm(update, context):
+    scanner = context.application.bot_data["itm_scanner"]
+    # combine watchlist + dividend universe (dedup)
+    div_tickers = github_store.get_div_tickers()
+    watchlist = github_store.get_tickers()
+    combined = sorted(set(watchlist) | set(div_tickers.keys()))
+    if not combined:
+        await update.message.reply_text("_No tickers to scan._", parse_mode=ParseMode.MARKDOWN)
+        return
+    scanner.ticker_freqs = div_tickers
+    await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
+                    tickers_override=combined)
+
+
+@authorized_only
+async def cmd_refresh_token(update, context):
     schwab_client = context.application.bot_data["schwab_client"]
     auth_url = schwab_client.build_authorize_url()
     msg = (
         "🔐 Schwab Token Refresh\n\n"
         "⚡ Auth codes expire in ~10 sec — be ready!\n\n"
-        "1️⃣ FIRST: type /submit_token (with space) in this chat — DO NOT SEND YET\n\n"
-        "2️⃣ Tap this URL:\n"
-        f"{auth_url}\n\n"
-        "3️⃣ Log in → tap Allow\n\n"
-        "4️⃣ Browser shows broken https://127.0.0.1/?code=... page\n\n"
-        "5️⃣ Long-press address bar → Copy URL\n\n"
-        "6️⃣ Switch back to Telegram → long-press in message field → Paste → Send IMMEDIATELY"
+        "1️⃣ type /submit_token (with space) — DO NOT SEND YET\n"
+        "2️⃣ Tap URL below:\n"
+        f"{auth_url}\n"
+        "3️⃣ Log in → tap Allow\n"
+        "4️⃣ Browser shows broken https://127.0.0.1/?code=... page\n"
+        "5️⃣ Long-press address bar → Copy URL\n"
+        "6️⃣ Switch to Telegram → paste → Send IMMEDIATELY"
     )
     await update.message.reply_text(msg, disable_web_page_preview=True)
 
 
 @authorized_only
-async def cmd_submit_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_submit_token(update, context):
     schwab_client = context.application.bot_data["schwab_client"]
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     if len(parts) < 2:
-        await update.message.reply_text(
-            "Usage: /submit_token <full URL or just the code>",
-        )
+        await update.message.reply_text("Usage: /submit_token <URL or code>")
         return
     payload = parts[1].strip()
 
@@ -366,29 +356,28 @@ async def cmd_submit_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("token exchange failed")
         await update.message.reply_text(
             f"❌ Token exchange failed:\n{type(e).__name__}: {str(e)[:300]}\n\n"
-            "Most common cause: auth code already expired (>10 sec). "
-            "Try /refresh_token again — be faster this time."
+            "Most common cause: auth code already expired. Try /refresh_token again."
         )
         return
 
-    await update.message.reply_text(
-        "✅ Token refreshed successfully! Try /scan to confirm."
-    )
+    await update.message.reply_text("✅ Token refreshed! Try /scan to confirm.")
 
 
-def build_app(telegram_token: str,
-              collar_scanner: CollarScanner,
-              spread_scanner: SpreadScanner,
-              deepcall_scanner: DeepCallScanner,
-              dca_scanner: DcaScanner,
-              csp_scanner: CspScanner,
-              schwab_client) -> Application:
+def build_app(telegram_token,
+              collar_scanner,
+              spread_scanner,
+              deepcall_scanner,
+              dca_scanner,
+              csp_scanner,
+              itm_scanner,
+              schwab_client):
     app = Application.builder().token(telegram_token).build()
     app.bot_data["collar_scanner"]   = collar_scanner
     app.bot_data["spread_scanner"]   = spread_scanner
     app.bot_data["deepcall_scanner"] = deepcall_scanner
     app.bot_data["dca_scanner"]      = dca_scanner
     app.bot_data["csp_scanner"]      = csp_scanner
+    app.bot_data["itm_scanner"]      = itm_scanner
     app.bot_data["schwab_client"]    = schwab_client
 
     app.add_handler(CommandHandler("start",         cmd_start))
@@ -403,6 +392,7 @@ def build_app(telegram_token: str,
     app.add_handler(CommandHandler("deepcalls",     cmd_deepcall))
     app.add_handler(CommandHandler("dca",           cmd_dca))
     app.add_handler(CommandHandler("csp",           cmd_csp))
+    app.add_handler(CommandHandler("itm",           cmd_itm))
     app.add_handler(CommandHandler("logs",          cmd_logs))
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token",  cmd_submit_token))

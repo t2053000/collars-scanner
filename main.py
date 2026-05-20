@@ -17,6 +17,7 @@ from deepcall      import DeepCallScanner
 from dca           import DcaScanner
 from csp           import CspScanner
 from itm           import ItmScanner
+from ritm          import RitmScanner
 import github_store
 import bot as bot_module
 
@@ -66,6 +67,7 @@ def main():
     dca_scanner      = DcaScanner(schwab, initial_div_freqs)
     csp_scanner      = CspScanner(schwab, initial_div_freqs)
     itm_scanner      = ItmScanner(schwab, initial_div_freqs)
+    ritm_scanner     = RitmScanner(schwab, initial_div_freqs)
 
     app = bot_module.build_app(
         os.environ["TELEGRAM_BOT_TOKEN"],
@@ -75,6 +77,7 @@ def main():
         dca_scanner,
         csp_scanner,
         itm_scanner,
+        ritm_scanner,
         schwab,
     )
 

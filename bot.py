@@ -1,17 +1,22 @@
 """
 bot.py
-Telegram bot — collars, spreads, deep-ITM, DCA, CSP, ITM, RITM, token refresh.
+Telegram bot — scanners + ITM trade execution with improve/cancel flow.
 """
 
 import asyncio
 import logging
+import time
+import uuid
 from collections import Counter, deque
 from functools import wraps
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import BadRequest
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters,
+)
 
 import github_store
 from scanner  import CollarScanner
@@ -21,6 +26,7 @@ from dca      import DcaScanner
 from csp      import CspScanner
 from itm      import ItmScanner
 from ritm     import RitmScanner
+import orders
 
 logger = logging.getLogger(__name__)
 
@@ -28,16 +34,37 @@ SCAN_CONCURRENCY = 5
 TG_MAX_LEN = 4000
 _LAST_ERRORS: deque = deque(maxlen=30)
 
+# Pending order state per user
+# key: (user_id, trade_id), value: dict with hit, walk_step, expires_at, message_id
+_PENDING_TRADES: dict = {}
+PENDING_TIMEOUT_SEC = 60
+
+# Active orders being monitored
+# key: user_id, value: dict with order_id, hit, pricing, chat_id, message_id
+_ACTIVE_ORDERS: dict = {}
+
 
 def authorized_only(func):
     @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update, context):
         user = update.effective_user
         if not user or not github_store.is_authorized(user.id):
             await update.message.reply_text(
-                f"❌ You are not authorized.\nYour Telegram ID: `{user.id if user else '?'}`",
+                f"❌ Not authorized. Telegram ID: `{user.id if user else '?'}`",
                 parse_mode=ParseMode.MARKDOWN,
             )
+            return
+        return await func(update, context)
+    return wrapper
+
+
+def authorized_callback(func):
+    """Decorator for callback query handlers."""
+    @wraps(func)
+    async def wrapper(update, context):
+        user = update.effective_user
+        if not user or not github_store.is_authorized(user.id):
+            await update.callback_query.answer("Not authorized.")
             return
         return await func(update, context)
     return wrapper
@@ -49,41 +76,56 @@ def _truncate(text, limit=TG_MAX_LEN):
     return text[:limit - 30] + "\n\n_(truncated…)_"
 
 
-async def _send_robust(send_callable, text):
+async def _send_robust(send_callable, text, reply_markup=None):
     safe = _truncate(text)
     try:
-        await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
+        if reply_markup:
+            await send_callable(safe, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await send_callable(safe, parse_mode=ParseMode.MARKDOWN)
         return
     except BadRequest as e:
-        logger.warning(f"Telegram BadRequest with markdown: {e}")
+        logger.warning(f"BadRequest with markdown: {e}")
     try:
         plain = safe.replace("*", "").replace("_", "").replace("`", "")
         plain = _truncate(plain)
-        await send_callable(plain)
+        if reply_markup:
+            await send_callable(plain, reply_markup=reply_markup)
+        else:
+            await send_callable(plain)
     except BadRequest as e:
-        logger.error(f"Telegram BadRequest even on plain text: {e}")
+        logger.error(f"BadRequest plain text: {e}")
 
 
-async def _edit_robust(message, text):
+async def _edit_robust(message, text, reply_markup=None):
     safe = _truncate(text)
     try:
-        await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN)
+        if reply_markup is not None:
+            await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN, reply_markup=reply_markup)
+        else:
+            await message.edit_text(safe, parse_mode=ParseMode.MARKDOWN)
         return
     except BadRequest as e:
         logger.warning(f"Edit BadRequest with markdown: {e}")
     try:
         plain = safe.replace("*", "").replace("_", "").replace("`", "")
         plain = _truncate(plain)
-        await message.edit_text(plain)
+        if reply_markup is not None:
+            await message.edit_text(plain, reply_markup=reply_markup)
+        else:
+            await message.edit_text(plain)
     except BadRequest as e:
-        logger.error(f"Edit BadRequest even on plain text: {e}")
+        logger.error(f"Edit BadRequest plain text: {e}")
 
+
+# ---------------------------------------------------------------------------
+# Basic commands
+# ---------------------------------------------------------------------------
 
 async def cmd_start(update, context):
     await update.message.reply_text(
         "👋 *Options Scanner Bot*\n\n"
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
-        "`/refresh_token` to refresh Schwab.\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -92,15 +134,10 @@ async def cmd_start(update, context):
 async def cmd_help(update, context):
     await update.message.reply_text(
         "*Commands*\n"
-        "`/scan` – collar scan\n"
-        "`/spreads [TICKER]` – cheap vertical debit spreads\n"
-        "`/deepcall [N]` – deep-ITM buy-write\n"
-        "`/dca` – dividend collar arbitrage\n"
-        "`/csp` – bull put credit spreads (OTM)\n"
-        "`/itm` – ITM conversion (long stock + sell call + buy put)\n"
-        "`/ritm` – reverse ITM conversion (short stock + buy call + sell put)\n"
+        "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
-        "`/refresh_token` `/submit_token`",
+        "`/refresh_token` `/submit_token`\n\n"
+        "*Trading:* /itm hits now have inline Trade buttons.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -116,7 +153,7 @@ async def cmd_whoami(update, context):
 async def cmd_list(update, context):
     tickers = github_store.get_tickers()
     if not tickers:
-        await update.message.reply_text("_Watchlist is empty._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_Empty._", parse_mode=ParseMode.MARKDOWN)
         return
     await update.message.reply_text(
         f"*Watchlist ({len(tickers)})*\n" + ", ".join(f"`{t}`" for t in tickers),
@@ -127,7 +164,7 @@ async def cmd_list(update, context):
 @authorized_only
 async def cmd_add(update, context):
     if not context.args:
-        await update.message.reply_text("Usage: `/add AAPL TSLA`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Usage: `/add AAPL`", parse_mode=ParseMode.MARKDOWN)
         return
     lines = [github_store.add_ticker(t)[1] for t in context.args]
     await update.message.reply_text("\n".join(lines))
@@ -145,24 +182,27 @@ async def cmd_remove(update, context):
 @authorized_only
 async def cmd_logs(update, context):
     if not _LAST_ERRORS:
-        await update.message.reply_text("_No recent errors._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_No errors._", parse_mode=ParseMode.MARKDOWN)
         return
     body = "\n".join(_LAST_ERRORS)
     if len(body) > 3800:
         body = body[-3800:]
     await update.message.reply_text(
-        "*Recent error details (most recent last):*\n```\n" + body + "\n```",
+        "*Recent errors:*\n```\n" + body + "\n```",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
+# ---------------------------------------------------------------------------
+# Generic scan runner
+# ---------------------------------------------------------------------------
+
 async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
-                    tickers_override=None, scan_kwargs=None, summary_kwargs=None):
+                    tickers_override=None, scan_kwargs=None, summary_kwargs=None,
+                    hits_with_buttons=False, scanner_key=None):
     tickers = tickers_override if tickers_override is not None else github_store.get_tickers()
     if not tickers:
-        await update.message.reply_text(
-            "_Watchlist is empty._", parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
 
     status_msg = await update.message.reply_text(
@@ -205,12 +245,8 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 
     await asyncio.gather(*(scan_one(t) for t in tickers))
 
-    kwargs = dict(
-        all_hits=all_hits,
-        scanned=len(tickers),
-        successful=successful,
-        errors=errors,
-    )
+    kwargs = dict(all_hits=all_hits, scanned=len(tickers),
+                  successful=successful, errors=errors)
     if summary_kwargs:
         kwargs.update(summary_kwargs)
     if debug_totals:
@@ -230,6 +266,45 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     for extra in messages[1:]:
         await _send_robust(update.message.reply_text, extra)
 
+    # If buttons enabled, send a follow-up trade-button message per hit
+    if hits_with_buttons and scanner_key == "itm" and all_hits:
+        all_hits.sort(key=lambda r: r["locked_apy"])
+        for hit in all_hits:
+            await _send_trade_button(update, context, hit)
+
+
+async def _send_trade_button(update, context, hit):
+    """Send a separate message with a Trade button for one ITM hit."""
+    trade_id = uuid.uuid4().hex[:8]
+    user_id = update.effective_user.id
+
+    # Store hit data so we can retrieve when button tapped
+    _PENDING_TRADES[(user_id, trade_id)] = {
+        "hit": hit,
+        "walk_step": 0,
+        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,  # long shelf life for trade buttons
+    }
+
+    pricing = orders.compute_legs_pricing(hit, walk_step=0)
+    summary = (
+        f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+        f"Strike ${hit['strike']:g} · Net credit ${pricing['net_credit']:.2f}/sh\n"
+        f"Locked: ${pricing['locked_total']:.2f} · APY: *{pricing['apy']:.1f}%*"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"💼 Trade @ {pricing['apy']:.1f}% APY",
+            callback_data=f"trade:{trade_id}",
+        )],
+    ])
+    await update.message.reply_text(
+        summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scanner commands
+# ---------------------------------------------------------------------------
 
 @authorized_only
 async def cmd_scan(update, context):
@@ -244,8 +319,7 @@ async def cmd_spreads(update, context):
         sym = context.args[0].upper().strip()
         if sym.isalpha() and 1 <= len(sym) <= 6:
             await _run_scan(update, context, scanner, "💸",
-                            SpreadScanner.format_summary,
-                            tickers_override=[sym])
+                            SpreadScanner.format_summary, tickers_override=[sym])
             return
     await _run_scan(update, context, scanner, "💸", SpreadScanner.format_summary)
 
@@ -261,14 +335,12 @@ async def cmd_deepcall(update, context):
             cushion_pct = clamped
             if was_clamped:
                 await update.message.reply_text(
-                    f"⚠️ Cushion `{requested}` outside range "
-                    f"`{MIN_CUSHION_PCT:g}–{MAX_CUSHION_PCT:g}` — using *{clamped:g}%*",
+                    f"⚠️ Using *{clamped:g}%* cushion",
                     parse_mode=ParseMode.MARKDOWN,
                 )
         except ValueError:
             await update.message.reply_text(
-                f"Usage: `/deepcall [N]` (default {DEFAULT_CUSHION_PCT:g})",
-                parse_mode=ParseMode.MARKDOWN,
+                f"Usage: `/deepcall [N]`", parse_mode=ParseMode.MARKDOWN
             )
             return
     await _run_scan(
@@ -283,7 +355,7 @@ async def cmd_dca(update, context):
     scanner = context.application.bot_data["dca_scanner"]
     div_tickers = github_store.get_div_tickers()
     if not div_tickers:
-        await update.message.reply_text("_div_tickers.txt empty._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_Empty._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
@@ -296,7 +368,7 @@ async def cmd_csp(update, context):
     scanner = context.application.bot_data["csp_scanner"]
     div_tickers = github_store.get_div_tickers()
     if not div_tickers:
-        await update.message.reply_text("_div_tickers.txt empty._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_Empty._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
@@ -311,11 +383,12 @@ async def cmd_itm(update, context):
     watchlist = github_store.get_tickers()
     combined = sorted(set(watchlist) | set(div_tickers.keys()))
     if not combined:
-        await update.message.reply_text("_No tickers to scan._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
-                    tickers_override=combined)
+                    tickers_override=combined,
+                    hits_with_buttons=True, scanner_key="itm")
 
 
 @authorized_only
@@ -325,12 +398,290 @@ async def cmd_ritm(update, context):
     watchlist = github_store.get_tickers()
     combined = sorted(set(watchlist) | set(div_tickers.keys()))
     if not combined:
-        await update.message.reply_text("_No tickers to scan._", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
     await _run_scan(update, context, scanner, "🔄", RitmScanner.format_summary,
                     tickers_override=combined)
 
+
+# ---------------------------------------------------------------------------
+# Trade flow
+# ---------------------------------------------------------------------------
+
+@authorized_callback
+async def cb_trade(update, context):
+    """Trade button tapped — show confirmation prompt."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    trade_id = query.data.split(":", 1)[1]
+
+    pending = _PENDING_TRADES.get((user_id, trade_id))
+    if not pending:
+        await query.message.reply_text("⏱ Trade expired. Re-run /itm to refresh.")
+        return
+
+    hit = pending["hit"]
+    walk_step = pending["walk_step"]
+    pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
+    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
+
+    # Update pending entry with shorter timeout for confirmation step
+    pending["expires_at"] = time.time() + PENDING_TIMEOUT_SEC
+    pending["pricing"] = pricing
+    pending["chat_id"] = query.message.chat_id
+    pending["trade_id"] = trade_id
+
+    preview = orders.format_order_preview(hit, pricing, next_pricing)
+    await query.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_yes_reply(update, context):
+    """Handler for messages that start with 'YES <TICKER>'."""
+    user = update.effective_user
+    if not user or not github_store.is_authorized(user.id):
+        return
+
+    text = (update.message.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2 or parts[0].upper() != "YES":
+        return
+
+    ticker = parts[1].upper()
+    user_id = user.id
+
+    # Find a matching pending trade for this user+ticker
+    now = time.time()
+    matching = None
+    for (uid, tid), pending in list(_PENDING_TRADES.items()):
+        if uid != user_id:
+            continue
+        if pending.get("hit", {}).get("ticker", "").upper() != ticker:
+            continue
+        if pending.get("expires_at", 0) < now:
+            del _PENDING_TRADES[(uid, tid)]
+            continue
+        if "pricing" not in pending:
+            continue  # not yet at confirmation step
+        matching = (uid, tid, pending)
+        break
+
+    if not matching:
+        await update.message.reply_text(
+            f"❌ No pending {ticker} trade. Tap the Trade button first and reply YES {ticker} within 60s."
+        )
+        return
+
+    uid, tid, pending = matching
+    hit = pending["hit"]
+    pricing = pending["pricing"]
+
+    # Build and submit order
+    schwab = context.application.bot_data["schwab_client"]
+    try:
+        order_payload = orders.build_itm_conversion_order(hit, pricing)
+    except Exception as e:
+        logger.exception("order build failed")
+        await update.message.reply_text(f"❌ Order build failed: {type(e).__name__}: {e}")
+        return
+
+    status_msg = await update.message.reply_text(
+        f"📤 Submitting {ticker} ITM conversion at ${pricing['apy']:.1f}% APY…"
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        order_id = await loop.run_in_executor(None, schwab.place_order, order_payload)
+    except Exception as e:
+        logger.exception("place_order failed")
+        await _edit_robust(status_msg, f"❌ Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        return
+
+    # Clean up pending
+    del _PENDING_TRADES[(uid, tid)]
+
+    # Start monitoring
+    _ACTIVE_ORDERS[user_id] = {
+        "order_id": order_id,
+        "hit": hit,
+        "pricing": pricing,
+        "walk_step": pending["walk_step"],
+        "chat_id": status_msg.chat_id,
+        "message_id": status_msg.message_id,
+    }
+
+    await _edit_robust(
+        status_msg,
+        f"📤 Order *{order_id}* submitted for {ticker}\n"
+        f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
+        f"APY if filled: *{pricing['apy']:.1f}%*\n"
+        f"⏳ Monitoring for fill (30s)…"
+    )
+
+    # Schedule monitor task
+    asyncio.create_task(
+        monitor_order(context, user_id, order_id, status_msg)
+    )
+
+
+async def monitor_order(context, user_id, order_id, status_msg):
+    """Poll order status for 30s. If unfilled, present Improve/Cancel buttons."""
+    schwab = context.application.bot_data["schwab_client"]
+    loop = asyncio.get_running_loop()
+    start = time.time()
+    filled = False
+
+    while time.time() - start < 30:
+        await asyncio.sleep(5)
+        try:
+            status = await loop.run_in_executor(None, schwab.get_order_status, order_id)
+            status_str = status.get("status", "UNKNOWN")
+            if status_str == "FILLED":
+                filled = True
+                break
+            if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
+                active = _ACTIVE_ORDERS.pop(user_id, None)
+                hit = active["hit"] if active else None
+                tkr = hit["ticker"] if hit else "?"
+                await _edit_robust(
+                    status_msg,
+                    f"⚠️ Order {order_id} for {tkr} ended with status: {status_str}",
+                )
+                return
+        except Exception as e:
+            logger.warning(f"order status poll failed: {e}")
+            continue
+
+    if filled:
+        active = _ACTIVE_ORDERS.pop(user_id, None)
+        hit = active["hit"] if active else None
+        tkr = hit["ticker"] if hit else "?"
+        await _edit_robust(
+            status_msg,
+            f"✅ *FILLED* — order {order_id} for {tkr} executed.",
+        )
+        return
+
+    # Not filled — offer Improve/Cancel
+    active = _ACTIVE_ORDERS.get(user_id)
+    if not active:
+        return
+
+    hit = active["hit"]
+    walk_step = active["walk_step"]
+    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
+    improve_enabled = orders.can_improve(next_pricing)
+
+    buttons = []
+    if improve_enabled:
+        buttons.append([InlineKeyboardButton(
+            f"🔧 Improve → {next_pricing['apy']:.1f}% APY",
+            callback_data=f"improve:{order_id}",
+        )])
+    buttons.append([InlineKeyboardButton(
+        "❌ Cancel order", callback_data=f"cancel:{order_id}",
+    )])
+    keyboard = InlineKeyboardMarkup(buttons)
+
+    floor_note = ""
+    if not improve_enabled:
+        floor_note = f"\n⚠️ Can't improve — next price would drop APY below {orders.MIN_APY_FLOOR_PCT:g}% floor."
+
+    await _edit_robust(
+        status_msg,
+        f"⏳ Order {order_id} for *{hit['ticker']}* not filled after 30s.\n"
+        f"Current limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
+        f"Current APY: {active['pricing']['apy']:.1f}%{floor_note}",
+        reply_markup=keyboard,
+    )
+
+
+@authorized_callback
+async def cb_improve(update, context):
+    """Improve button — cancel current order, submit at less favorable price."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    order_id = query.data.split(":", 1)[1]
+
+    active = _ACTIVE_ORDERS.get(user_id)
+    if not active or active["order_id"] != order_id:
+        await query.message.reply_text("⏱ Order session expired.")
+        return
+
+    schwab = context.application.bot_data["schwab_client"]
+    loop = asyncio.get_running_loop()
+    hit = active["hit"]
+
+    # Cancel current
+    try:
+        await loop.run_in_executor(None, schwab.cancel_order, order_id)
+    except Exception as e:
+        logger.warning(f"cancel during improve failed: {e}")
+
+    # Walk + resubmit
+    new_walk = active["walk_step"] + 1
+    new_pricing = orders.compute_legs_pricing(hit, walk_step=new_walk)
+    if not orders.can_improve(new_pricing):
+        await query.message.reply_text(
+            f"⚠️ Improvement would drop APY below {orders.MIN_APY_FLOOR_PCT:g}% floor. Aborted."
+        )
+        _ACTIVE_ORDERS.pop(user_id, None)
+        return
+
+    try:
+        order_payload = orders.build_itm_conversion_order(hit, new_pricing)
+        new_order_id = await loop.run_in_executor(None, schwab.place_order, order_payload)
+    except Exception as e:
+        logger.exception("improve resubmit failed")
+        await query.message.reply_text(f"❌ Resubmit failed: {type(e).__name__}: {e}")
+        _ACTIVE_ORDERS.pop(user_id, None)
+        return
+
+    status_msg = await query.message.reply_text(
+        f"🔁 Retry #{new_walk}: order *{new_order_id}* for {hit['ticker']} @ {new_pricing['apy']:.1f}% APY\n"
+        f"⏳ Monitoring (30s)…",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    _ACTIVE_ORDERS[user_id] = {
+        "order_id": new_order_id,
+        "hit": hit,
+        "pricing": new_pricing,
+        "walk_step": new_walk,
+        "chat_id": status_msg.chat_id,
+        "message_id": status_msg.message_id,
+    }
+    asyncio.create_task(monitor_order(context, user_id, new_order_id, status_msg))
+
+
+@authorized_callback
+async def cb_cancel(update, context):
+    """Cancel button — cancel order and clear state."""
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    order_id = query.data.split(":", 1)[1]
+
+    active = _ACTIVE_ORDERS.get(user_id)
+    if not active or active["order_id"] != order_id:
+        await query.message.reply_text("⏱ No active order.")
+        return
+
+    schwab = context.application.bot_data["schwab_client"]
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, schwab.cancel_order, order_id)
+        await query.message.reply_text(f"❌ Order {order_id} cancelled.")
+    except Exception as e:
+        await query.message.reply_text(f"⚠️ Cancel failed: {e}")
+    _ACTIVE_ORDERS.pop(user_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Token refresh
+# ---------------------------------------------------------------------------
 
 @authorized_only
 async def cmd_refresh_token(update, context):
@@ -368,11 +719,15 @@ async def cmd_submit_token(update, context):
         logger.exception("token exchange failed")
         await update.message.reply_text(
             f"❌ Token exchange failed:\n{type(e).__name__}: {str(e)[:300]}\n\n"
-            "Most common cause: auth code already expired. Try /refresh_token again."
+            "Most common: auth code expired. Try /refresh_token again."
         )
         return
-    await update.message.reply_text("✅ Token refreshed! Try /scan to confirm.")
+    await update.message.reply_text("✅ Token refreshed!")
 
+
+# ---------------------------------------------------------------------------
+# Wire everything up
+# ---------------------------------------------------------------------------
 
 def build_app(telegram_token,
               collar_scanner,
@@ -410,4 +765,15 @@ def build_app(telegram_token,
     app.add_handler(CommandHandler("logs",          cmd_logs))
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
+
+    # Trade flow callbacks
+    app.add_handler(CallbackQueryHandler(cb_trade,   pattern=r"^trade:"))
+    app.add_handler(CallbackQueryHandler(cb_improve, pattern=r"^improve:"))
+    app.add_handler(CallbackQueryHandler(cb_cancel,  pattern=r"^cancel:"))
+
+    # YES confirmation — match plain text messages starting with YES
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_yes_reply
+    ))
+
     return app

@@ -1,6 +1,6 @@
 """
 schwab_client.py
-Schwab API wrapper with on-the-fly token refresh.
+Schwab API wrapper with market data + trading.
 """
 
 import base64
@@ -25,6 +25,7 @@ class SchwabClient:
         self.token_path   = os.getenv("SCHWAB_TOKEN_PATH", "token.json")
         self.redirect_uri = os.getenv("SCHWAB_REDIRECT_URI", "https://127.0.0.1")
         self._client = None
+        self._account_hash = None
 
     def initialize(self):
         self._client = schwab.auth.client_from_token_file(
@@ -75,7 +76,7 @@ class SchwabClient:
             return {}
 
     # ------------------------------------------------------------------
-    # OAuth helpers used by /refresh_token + /submit_token
+    # OAuth helpers
     # ------------------------------------------------------------------
 
     def build_authorize_url(self) -> str:
@@ -87,15 +88,8 @@ class SchwabClient:
         )
 
     def exchange_code_for_token(self, code_or_url: str) -> None:
-        """
-        Accepts either:
-          - The full redirected URL (https://127.0.0.1/?code=...&session=...)
-          - Just the auth code value
-        Exchanges the code for tokens, writes token.json, reloads the client.
-        """
         text = code_or_url.strip().strip("'\"<>")
         code = None
-
         if text.startswith("http"):
             parsed = urlparse(text)
             qs = parse_qs(parsed.query)
@@ -103,9 +97,7 @@ class SchwabClient:
             if code_list:
                 code = code_list[0]
         else:
-            # raw code value pasted
             code = text
-
         if not code:
             raise ValueError("No 'code' value found in input.")
 
@@ -119,7 +111,6 @@ class SchwabClient:
             "code":         code,
             "redirect_uri": self.redirect_uri,
         }
-
         resp = httpx.post(
             "https://api.schwabapi.com/v1/oauth/token",
             headers=headers,
@@ -131,13 +122,66 @@ class SchwabClient:
                 f"Token exchange failed: HTTP {resp.status_code} – {resp.text[:300]}"
             )
         token_payload = resp.json()
-
         wrapped = {
             "creation_timestamp": int(time.time()),
             "token": token_payload,
         }
         with open(self.token_path, "w") as f:
             json.dump(wrapped, f)
-
         logger.info("New token written to %s", self.token_path)
         self.reload()
+
+    # ------------------------------------------------------------------
+    # TRADING METHODS
+    # ------------------------------------------------------------------
+
+    def get_account_hash(self) -> str:
+        """Fetch and cache the encrypted account hash (Schwab uses these instead of account numbers)."""
+        if self._account_hash:
+            return self._account_hash
+        resp = self._client.get_account_numbers()
+        resp.raise_for_status()
+        accounts = resp.json()
+        if not accounts:
+            raise RuntimeError("No Schwab accounts found.")
+        # Take first account; if you have multiple, this picks the primary
+        self._account_hash = accounts[0]["hashValue"]
+        logger.info(f"Resolved Schwab account hash (first account).")
+        return self._account_hash
+
+    def place_order(self, order_payload: dict) -> str:
+        """
+        Submit an order. Returns the Schwab orderId as string.
+        order_payload follows Schwab's Order schema (see orders.py builders).
+        """
+        account_hash = self.get_account_hash()
+        resp = self._client.place_order(account_hash, order_payload)
+        # Schwab returns 201 with order ID in Location header
+        if resp.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Order placement failed: HTTP {resp.status_code} – {resp.text[:500]}"
+            )
+        # Order ID is in the Location header: .../orders/12345
+        location = resp.headers.get("Location", "")
+        order_id = location.rsplit("/", 1)[-1] if location else ""
+        if not order_id:
+            raise RuntimeError(f"Could not extract order ID from response. Headers: {dict(resp.headers)}")
+        logger.info(f"Order placed successfully, ID: {order_id}")
+        return order_id
+
+    def get_order_status(self, order_id: str) -> dict:
+        """Get current status of an order by ID."""
+        account_hash = self.get_account_hash()
+        resp = self._client.get_order(order_id, account_hash)
+        resp.raise_for_status()
+        return resp.json()
+
+    def cancel_order(self, order_id: str) -> None:
+        """Cancel a working order."""
+        account_hash = self.get_account_hash()
+        resp = self._client.cancel_order(order_id, account_hash)
+        if resp.status_code not in (200, 204):
+            raise RuntimeError(
+                f"Cancel failed: HTTP {resp.status_code} – {resp.text[:300]}"
+            )
+        logger.info(f"Order {order_id} cancelled successfully.")

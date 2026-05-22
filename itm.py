@@ -1,9 +1,6 @@
 """
 itm.py
 ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
-Strike below spot → call ITM, put OTM. Locked single outcome:
-  net cash recovered = strike × 100 regardless of where stock goes.
-  locked profit = net_credit - (spot - strike)
 """
 
 import logging
@@ -248,6 +245,11 @@ class ItmScanner:
                     freq=freq,
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
+                    # Raw bid/ask for price-walking when user trades
+                    call_bid=_bid(call_opt),
+                    call_ask=_ask(call_opt),
+                    put_bid=_bid(put_opt),
+                    put_ask=_ask(put_opt),
                 ))
 
         return results, debug

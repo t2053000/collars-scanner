@@ -38,6 +38,8 @@ _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
 _ACTIVE_ORDERS: dict = {}
 
+MAX_TRADE_BUTTONS = 20
+
 
 def authorized_only(func):
     @wraps(func)
@@ -131,7 +133,7 @@ async def cmd_help(update, context):
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
-        "*Trading:* /itm hits have inline Trade buttons.",
+        "*Trading:* /itm hits have inline Trade buttons (top 20 only).",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -262,8 +264,15 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 
     if hits_with_buttons and scanner_key == "itm" and all_hits:
         all_hits.sort(key=lambda r: r["locked_apy"])
-        for hit in all_hits:
-            await _send_trade_button(update, context, hit)
+        # Send only the top 20 best hits (highest APY at the BOTTOM of chat)
+        top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+        for hit in top_hits:
+            try:
+                await _send_trade_button(update, context, hit)
+                await asyncio.sleep(0.5)  # throttle to avoid Telegram rate limits
+            except Exception as e:
+                logger.warning(f"trade button send failed for {hit.get('ticker')}: {e}")
+                continue
 
 
 async def _send_trade_button(update, context, hit):

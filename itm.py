@@ -1,6 +1,7 @@
 """
 itm.py
 ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
+Now commission-aware: filters out hits that don't profit after $1.30/contract.
 """
 
 import logging
@@ -15,6 +16,8 @@ STRIKES_BELOW_SPOT   = 4
 MID_ADJUST_FRAC      = 0.15
 MIN_OI               = 10
 MAX_SPREAD_PCT       = 0.75
+COMMISSION_PER_CONTRACT = 1.30          # $0.65/leg × 2 option legs
+MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0  # require at least $5/spread net
 
 
 _FREQ_DAYS = {
@@ -137,6 +140,9 @@ class ItmScanner:
         all_exp_dates = set(k.split(":")[0] for k in call_map) & \
                         set(k.split(":")[0] for k in put_map)
 
+        commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+        min_locked_per_share = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
+
         for exp_date in sorted(all_exp_dates):
             try:
                 exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
@@ -210,10 +216,11 @@ class ItmScanner:
                 net_credit = call_credit - put_cost
 
                 gap = spot - strike
-                locked_profit = net_credit - gap
+                locked_profit_pre_comm = net_credit - gap
+                locked_profit = locked_profit_pre_comm - commission_per_share
 
-                if locked_profit <= 0:
-                    debug["non_positive_locked"] += 1
+                if locked_profit < min_locked_per_share:
+                    debug["below_min_locked_after_comm"] += 1
                     continue
 
                 cost_basis = spot - net_credit
@@ -236,7 +243,9 @@ class ItmScanner:
                     put_cost=round(put_cost, 2),
                     net_credit=round(net_credit, 2),
                     gap=round(gap, 2),
-                    locked_profit=round(locked_profit, 2),
+                    locked_profit_pre_comm=round(locked_profit_pre_comm, 2),
+                    locked_profit=round(locked_profit, 4),
+                    locked_total=round(locked_profit * 100.0, 2),
                     locked_apy=round(locked_apy, 1),
                     cost_basis=round(cost_basis, 2),
                     annual_div=round(annual_div, 2),
@@ -245,7 +254,6 @@ class ItmScanner:
                     freq=freq,
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
-                    # Raw bid/ask for price-walking when user trades
                     call_bid=_bid(call_opt),
                     call_ask=_ask(call_opt),
                     put_bid=_bid(put_opt),
@@ -275,7 +283,7 @@ class ItmScanner:
             f"  💰 Cost basis: ${r['cost_basis']}/sh\n"
             f"{div_line}"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
-            f"  🎯 Locked profit: *${r['locked_profit']}/sh* (*{r['locked_apy']}% APY*)"
+            f"  🎯 Locked (net of ${COMMISSION_PER_CONTRACT:.2f} comm): *${r['locked_total']:.2f}* (*{r['locked_apy']}% APY*)"
         )
 
     @staticmethod
@@ -283,8 +291,9 @@ class ItmScanner:
         header = (
             f"🔒 *ITM Conversion Scan*\n"
             f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
-            f"Same-strike call+put · strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} · spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
-            f"Positive locked profit only · _Best at BOTTOM_\n"
+            f"Same-strike call+put · strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI}\n"
+            f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after ${COMMISSION_PER_CONTRACT:g} comm\n"
+            f"_Best at BOTTOM_\n"
         )
         if debug_totals:
             d = debug_totals
@@ -296,7 +305,7 @@ class ItmScanner:
                 f"  · put OI low:       {d.get('put_oi_low', 0):,}\n"
                 f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
                 f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
-                f"  · non-positive:     {d.get('non_positive_locked', 0):,}\n"
+                f"  · below min after comm: {d.get('below_min_locked_after_comm', 0):,}\n"
                 f"  · ✅ passed:        {d.get('passed', 0):,}\n"
             )
         header += f"\nOpportunities: *{len(all_hits)}*\n"
@@ -309,7 +318,7 @@ class ItmScanner:
         header += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
         if not all_hits:
-            return [header + "_No positive-locked-profit conversions found._"]
+            return [header + "_No profitable conversions found._"]
 
         all_hits.sort(key=lambda r: r["locked_apy"])
 

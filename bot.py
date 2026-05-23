@@ -34,13 +34,8 @@ SCAN_CONCURRENCY = 5
 TG_MAX_LEN = 4000
 _LAST_ERRORS: deque = deque(maxlen=30)
 
-# Pending order state per user
-# key: (user_id, trade_id), value: dict with hit, walk_step, expires_at, message_id
 _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
-
-# Active orders being monitored
-# key: user_id, value: dict with order_id, hit, pricing, chat_id, message_id
 _ACTIVE_ORDERS: dict = {}
 
 
@@ -59,7 +54,6 @@ def authorized_only(func):
 
 
 def authorized_callback(func):
-    """Decorator for callback query handlers."""
     @wraps(func)
     async def wrapper(update, context):
         user = update.effective_user
@@ -137,7 +131,7 @@ async def cmd_help(update, context):
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
-        "*Trading:* /itm hits now have inline Trade buttons.",
+        "*Trading:* /itm hits have inline Trade buttons.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -266,7 +260,6 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     for extra in messages[1:]:
         await _send_robust(update.message.reply_text, extra)
 
-    # If buttons enabled, send a follow-up trade-button message per hit
     if hits_with_buttons and scanner_key == "itm" and all_hits:
         all_hits.sort(key=lambda r: r["locked_apy"])
         for hit in all_hits:
@@ -278,11 +271,10 @@ async def _send_trade_button(update, context, hit):
     trade_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
 
-    # Store hit data so we can retrieve when button tapped
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit": hit,
         "walk_step": 0,
-        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,  # long shelf life for trade buttons
+        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
     }
 
     pricing = orders.compute_legs_pricing(hit, walk_step=0)
@@ -297,9 +289,17 @@ async def _send_trade_button(update, context, hit):
             callback_data=f"trade:{trade_id}",
         )],
     ])
-    await update.message.reply_text(
-        summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
-    )
+    try:
+        await update.message.reply_text(
+            summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard
+        )
+    except BadRequest as e:
+        logger.warning(f"trade button markdown failed: {e}")
+        plain = summary.replace("*", "").replace("_", "").replace("`", "")
+        try:
+            await update.message.reply_text(plain, reply_markup=keyboard)
+        except BadRequest as e2:
+            logger.error(f"trade button send failed even plain: {e2}")
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +411,6 @@ async def cmd_ritm(update, context):
 
 @authorized_callback
 async def cb_trade(update, context):
-    """Trade button tapped — show confirmation prompt."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -427,18 +426,20 @@ async def cb_trade(update, context):
     pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
 
-    # Update pending entry with shorter timeout for confirmation step
     pending["expires_at"] = time.time() + PENDING_TIMEOUT_SEC
     pending["pricing"] = pricing
     pending["chat_id"] = query.message.chat_id
     pending["trade_id"] = trade_id
 
     preview = orders.format_order_preview(hit, pricing, next_pricing)
-    await query.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await query.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN)
+    except BadRequest:
+        plain = preview.replace("*", "").replace("_", "").replace("`", "")
+        await query.message.reply_text(plain)
 
 
 async def handle_yes_reply(update, context):
-    """Handler for messages that start with 'YES <TICKER>'."""
     user = update.effective_user
     if not user or not github_store.is_authorized(user.id):
         return
@@ -451,7 +452,6 @@ async def handle_yes_reply(update, context):
     ticker = parts[1].upper()
     user_id = user.id
 
-    # Find a matching pending trade for this user+ticker
     now = time.time()
     matching = None
     for (uid, tid), pending in list(_PENDING_TRADES.items()):
@@ -463,7 +463,7 @@ async def handle_yes_reply(update, context):
             del _PENDING_TRADES[(uid, tid)]
             continue
         if "pricing" not in pending:
-            continue  # not yet at confirmation step
+            continue
         matching = (uid, tid, pending)
         break
 
@@ -477,7 +477,6 @@ async def handle_yes_reply(update, context):
     hit = pending["hit"]
     pricing = pending["pricing"]
 
-    # Build and submit order
     schwab = context.application.bot_data["schwab_client"]
     try:
         order_payload = orders.build_itm_conversion_order(hit, pricing)
@@ -487,7 +486,7 @@ async def handle_yes_reply(update, context):
         return
 
     status_msg = await update.message.reply_text(
-        f"📤 Submitting {ticker} ITM conversion at ${pricing['apy']:.1f}% APY…"
+        f"📤 Submitting {ticker} ITM conversion at {pricing['apy']:.1f}% APY…"
     )
 
     loop = asyncio.get_running_loop()
@@ -498,10 +497,8 @@ async def handle_yes_reply(update, context):
         await _edit_robust(status_msg, f"❌ Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
 
-    # Clean up pending
     del _PENDING_TRADES[(uid, tid)]
 
-    # Start monitoring
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id,
         "hit": hit,
@@ -519,14 +516,10 @@ async def handle_yes_reply(update, context):
         f"⏳ Monitoring for fill (30s)…"
     )
 
-    # Schedule monitor task
-    asyncio.create_task(
-        monitor_order(context, user_id, order_id, status_msg)
-    )
+    asyncio.create_task(monitor_order(context, user_id, order_id, status_msg))
 
 
 async def monitor_order(context, user_id, order_id, status_msg):
-    """Poll order status for 30s. If unfilled, present Improve/Cancel buttons."""
     schwab = context.application.bot_data["schwab_client"]
     loop = asyncio.get_running_loop()
     start = time.time()
@@ -563,7 +556,6 @@ async def monitor_order(context, user_id, order_id, status_msg):
         )
         return
 
-    # Not filled — offer Improve/Cancel
     active = _ACTIVE_ORDERS.get(user_id)
     if not active:
         return
@@ -599,7 +591,6 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
 @authorized_callback
 async def cb_improve(update, context):
-    """Improve button — cancel current order, submit at less favorable price."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -614,13 +605,11 @@ async def cb_improve(update, context):
     loop = asyncio.get_running_loop()
     hit = active["hit"]
 
-    # Cancel current
     try:
         await loop.run_in_executor(None, schwab.cancel_order, order_id)
     except Exception as e:
         logger.warning(f"cancel during improve failed: {e}")
 
-    # Walk + resubmit
     new_walk = active["walk_step"] + 1
     new_pricing = orders.compute_legs_pricing(hit, walk_step=new_walk)
     if not orders.can_improve(new_pricing):
@@ -658,7 +647,6 @@ async def cb_improve(update, context):
 
 @authorized_callback
 async def cb_cancel(update, context):
-    """Cancel button — cancel order and clear state."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
@@ -766,12 +754,10 @@ def build_app(telegram_token,
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
 
-    # Trade flow callbacks
     app.add_handler(CallbackQueryHandler(cb_trade,   pattern=r"^trade:"))
     app.add_handler(CallbackQueryHandler(cb_improve, pattern=r"^improve:"))
     app.add_handler(CallbackQueryHandler(cb_cancel,  pattern=r"^cancel:"))
 
-    # YES confirmation — match plain text messages starting with YES
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, handle_yes_reply
     ))

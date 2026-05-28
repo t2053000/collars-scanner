@@ -1,7 +1,7 @@
 """
 itm.py
 ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
-Now commission-aware: filters out hits that don't profit after $1.30/contract.
+Commission-aware, fillability-filtered, with primary + fallback pricing.
 """
 
 import logging
@@ -14,10 +14,11 @@ DTE_MIN              = 1
 DTE_MAX              = 45
 STRIKES_BELOW_SPOT   = 4
 MID_ADJUST_FRAC      = 0.15
-MIN_OI               = 10
-MAX_SPREAD_PCT       = 0.75
-COMMISSION_PER_CONTRACT = 1.30          # $0.65/leg × 2 option legs
-MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0  # require at least $5/spread net
+FALLBACK_STEP_FRAC   = 0.15          # fallback walks 15% of spread worse
+MIN_OI               = 50            # fillability: both legs need OI >= this
+MAX_SPREAD_PCT       = 0.40          # fillability: spread <= 40% of mid
+COMMISSION_PER_CONTRACT = 1.30
+MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
 
 
 _FREQ_DAYS = {
@@ -52,18 +53,20 @@ def _spread_pct(option):
     return (ask - bid) / mid
 
 
-def _sell_price(option):
+def _sell_price(option, extra_frac=0.0):
+    """Sell at mid - (MID_ADJUST_FRAC + extra_frac) * spread. Higher extra = worse (lower) sell."""
     bid = _bid(option)
     ask = _ask(option)
     mid = (bid + ask) / 2.0
-    return mid - MID_ADJUST_FRAC * (ask - bid)
+    return mid - (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
 
 
-def _buy_price(option):
+def _buy_price(option, extra_frac=0.0):
+    """Buy at mid + (MID_ADJUST_FRAC + extra_frac) * spread. Higher extra = worse (higher) buy."""
     bid = _bid(option)
     ask = _ask(option)
     mid = (bid + ask) / 2.0
-    return mid + MID_ADJUST_FRAC * (ask - bid)
+    return mid + (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
 
 
 def _compute_annual_div(fundamentals, spot):
@@ -93,6 +96,20 @@ def _project_ex_div_dates(last_ex_div, freq, until):
         count += 1
         next_div += timedelta(days=interval)
     return count
+
+
+def _locked_and_apy(spot, strike, call_credit, put_cost, dte):
+    """Return (net_credit, locked_after_comm_per_share, locked_total, apy)."""
+    net_credit = call_credit - put_cost
+    gap = spot - strike
+    commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+    locked = (net_credit - gap) - commission_per_share
+    cost_basis = spot - net_credit
+    if cost_basis <= 0 or dte <= 0:
+        apy = 0.0
+    else:
+        apy = (locked / cost_basis) * (365.0 / dte) * 100.0
+    return net_credit, locked, locked * 100.0, apy
 
 
 class ItmScanner:
@@ -140,7 +157,6 @@ class ItmScanner:
         all_exp_dates = set(k.split(":")[0] for k in call_map) & \
                         set(k.split(":")[0] for k in put_map)
 
-        commission_per_share = COMMISSION_PER_CONTRACT / 100.0
         min_locked_per_share = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
 
         for exp_date in sorted(all_exp_dates):
@@ -197,13 +213,13 @@ class ItmScanner:
                     debug["put_no_market"] += 1
                     continue
 
+                # FILLABILITY FILTER — both legs OI >= MIN_OI, spread <= MAX_SPREAD_PCT
                 if _oi(call_opt) < MIN_OI:
                     debug["call_oi_low"] += 1
                     continue
                 if _oi(put_opt) < MIN_OI:
                     debug["put_oi_low"] += 1
                     continue
-
                 if _spread_pct(call_opt) > MAX_SPREAD_PCT:
                     debug["call_spread_wide"] += 1
                     continue
@@ -211,23 +227,27 @@ class ItmScanner:
                     debug["put_spread_wide"] += 1
                     continue
 
-                call_credit = _sell_price(call_opt)
-                put_cost = _buy_price(put_opt)
-                net_credit = call_credit - put_cost
+                # PRIMARY pricing (mid-adjusted)
+                call_credit_p = _sell_price(call_opt)
+                put_cost_p = _buy_price(put_opt)
+                net_credit_p, locked_p, locked_total_p, apy_p = _locked_and_apy(
+                    spot, strike, call_credit_p, put_cost_p, dte
+                )
 
-                gap = spot - strike
-                locked_profit_pre_comm = net_credit - gap
-                locked_profit = locked_profit_pre_comm - commission_per_share
-
-                if locked_profit < min_locked_per_share:
+                if locked_p < min_locked_per_share:
                     debug["below_min_locked_after_comm"] += 1
                     continue
 
-                cost_basis = spot - net_credit
-                if cost_basis <= 0:
-                    continue
+                # FALLBACK pricing (walk 15% of spread worse on both legs)
+                call_credit_f = _sell_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
+                put_cost_f = _buy_price(put_opt, extra_frac=FALLBACK_STEP_FRAC)
+                net_credit_f, locked_f, locked_total_f, apy_f = _locked_and_apy(
+                    spot, strike, call_credit_f, put_cost_f, dte
+                )
 
-                locked_apy = (locked_profit / cost_basis) * (365.0 / dte) * 100.0
+                # Net debit per share to enter (stock - call credit + put cost)
+                primary_debit = spot - call_credit_p + put_cost_p
+                fallback_debit = spot - call_credit_f + put_cost_f
 
                 num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
                 div_yield_pct = (annual_div / spot) * 100.0 if spot > 0 else 0.0
@@ -239,15 +259,20 @@ class ItmScanner:
                     dte=dte,
                     spot=round(spot, 2),
                     strike=strike,
-                    call_credit=round(call_credit, 2),
-                    put_cost=round(put_cost, 2),
-                    net_credit=round(net_credit, 2),
-                    gap=round(gap, 2),
-                    locked_profit_pre_comm=round(locked_profit_pre_comm, 2),
-                    locked_profit=round(locked_profit, 4),
-                    locked_total=round(locked_profit * 100.0, 2),
-                    locked_apy=round(locked_apy, 1),
-                    cost_basis=round(cost_basis, 2),
+                    call_credit=round(call_credit_p, 2),
+                    put_cost=round(put_cost_p, 2),
+                    net_credit=round(net_credit_p, 2),
+                    gap=round(spot - strike, 2),
+                    locked_profit=round(locked_p, 4),
+                    locked_total=round(locked_total_p, 2),
+                    locked_apy=round(apy_p, 1),
+                    primary_debit=round(primary_debit, 2),
+                    # fallback
+                    fallback_debit=round(fallback_debit, 2),
+                    fallback_locked_total=round(locked_total_f, 2),
+                    fallback_apy=round(apy_f, 1),
+                    # context
+                    cost_basis=round(spot - net_credit_p, 2),
                     annual_div=round(annual_div, 2),
                     div_yield_pct=round(div_yield_pct, 2),
                     num_ex_divs=num_ex_divs,
@@ -280,10 +305,10 @@ class ItmScanner:
             f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
             f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
             f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
-            f"  💰 Cost basis: ${r['cost_basis']}/sh\n"
+            f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
+            f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
             f"{div_line}"
-            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}\n"
-            f"  🎯 Locked (net of ${COMMISSION_PER_CONTRACT:.2f} comm): *${r['locked_total']:.2f}* (*{r['locked_apy']}% APY*)"
+            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
         )
 
     @staticmethod
@@ -291,7 +316,7 @@ class ItmScanner:
         header = (
             f"🔒 *ITM Conversion Scan*\n"
             f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
-            f"Same-strike call+put · strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI}\n"
+            f"Strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} both legs · spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
             f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after ${COMMISSION_PER_CONTRACT:g} comm\n"
             f"_Best at BOTTOM_\n"
         )
@@ -301,11 +326,11 @@ class ItmScanner:
                 f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
                 f"  · call no market:   {d.get('call_no_market', 0):,}\n"
                 f"  · put no market:    {d.get('put_no_market', 0):,}\n"
-                f"  · call OI low:      {d.get('call_oi_low', 0):,}\n"
-                f"  · put OI low:       {d.get('put_oi_low', 0):,}\n"
+                f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"
+                f"  · put OI < {MIN_OI}:     {d.get('put_oi_low', 0):,}\n"
                 f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
                 f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
-                f"  · below min after comm: {d.get('below_min_locked_after_comm', 0):,}\n"
+                f"  · below min profit: {d.get('below_min_locked_after_comm', 0):,}\n"
                 f"  · ✅ passed:        {d.get('passed', 0):,}\n"
             )
         header += f"\nOpportunities: *{len(all_hits)}*\n"
@@ -318,7 +343,7 @@ class ItmScanner:
         header += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
         if not all_hits:
-            return [header + "_No profitable conversions found._"]
+            return [header + "_No fillable conversions found._"]
 
         all_hits.sort(key=lambda r: r["locked_apy"])
 

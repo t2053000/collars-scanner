@@ -1,6 +1,7 @@
 """
 bot.py
 Telegram bot — scanners + ITM trade execution with improve/cancel flow.
+Heavy logging on trade flow for debugging.
 """
 
 import asyncio
@@ -265,6 +266,7 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     if hits_with_buttons and scanner_key == "itm" and all_hits:
         all_hits.sort(key=lambda r: r["locked_apy"])
         top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+        logger.info(f"_run_scan: sending {len(top_hits)} trade buttons")
         for hit in top_hits:
             try:
                 await _send_trade_button(update, context, hit)
@@ -275,9 +277,9 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 
 
 async def _send_trade_button(update, context, hit):
-    """Send a separate message with a Trade button for one ITM hit."""
     trade_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
+    logger.info(f"_send_trade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
 
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit": hit,
@@ -415,37 +417,75 @@ async def cmd_ritm(update, context):
 
 
 # ---------------------------------------------------------------------------
-# Trade flow
+# Trade flow — with verbose logging
 # ---------------------------------------------------------------------------
 
 @authorized_callback
 async def cb_trade(update, context):
     query = update.callback_query
-    await query.answer()
+    logger.info(f"cb_trade FIRED user={update.effective_user.id} data={query.data}")
+    try:
+        await query.answer()
+    except Exception as e:
+        logger.exception(f"cb_trade: query.answer failed: {e}")
+
     user_id = update.effective_user.id
-    trade_id = query.data.split(":", 1)[1]
+    try:
+        trade_id = query.data.split(":", 1)[1]
+    except Exception as e:
+        logger.exception(f"cb_trade: failed to parse trade_id: {e}")
+        await query.message.reply_text(f"❌ Bad callback data: {query.data}")
+        return
 
     pending = _PENDING_TRADES.get((user_id, trade_id))
+    logger.info(f"cb_trade: pending lookup ({user_id},{trade_id}) found={pending is not None}, total pending={len(_PENDING_TRADES)}")
     if not pending:
-        await query.message.reply_text("⏱ Trade expired. Re-run /itm to refresh.")
+        await query.message.reply_text(
+            f"⏱ Trade expired (no entry for {trade_id}). Re-run /itm."
+        )
         return
 
     hit = pending["hit"]
     walk_step = pending["walk_step"]
-    pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
-    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
+    logger.info(f"cb_trade: ticker={hit.get('ticker')} walk_step={walk_step}")
+
+    try:
+        pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
+        next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
+        logger.info(f"cb_trade: pricing computed, apy={pricing.get('apy')}")
+    except Exception as e:
+        logger.exception(f"cb_trade: compute_legs_pricing failed: {e}")
+        await query.message.reply_text(f"❌ Pricing calc failed: {type(e).__name__}: {e}")
+        return
 
     pending["expires_at"] = time.time() + PENDING_TIMEOUT_SEC
     pending["pricing"] = pricing
     pending["chat_id"] = query.message.chat_id
     pending["trade_id"] = trade_id
 
-    preview = orders.format_order_preview(hit, pricing, next_pricing)
+    try:
+        preview = orders.format_order_preview(hit, pricing, next_pricing)
+        logger.info(f"cb_trade: preview built, {len(preview)} chars")
+    except Exception as e:
+        logger.exception(f"cb_trade: format_order_preview failed: {e}")
+        await query.message.reply_text(f"❌ Preview format failed: {type(e).__name__}: {e}")
+        return
+
     try:
         await query.message.reply_text(preview, parse_mode=ParseMode.MARKDOWN)
-    except BadRequest:
+        logger.info("cb_trade: preview sent (markdown)")
+    except BadRequest as e:
+        logger.warning(f"cb_trade: markdown failed: {e}, retrying plain")
         plain = preview.replace("*", "").replace("_", "").replace("`", "")
-        await query.message.reply_text(plain)
+        try:
+            await query.message.reply_text(plain)
+            logger.info("cb_trade: preview sent (plain)")
+        except Exception as e2:
+            logger.exception(f"cb_trade: plain preview failed: {e2}")
+            await query.message.reply_text(f"❌ Send failed: {type(e2).__name__}")
+    except Exception as e:
+        logger.exception(f"cb_trade: unexpected send error: {e}")
+        await query.message.reply_text(f"❌ Send error: {type(e).__name__}: {e}")
 
 
 async def handle_yes_reply(update, context):
@@ -458,37 +498,45 @@ async def handle_yes_reply(update, context):
     if len(parts) < 2 or parts[0].upper() != "YES":
         return
 
+    logger.info(f"handle_yes_reply: text='{text[:60]}' user={user.id}")
+
     ticker = parts[1].upper()
     user_id = user.id
 
     now = time.time()
     matching = None
+    logger.info(f"handle_yes_reply: searching {len(_PENDING_TRADES)} pending trades for user={user_id} ticker={ticker}")
     for (uid, tid), pending in list(_PENDING_TRADES.items()):
         if uid != user_id:
             continue
         if pending.get("hit", {}).get("ticker", "").upper() != ticker:
             continue
         if pending.get("expires_at", 0) < now:
+            logger.info(f"handle_yes_reply: removed expired {tid}")
             del _PENDING_TRADES[(uid, tid)]
             continue
         if "pricing" not in pending:
+            logger.info(f"handle_yes_reply: skipping {tid}, no pricing (button not tapped)")
             continue
         matching = (uid, tid, pending)
         break
 
     if not matching:
+        logger.info(f"handle_yes_reply: no matching pending for {ticker}")
         await update.message.reply_text(
-            f"❌ No pending {ticker} trade. Tap the Trade button first and reply YES {ticker} within 60s."
+            f"❌ No pending {ticker} trade. Tap Trade button first, then reply YES {ticker} within 60s."
         )
         return
 
     uid, tid, pending = matching
     hit = pending["hit"]
     pricing = pending["pricing"]
+    logger.info(f"handle_yes_reply: matched pending {tid}, building order")
 
     schwab = context.application.bot_data["schwab_client"]
     try:
         order_payload = orders.build_itm_conversion_order(hit, pricing)
+        logger.info(f"handle_yes_reply: order payload built")
     except Exception as e:
         logger.exception("order build failed")
         await update.message.reply_text(f"❌ Order build failed: {type(e).__name__}: {e}")
@@ -501,6 +549,7 @@ async def handle_yes_reply(update, context):
     loop = asyncio.get_running_loop()
     try:
         order_id = await loop.run_in_executor(None, schwab.place_order, order_payload)
+        logger.info(f"handle_yes_reply: order placed, id={order_id}")
     except Exception as e:
         logger.exception("place_order failed")
         await _edit_robust(status_msg, f"❌ Order rejected: {type(e).__name__}: {str(e)[:300]}")
@@ -529,6 +578,7 @@ async def handle_yes_reply(update, context):
 
 
 async def monitor_order(context, user_id, order_id, status_msg):
+    logger.info(f"monitor_order START: user={user_id} order={order_id}")
     schwab = context.application.bot_data["schwab_client"]
     loop = asyncio.get_running_loop()
     start = time.time()
@@ -539,6 +589,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
         try:
             status = await loop.run_in_executor(None, schwab.get_order_status, order_id)
             status_str = status.get("status", "UNKNOWN")
+            logger.info(f"monitor_order: order={order_id} status={status_str}")
             if status_str == "FILLED":
                 filled = True
                 break
@@ -548,7 +599,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
                 tkr = hit["ticker"] if hit else "?"
                 await _edit_robust(
                     status_msg,
-                    f"⚠️ Order {order_id} for {tkr} ended with status: {status_str}",
+                    f"⚠️ Order {order_id} for {tkr} ended: {status_str}",
                 )
                 return
         except Exception as e:
@@ -561,7 +612,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
         tkr = hit["ticker"] if hit else "?"
         await _edit_robust(
             status_msg,
-            f"✅ *FILLED* — order {order_id} for {tkr} executed.",
+            f"✅ *FILLED* — order {order_id} for {tkr}",
         )
         return
 
@@ -587,7 +638,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
     floor_note = ""
     if not improve_enabled:
-        floor_note = f"\n⚠️ Can't improve — next price would drop APY below {orders.MIN_APY_FLOOR_PCT:g}% floor."
+        floor_note = f"\n⚠️ Can't improve — next would drop below {orders.MIN_APY_FLOOR_PCT:g}% floor."
 
     await _edit_robust(
         status_msg,
@@ -601,6 +652,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
 @authorized_callback
 async def cb_improve(update, context):
     query = update.callback_query
+    logger.info(f"cb_improve FIRED user={update.effective_user.id} data={query.data}")
     await query.answer()
     user_id = update.effective_user.id
     order_id = query.data.split(":", 1)[1]
@@ -623,7 +675,7 @@ async def cb_improve(update, context):
     new_pricing = orders.compute_legs_pricing(hit, walk_step=new_walk)
     if not orders.can_improve(new_pricing):
         await query.message.reply_text(
-            f"⚠️ Improvement would drop APY below {orders.MIN_APY_FLOOR_PCT:g}% floor. Aborted."
+            f"⚠️ Improvement would drop below {orders.MIN_APY_FLOOR_PCT:g}% floor. Aborted."
         )
         _ACTIVE_ORDERS.pop(user_id, None)
         return
@@ -638,7 +690,7 @@ async def cb_improve(update, context):
         return
 
     status_msg = await query.message.reply_text(
-        f"🔁 Retry #{new_walk}: order *{new_order_id}* for {hit['ticker']} @ {new_pricing['apy']:.1f}% APY\n"
+        f"🔁 Retry #{new_walk}: order *{new_order_id}* @ {new_pricing['apy']:.1f}% APY\n"
         f"⏳ Monitoring (30s)…",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -657,6 +709,7 @@ async def cb_improve(update, context):
 @authorized_callback
 async def cb_cancel(update, context):
     query = update.callback_query
+    logger.info(f"cb_cancel FIRED user={update.effective_user.id} data={query.data}")
     await query.answer()
     user_id = update.effective_user.id
     order_id = query.data.split(":", 1)[1]

@@ -264,12 +264,11 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 
     if hits_with_buttons and scanner_key == "itm" and all_hits:
         all_hits.sort(key=lambda r: r["locked_apy"])
-        # Send only the top 20 best hits (highest APY at the BOTTOM of chat)
         top_hits = all_hits[-MAX_TRADE_BUTTONS:]
         for hit in top_hits:
             try:
                 await _send_trade_button(update, context, hit)
-                await asyncio.sleep(0.5)  # throttle to avoid Telegram rate limits
+                await asyncio.sleep(0.5)
             except Exception as e:
                 logger.warning(f"trade button send failed for {hit.get('ticker')}: {e}")
                 continue
@@ -286,15 +285,16 @@ async def _send_trade_button(update, context, hit):
         "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
     }
 
-    pricing = orders.compute_legs_pricing(hit, walk_step=0)
     summary = (
         f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
-        f"Strike ${hit['strike']:g} · Net credit ${pricing['net_credit']:.2f}/sh\n"
-        f"Locked: ${pricing['locked_total']:.2f} · APY: *{pricing['apy']:.1f}%*"
+        f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh\n"
+        f"💳 Pay ${hit['primary_debit']:.2f}/sh → *{hit['locked_apy']:.1f}% APY*\n"
+        f"🔄 Fallback ${hit['fallback_debit']:.2f}/sh → {hit['fallback_apy']:.1f}% APY\n"
+        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit['locked_total']:.0f}"
     )
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"💼 Trade @ {pricing['apy']:.1f}% APY",
+            f"💼 Trade @ {hit['locked_apy']:.1f}% APY",
             callback_data=f"trade:{trade_id}",
         )],
     ])

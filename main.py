@@ -81,8 +81,8 @@ def main():
         schwab,
     )
 
-    log.info("Bot starting – polling Telegram…")
-    app.run_polling(allowed_updates=["message"])
+    log.info("Bot starting – polling Telegram (messages + callback_queries)…")
+    app.run_polling(allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

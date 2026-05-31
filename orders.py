@@ -1,9 +1,13 @@
 """
 orders.py
-Order construction + price walking for the trade-from-Telegram flow.
+Order construction for /itm conversion and /ritm reverse-conversion trade flow.
 
-ITM conversion: BUY stock + SELL call + BUY put (strike below spot).
-Net cash OUT per share = stock_price - call_credit + put_cost (positive debit).
+ITM conversion (build_itm_conversion_order): BUY stock + SELL call + BUY put (strike < spot)
+RITM reverse (build_ritm_conversion_order): SHORT stock + BUY call + SELL put (strike > spot)
+
+For /ritm: submits at intentionally unfillable "parked" price ($0.50 worse than fair).
+The order sits as WORKING on Schwab. User must manually review and edit the limit
+price on Schwab to make it fill. This is a SAFETY PAUSE feature, not a bug.
 """
 
 import logging
@@ -16,9 +20,11 @@ INITIAL_MID_FRAC = 0.15
 IMPROVE_STEP_FRAC = 0.10
 MIN_APY_FLOOR_PCT = 10.0
 
+# /ritm: how much worse than fair we submit the limit price so it doesn't auto-fill
+RITM_PARK_OFFSET = 0.50  # $0.50 LESS credit than market (i.e., order sits unfilled)
+
 
 def build_option_symbol(ticker: str, exp_date: str, strike: float, opt_type: str) -> str:
-    """OSI symbol: SYM<spaces>YYMMDDC00012500"""
     exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
     yymmdd = exp_dt.strftime("%y%m%d")
     strike_int = int(round(strike * 1000))
@@ -27,18 +33,17 @@ def build_option_symbol(ticker: str, exp_date: str, strike: float, opt_type: str
     return f"{ticker_padded}{yymmdd}{opt_type.upper()}{strike_str}"
 
 
+# =========================================================================
+# ITM CONVERSION (unchanged from prior version)
+# =========================================================================
+
 def compute_legs_pricing(hit: dict, walk_step: int = 0):
-    """
-    Walk pricing: walk_step=0 starts at mid +/- 15%; each step adds 10% toward unfavorable side.
-    Returns dict with limit prices and projected APY.
-    """
     call_bid = hit.get("call_bid")
     call_ask = hit.get("call_ask")
     put_bid = hit.get("put_bid")
     put_ask = hit.get("put_ask")
 
     if None in (call_bid, call_ask, put_bid, put_ask):
-        # Fallback: use stored mid-adjusted prices, shrink by walk_step
         call_credit = hit["call_credit"]
         put_cost = hit["put_cost"]
         credit_shrink = 0.02 * walk_step
@@ -50,11 +55,9 @@ def compute_legs_pricing(hit: dict, walk_step: int = 0):
         put_mid = (put_bid + put_ask) / 2.0
         put_spread = put_ask - put_bid
 
-        # SELL call: start mid-15%, walk toward bid (lower price = worse fill for us)
         sell_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         call_credit = call_mid - sell_offset * call_spread
 
-        # BUY put: start mid+15%, walk toward ask (higher price = worse for us)
         buy_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         put_cost = put_mid + buy_offset * put_spread
 
@@ -97,25 +100,11 @@ def can_improve(pricing_next: dict) -> bool:
 
 
 def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
-    """
-    Build a Schwab NET_DEBIT multi-leg order:
-      LEG 1: BUY 100 shares of underlying (equity leg)
-      LEG 2: SELL_TO_OPEN 1 call at strike
-      LEG 3: BUY_TO_OPEN 1 put at same strike
-
-    Net debit per share = stock_price - call_credit + put_cost (POSITIVE NUMBER)
-    This is what you PAY per share. Schwab will fill at this debit or better.
-
-    SAFETY CHECKS:
-      - strike must be < spot (ITM conversion requires this)
-      - net debit must be positive (you should be paying, not receiving)
-    """
     ticker = hit["ticker"].upper()
     exp_date = hit["exp_date"]
     strike = float(hit["strike"])
     spot = float(pricing["stock_price"])
 
-    # SAFETY: strike must be below spot for ITM conversion
     if strike >= spot:
         raise ValueError(
             f"ITM conversion requires strike < spot. Got strike={strike}, spot={spot}. "
@@ -125,18 +114,14 @@ def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
     call_limit = float(pricing["call_limit"])
     put_limit = float(pricing["put_limit"])
 
-    # Net debit per share = pay for stock - get call credit + pay for put
     net_debit_per_share = spot - call_limit + put_limit
 
-    # SAFETY: net debit must be positive (we're paying, not receiving)
     if net_debit_per_share <= 0:
         raise ValueError(
             f"Net debit must be positive for ITM conversion. Got {net_debit_per_share:.4f}. "
             f"spot={spot}, call_credit={call_limit}, put_cost={put_limit}. Aborting."
         )
 
-    # SAFETY: net debit should be roughly equal to strike for a real conversion
-    # (because locked outcome = strike, and small locked profit means debit slightly below strike)
     if net_debit_per_share < strike * 0.5 or net_debit_per_share > spot * 1.1:
         raise ValueError(
             f"Net debit {net_debit_per_share:.2f} sanity-check failed for strike={strike}, spot={spot}. "
@@ -165,28 +150,19 @@ def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
                 "orderLegType": "EQUITY",
                 "instruction": "BUY",
                 "quantity": 100,
-                "instrument": {
-                    "symbol": ticker,
-                    "assetType": "EQUITY",
-                },
+                "instrument": {"symbol": ticker, "assetType": "EQUITY"},
             },
             {
                 "orderLegType": "OPTION",
                 "instruction": "SELL_TO_OPEN",
                 "quantity": 1,
-                "instrument": {
-                    "symbol": call_symbol,
-                    "assetType": "OPTION",
-                },
+                "instrument": {"symbol": call_symbol, "assetType": "OPTION"},
             },
             {
                 "orderLegType": "OPTION",
                 "instruction": "BUY_TO_OPEN",
                 "quantity": 1,
-                "instrument": {
-                    "symbol": put_symbol,
-                    "assetType": "OPTION",
-                },
+                "instrument": {"symbol": put_symbol, "assetType": "OPTION"},
             },
         ],
     }
@@ -217,8 +193,155 @@ def format_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) ->
         f"",
     ]
     if next_pricing and can_improve(next_pricing):
-        lines.append(
-            f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_"
-        )
+        lines.append(f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_")
     lines.append(f"Reply `YES {ticker}` within 60s to submit.")
+    return "\n".join(lines)
+
+
+# =========================================================================
+# RITM REVERSE CONVERSION (parked-price safety pause)
+# =========================================================================
+
+def compute_ritm_pricing(hit: dict):
+    """
+    Compute ritm leg prices at MARKET MID (fair value).
+    Used both for display and as basis for parked submission.
+    """
+    call_bid = hit.get("call_bid")
+    call_ask = hit.get("call_ask")
+    put_bid = hit.get("put_bid")
+    put_ask = hit.get("put_ask")
+
+    call_mid = (call_bid + call_ask) / 2.0
+    put_mid = (put_bid + put_ask) / 2.0
+
+    spot = hit["spot"]
+    strike = hit["strike"]
+
+    # Net credit at fair value: SELL stock (+spot) + SELL put (+put_mid) - BUY call (-call_mid)
+    # Stock leg cash flow is +spot, option leg net is (put_mid - call_mid)
+    fair_net_credit_per_share = spot + put_mid - call_mid
+
+    # Parked limit price: $0.50 LESS credit than fair (will NOT fill until user adjusts)
+    parked_net_credit_per_share = fair_net_credit_per_share - RITM_PARK_OFFSET
+
+    return {
+        "call_limit": round(call_mid, 2),
+        "put_limit": round(put_mid, 2),
+        "stock_price": spot,
+        "fair_net_credit_per_share": round(fair_net_credit_per_share, 2),
+        "parked_net_credit_per_share": round(parked_net_credit_per_share, 2),
+        "park_offset": RITM_PARK_OFFSET,
+    }
+
+
+def build_ritm_conversion_order(hit: dict, pricing: dict) -> dict:
+    """
+    Build a Schwab NET_CREDIT 3-leg reverse conversion:
+      LEG 1: SELL_SHORT 100 shares
+      LEG 2: BUY_TO_OPEN 1 call (strike > spot)
+      LEG 3: SELL_TO_OPEN 1 put (same strike)
+
+    Limit price is INTENTIONALLY $0.50 BELOW fair so the order sits as WORKING
+    on Schwab. User reviews and edits the price on Schwab to make it fill.
+
+    SAFETY CHECKS:
+      - strike must be > spot (RITM requires this)
+      - parked net credit must be positive
+    """
+    ticker = hit["ticker"].upper()
+    exp_date = hit["exp_date"]
+    strike = float(hit["strike"])
+    spot = float(pricing["stock_price"])
+
+    if strike <= spot:
+        raise ValueError(
+            f"RITM requires strike > spot. Got strike={strike}, spot={spot}. "
+            f"Ticker={ticker}. Aborting."
+        )
+
+    call_limit = float(pricing["call_limit"])
+    put_limit = float(pricing["put_limit"])
+    parked_credit = float(pricing["parked_net_credit_per_share"])
+
+    if parked_credit <= 0:
+        raise ValueError(
+            f"Parked net credit non-positive. Got {parked_credit:.4f}. "
+            f"spot={spot}, put_credit={put_limit}, call_cost={call_limit}. Aborting."
+        )
+
+    if parked_credit < strike * 0.5 or parked_credit > spot * 1.5:
+        raise ValueError(
+            f"Parked credit {parked_credit:.2f} sanity-check failed for strike={strike}, spot={spot}. Aborting."
+        )
+
+    call_symbol = build_option_symbol(ticker, exp_date, strike, "C")
+    put_symbol = build_option_symbol(ticker, exp_date, strike, "P")
+
+    price_str = f"{parked_credit:.2f}"
+
+    logger.info(
+        f"build_ritm_conversion_order: ticker={ticker} exp={exp_date} strike={strike} spot={spot} "
+        f"call_cost={call_limit} put_credit={put_limit} fair_credit={pricing['fair_net_credit_per_share']:.2f} "
+        f"PARKED_NET_CREDIT={price_str} (offset=${RITM_PARK_OFFSET})"
+    )
+
+    order = {
+        "orderType": "NET_CREDIT",
+        "session": "NORMAL",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "complexOrderStrategyType": "CUSTOM",
+        "price": price_str,
+        "orderLegCollection": [
+            {
+                "orderLegType": "EQUITY",
+                "instruction": "SELL_SHORT",
+                "quantity": 100,
+                "instrument": {"symbol": ticker, "assetType": "EQUITY"},
+            },
+            {
+                "orderLegType": "OPTION",
+                "instruction": "BUY_TO_OPEN",
+                "quantity": 1,
+                "instrument": {"symbol": call_symbol, "assetType": "OPTION"},
+            },
+            {
+                "orderLegType": "OPTION",
+                "instruction": "SELL_TO_OPEN",
+                "quantity": 1,
+                "instrument": {"symbol": put_symbol, "assetType": "OPTION"},
+            },
+        ],
+    }
+    return order
+
+
+def format_ritm_preview(hit: dict, pricing: dict) -> str:
+    ticker = hit["ticker"]
+    spot = pricing["stock_price"]
+    strike = hit["strike"]
+    fair = pricing["fair_net_credit_per_share"]
+    parked = pricing["parked_net_credit_per_share"]
+
+    lines = [
+        f"⚠️ *CONFIRM RITM REVERSE CONVERSION*",
+        f"*{ticker}* @ ${spot}  ·  strike ${strike:g}  ·  exp {hit['exp_date']} ({hit['dte']}d)",
+        f"",
+        f"📦 1 spread = 3 legs (atomic combo):",
+        f"  · SHORT 100 shares @ ~${spot:.2f}",
+        f"  · BUY  1 C ${strike:g} @ limit ${pricing['call_limit']:.2f}",
+        f"  · SELL 1 P ${strike:g} @ limit ${pricing['put_limit']:.2f}",
+        f"",
+        f"💰 Fair net credit: ${fair:.2f}/sh",
+        f"🅿️ *PARKED at ${parked:.2f}/sh* (${pricing['park_offset']:.2f} below fair)",
+        f"📊 Locked (fair, assuming 25% borrow): *${hit['locked_total']:.2f}*",
+        f"📈 APY (fair): *{hit['locked_apy']:.1f}%*",
+        f"",
+        f"⚠️ *Requires margin + naked-put approval*",
+        f"⚠️ Order will sit UNFILLED on Schwab.",
+        f"   Go to Schwab and edit limit price UP to fill.",
+        f"",
+        f"Reply `YES {ticker}` within 60s to submit (parked).",
+    ]
     return "\n".join(lines)

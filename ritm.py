@@ -22,7 +22,6 @@ MAX_HITS = 50
 
 
 def _load_tickers_safely():
-    """Try multiple known function names in github_store; fall back to empty list."""
     try:
         import github_store
     except ImportError:
@@ -37,6 +36,14 @@ def _load_tickers_safely():
                 if result:
                     logger.info(f"loaded tickers via github_store.{name}, count={len(result)}")
                     return result
+            except TypeError:
+                try:
+                    result = fn()
+                    if result:
+                        logger.info(f"loaded tickers via github_store.{name}() no-arg, count={len(result)}")
+                        return result
+                except Exception as e:
+                    logger.warning(f"github_store.{name}() no-arg failed: {e}")
             except Exception as e:
                 logger.warning(f"github_store.{name} failed: {e}")
                 continue
@@ -188,9 +195,21 @@ def format_ritm_hit(hit, idx, total):
 
 
 class RitmScanner:
-    """Backwards-compat shim for main.py that imports RitmScanner."""
-    @staticmethod
-    def run():
+    """Shim accepting whatever args main.py passes."""
+
+    def __init__(self, schwab_client=None, div_freqs=None, *args, **kwargs):
+        self.schwab = schwab_client
+        self.div_freqs = div_freqs or {}
+        logger.info(f"RitmScanner init: schwab={'set' if schwab_client else 'none'}, "
+                    f"div_freqs_count={len(self.div_freqs) if hasattr(self.div_freqs, '__len__') else 0}")
+
+    def run(self, *args, **kwargs):
+        return scan_ritm()
+
+    def scan(self, *args, **kwargs):
+        return scan_ritm()
+
+    def execute(self, *args, **kwargs):
         return scan_ritm()
 
     @staticmethod

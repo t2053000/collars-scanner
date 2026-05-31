@@ -1,14 +1,12 @@
 """
 ritm.py - Reverse ITM conversion scanner.
-Setup: SHORT 100 stock + BUY 1 call + SELL 1 put at same strike (strike > spot).
-Requires margin account with short-sale and naked-put approval.
-Borrow rate assumed at 25% APR (conservative).
+Setup: SHORT 100 stock + BUY 1 call + SELL 1 put (strike > spot).
+Requires margin + naked-put approval. Borrow assumed at 25% APR.
 """
 
 import logging
 from datetime import datetime
 from schwab_client import SchwabClient
-from github_store import load_tickers
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +19,29 @@ MAX_SPREAD_PCT = 0.40
 MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
 FALLBACK_STEP_FRAC = 0.15
 MAX_HITS = 50
+
+
+def _load_tickers_safely():
+    """Try multiple known function names in github_store; fall back to empty list."""
+    try:
+        import github_store
+    except ImportError:
+        logger.warning("github_store not importable")
+        return []
+    for name in ["load_tickers", "read_tickers", "get_tickers", "list_tickers",
+                 "load_file", "read_file", "fetch_tickers"]:
+        fn = getattr(github_store, name, None)
+        if callable(fn):
+            try:
+                result = fn("tickers.txt")
+                if result:
+                    logger.info(f"loaded tickers via github_store.{name}, count={len(result)}")
+                    return result
+            except Exception as e:
+                logger.warning(f"github_store.{name} failed: {e}")
+                continue
+    logger.warning("no working ticker-loader found in github_store")
+    return []
 
 
 def _mid(bid, ask):
@@ -41,7 +62,7 @@ def _spread_pct(bid, ask):
 def scan_ritm(tickers=None):
     client = SchwabClient()
     if tickers is None:
-        tickers = load_tickers("tickers.txt")
+        tickers = _load_tickers_safely()
 
     hits = []
     today = datetime.now().date()
@@ -166,8 +187,8 @@ def format_ritm_hit(hit, idx, total):
     )
 
 
-# Backwards-compat shim for main.py that imports RitmScanner
 class RitmScanner:
+    """Backwards-compat shim for main.py that imports RitmScanner."""
     @staticmethod
     def run():
         return scan_ritm()

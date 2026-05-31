@@ -1,14 +1,8 @@
 """
-ritm.py
-Reverse ITM conversion scanner.
-
-Setup: SHORT 100 shares + BUY 1 call (strike > spot) + SELL 1 put (same strike)
-At expiry: position locks at strike regardless of underlying.
-Locked profit per share = net_credit_received - (strike - spot) - borrow_cost - dividend_cost
-
-Requires margin account with short-sale and naked-put approval on Schwab.
-Borrow rate assumed at 25% APR (conservative — small caps with put skew
-that show up in /ritm hits often have high borrow).
+ritm.py - Reverse ITM conversion scanner.
+Setup: SHORT 100 stock + BUY 1 call + SELL 1 put at same strike (strike > spot).
+Requires margin account with short-sale and naked-put approval.
+Borrow rate assumed at 25% APR (conservative).
 """
 
 import logging
@@ -18,19 +12,18 @@ from github_store import load_tickers
 
 logger = logging.getLogger(__name__)
 
-# --- Filter constants ---
 DTE_MIN = 1
 DTE_MAX = 14
-BORROW_RATE_PCT = 25.0  # conservative annualized borrow rate
+BORROW_RATE_PCT = 25.0
 COMMISSION_PER_CONTRACT = 1.30
 MIN_OI = 50
 MAX_SPREAD_PCT = 0.40
 MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
-FALLBACK_STEP_FRAC = 0.15  # how much worse the fallback price is vs mid
+FALLBACK_STEP_FRAC = 0.15
 MAX_HITS = 50
 
 
-def _safe_mid(bid, ask):
+def _mid(bid, ask):
     if bid is None or ask is None or bid <= 0 or ask <= 0:
         return None
     return (bid + ask) / 2.0
@@ -46,10 +39,6 @@ def _spread_pct(bid, ask):
 
 
 def scan_ritm(tickers=None):
-    """
-    Scan tickers for reverse-conversion opportunities.
-    Returns list of hit dicts, sorted ascending by locked_apy (best last).
-    """
     client = SchwabClient()
     if tickers is None:
         tickers = load_tickers("tickers.txt")
@@ -61,7 +50,6 @@ def scan_ritm(tickers=None):
         ticker = ticker.strip().upper()
         if not ticker:
             continue
-
         try:
             quote = client.get_quote(ticker)
             spot = quote.get("last") or quote.get("mark")
@@ -78,7 +66,6 @@ def scan_ritm(tickers=None):
             for exp_key in call_map:
                 if exp_key not in put_map:
                     continue
-
                 exp_date_str = exp_key.split(":")[0]
                 exp_date = datetime.strptime(exp_date_str, "%Y-%m-%d").date()
                 dte = (exp_date - today).days
@@ -89,14 +76,11 @@ def scan_ritm(tickers=None):
                     if strike_str not in put_map[exp_key]:
                         continue
                     strike = float(strike_str)
-
-                    # /ritm: strike must be ABOVE spot
                     if strike <= spot:
                         continue
 
                     call_data = call_map[exp_key][strike_str][0]
                     put_data = put_map[exp_key][strike_str][0]
-
                     call_bid = call_data.get("bid")
                     call_ask = call_data.get("ask")
                     put_bid = put_data.get("bid")
@@ -106,42 +90,93 @@ def scan_ritm(tickers=None):
                     put_oi = put_data.get("openInterest", 0) or 0
                     if call_oi < MIN_OI or put_oi < MIN_OI:
                         continue
-
                     if _spread_pct(call_bid, call_ask) > MAX_SPREAD_PCT:
                         continue
                     if _spread_pct(put_bid, put_ask) > MAX_SPREAD_PCT:
                         continue
 
-                    call_mid = _safe_mid(call_bid, call_ask)
-                    put_mid = _safe_mid(put_bid, put_ask)
+                    call_mid = _mid(call_bid, call_ask)
+                    put_mid = _mid(put_bid, put_ask)
                     if call_mid is None or put_mid is None:
                         continue
 
-                    # /ritm: SELL stock at spot, BUY call (pay), SELL put (collect)
-                    # Net credit per share = spot + put_premium - call_premium
-                    # (we receive stock proceeds + put premium, pay for call)
-                    # gap = strike - spot (we owe this back at expiry to close)
-
-                    # Primary pricing: option mids
-                    call_cost = call_mid
-                    put_credit = put_mid
-                    net_premium_credit = put_credit - call_cost  # could be negative
-
-                    # gap to close at expiry (locked outcome = -strike, started at spot)
+                    net_premium = put_mid - call_mid
                     gap = strike - spot
-
-                    # Borrow cost per share over holding period
-                    borrow_cost_per_share = spot * (BORROW_RATE_PCT / 100.0) * (dte / 365.0)
-
-                    # Dividend cost (assume zero for now; future: pull ex-div calendar)
-                    div_cost_per_share = 0.0
-
-                    locked_per_share = net_premium_credit - gap - borrow_cost_per_share - div_cost_per_share
-                    commission_per_share = COMMISSION_PER_CONTRACT / 100.0  # both option legs
+                    borrow = spot * (BORROW_RATE_PCT / 100.0) * (dte / 365.0)
+                    locked_per_share = net_premium - gap - borrow
+                    commission_per_share = COMMISSION_PER_CONTRACT / 100.0
                     locked_after_comm = locked_per_share - commission_per_share
                     locked_total = locked_after_comm * 100.0
 
                     if locked_total < MIN_LOCKED_AFTER_COMM_PER_CONTRACT:
                         continue
 
-                    # Capital required for /ritm: margin = ~50% of short stock value
+                    cost_basis = spot
+                    if cost_basis <= 0 or dte <= 0:
+                        continue
+                    apy = (locked_after_comm / cost_basis) * (365.0 / dte) * 100.0
+
+                    call_fallback = call_mid + FALLBACK_STEP_FRAC * (call_ask - call_bid)
+                    put_fallback = put_mid - FALLBACK_STEP_FRAC * (put_ask - put_bid)
+                    fb_net = put_fallback - call_fallback
+                    fb_locked = fb_net - gap - borrow - commission_per_share
+                    fb_apy = (fb_locked / cost_basis) * (365.0 / dte) * 100.0 if fb_locked > 0 else 0.0
+
+                    hits.append({
+                        "ticker": ticker,
+                        "spot": round(spot, 2),
+                        "strike": strike,
+                        "exp_date": exp_date_str,
+                        "dte": dte,
+                        "call_bid": call_bid,
+                        "call_ask": call_ask,
+                        "put_bid": put_bid,
+                        "put_ask": put_ask,
+                        "call_cost": round(call_mid, 2),
+                        "put_credit": round(put_mid, 2),
+                        "net_premium_credit": round(net_premium, 2),
+                        "gap": round(gap, 2),
+                        "borrow_cost_per_share": round(borrow, 4),
+                        "locked_per_share": round(locked_per_share, 2),
+                        "locked_total": round(locked_total, 2),
+                        "locked_apy": round(apy, 1),
+                        "fallback_locked": round(fb_locked * 100, 2),
+                        "fallback_apy": round(fb_apy, 1),
+                        "call_oi": call_oi,
+                        "put_oi": put_oi,
+                    })
+
+        except Exception as e:
+            logger.warning(f"/ritm scan error on {ticker}: {e}")
+            continue
+
+    hits.sort(key=lambda h: h["locked_apy"])
+    return hits[-MAX_HITS:]
+
+
+def format_ritm_hit(hit, idx, total):
+    return (
+        f"*{idx}/{total}  {hit['ticker']}*  spot ${hit['spot']}\n"
+        f"  strike ${hit['strike']:g}  exp {hit['exp_date']} ({hit['dte']}d)\n"
+        f"  call mid ${hit['call_cost']}  put mid ${hit['put_credit']}\n"
+        f"  net credit ${hit['net_premium_credit']}  gap ${hit['gap']}\n"
+        f"  borrow @25%: -${hit['borrow_cost_per_share']:.2f}/sh\n"
+        f"  *locked ${hit['locked_total']:.2f}* @ *{hit['locked_apy']:.1f}% APY*\n"
+        f"  fallback: ${hit['fallback_locked']:.2f} @ {hit['fallback_apy']:.1f}% APY\n"
+    )
+
+
+# Backwards-compat shim for main.py that imports RitmScanner
+class RitmScanner:
+    @staticmethod
+    def run():
+        return scan_ritm()
+
+    @staticmethod
+    def format(hits):
+        if not hits:
+            return "No /ritm hits."
+        lines = [f"📊 /ritm found {len(hits)} hits (borrow 25%):\n"]
+        for i, h in enumerate(hits, 1):
+            lines.append(format_ritm_hit(h, i, len(hits)))
+        return "\n".join(lines)

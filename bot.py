@@ -1,6 +1,6 @@
 """
 bot.py — Telegram handlers and trade flow.
-Defensive imports against unknown github_store API.
+Defensive imports + flexible build_app signature.
 """
 
 import asyncio
@@ -31,22 +31,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 # ---------- Defensive github_store wrapper ----------
 import github_store as _gs
 
-def _gs_call(names, *args, default=None):
-    """Try a list of possible function names on github_store; return first that works."""
+
+def _gs_try(names, *args, default=None):
+    """Try function names with args; if TypeError, try without args."""
     for name in names:
         fn = getattr(_gs, name, None)
-        if callable(fn):
+        if not callable(fn):
+            continue
+        try:
+            res = fn(*args)
+            if res is not None:
+                return res
+        except TypeError:
             try:
-                return fn(*args)
+                res = fn()
+                if res is not None:
+                    return res
             except Exception as e:
-                logger.warning(f"github_store.{name}{args} failed: {e}")
-                continue
-    logger.warning(f"no working github_store fn found among {names}; using default")
+                logger.warning(f"github_store.{name}() no-arg failed: {e}")
+        except Exception as e:
+            logger.warning(f"github_store.{name}{args} failed: {e}")
     return default
 
 
 def _load_tickers():
-    return _gs_call(
+    return _gs_try(
         ["load_tickers", "read_tickers", "get_tickers", "list_tickers", "load_file", "read_file"],
         "tickers.txt",
         default=[]
@@ -54,18 +63,21 @@ def _load_tickers():
 
 
 def _load_whitelist():
-    return _gs_call(
+    res = _gs_try(
         ["load_whitelist", "read_whitelist", "get_whitelist", "load_file", "read_file"],
         "whitelist.txt",
-        default=["108893493", "396567390"]
-    ) or ["108893493", "396567390"]
+        default=None
+    )
+    if res:
+        return res
+    logger.warning("no working github_store whitelist fn; using hardcoded default")
+    return ["108893493", "396567390"]
 
 
 def _save_tickers(tickers):
-    return _gs_call(
+    return _gs_try(
         ["save_tickers", "write_tickers", "write_file", "save_file"],
         "tickers.txt", tickers,
-        default=None
     )
 
 
@@ -76,7 +88,6 @@ def _add_ticker_helper(t):
             return fn("tickers.txt", t)
         except Exception as e:
             logger.warning(f"github_store.add_ticker failed: {e}")
-    # Fallback: load, append, save
     tickers = _load_tickers()
     if t not in tickers:
         tickers.append(t)
@@ -145,7 +156,10 @@ async def cmd_whoami(update, ctx):
 
 async def cmd_list(update, ctx):
     tickers = _load_tickers()
-    await update.message.reply_text("Tickers: " + ", ".join(tickers) if tickers else "(none loaded)")
+    if tickers:
+        await update.message.reply_text("Tickers: " + ", ".join(tickers))
+    else:
+        await update.message.reply_text("(no tickers loaded)")
 
 
 async def cmd_add(update, ctx):
@@ -179,18 +193,32 @@ async def cmd_submit_token(update, ctx):
 
 
 # =========================================================================
-# SCANNER COMMANDS (passthrough)
+# SCANNER COMMANDS (passthrough — try multiple entry-point names)
 # =========================================================================
+
+def _run_scanner_module(mod, names, *args):
+    """Try multiple function names on a scanner module."""
+    for name in names:
+        fn = getattr(mod, name, None)
+        if callable(fn):
+            try:
+                return fn(*args)
+            except TypeError:
+                try:
+                    return fn()
+                except Exception as e:
+                    logger.warning(f"{mod.__name__}.{name}() failed: {e}")
+            except Exception as e:
+                logger.warning(f"{mod.__name__}.{name}{args} failed: {e}")
+    return f"❌ No working scanner entry point found in {mod.__name__}"
+
 
 async def cmd_scan(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     await update.message.reply_text("Running collar scan…")
-    try:
-        msg = scanner.run_scan()
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"❌ scan error: {e}")
+    msg = _run_scanner_module(scanner, ["run_scan", "scan", "run", "main"])
+    await update.message.reply_text(str(msg)[:4000])
 
 
 async def cmd_spreads(update, ctx):
@@ -198,11 +226,8 @@ async def cmd_spreads(update, ctx):
         return
     ticker = ctx.args[0].upper() if ctx.args else None
     await update.message.reply_text("Running spreads scan…")
-    try:
-        msg = spreads_mod.run_spreads(ticker)
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"❌ spreads error: {e}")
+    msg = _run_scanner_module(spreads_mod, ["run_spreads", "scan", "run", "main"], ticker)
+    await update.message.reply_text(str(msg)[:4000])
 
 
 async def cmd_deepcall(update, ctx):
@@ -210,55 +235,71 @@ async def cmd_deepcall(update, ctx):
         return
     n = int(ctx.args[0]) if ctx.args else 5
     await update.message.reply_text(f"Running deepcall scan (top {n})…")
-    try:
-        msg = deepcall.run_deepcall(n)
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"❌ deepcall error: {e}")
+    msg = _run_scanner_module(deepcall, ["run_deepcall", "scan", "run", "main"], n)
+    await update.message.reply_text(str(msg)[:4000])
 
 
 async def cmd_dca(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     await update.message.reply_text("Running dca scan…")
-    try:
-        msg = dca.run_dca()
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"❌ dca error: {e}")
+    msg = _run_scanner_module(dca, ["run_dca", "scan", "run", "main"])
+    await update.message.reply_text(str(msg)[:4000])
 
 
 async def cmd_csp(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     await update.message.reply_text("Running csp scan…")
-    try:
-        msg = csp.run_csp()
-        await update.message.reply_text(msg[:4000])
-    except Exception as e:
-        await update.message.reply_text(f"❌ csp error: {e}")
+    msg = _run_scanner_module(csp, ["run_csp", "scan", "run", "main"])
+    await update.message.reply_text(str(msg)[:4000])
 
 
 # =========================================================================
 # /itm WITH TRADE BUTTONS
 # =========================================================================
 
+def _get_itm_hits():
+    """Try multiple entry-point names to get ITM hits as a list of dicts."""
+    for name in ["scan_itm", "scan", "run_itm", "run", "find_hits"]:
+        fn = getattr(itm, name, None)
+        if callable(fn):
+            try:
+                hits = fn()
+                if isinstance(hits, list):
+                    return hits
+            except Exception as e:
+                logger.warning(f"itm.{name}() failed: {e}")
+    return []
+
+
+def _format_itm_hit(hit, idx, total):
+    """Try itm.format_itm_hit if exists, else build inline."""
+    fn = getattr(itm, "format_itm_hit", None)
+    if callable(fn):
+        try:
+            return fn(hit, idx, total)
+        except Exception:
+            pass
+    return (
+        f"*{idx}/{total} {hit.get('ticker')}* @ ${hit.get('spot')}\n"
+        f"  strike ${hit.get('strike'):g}  exp {hit.get('exp_date')} ({hit.get('dte')}d)\n"
+        f"  locked ${hit.get('locked_total', 0):.2f} @ {hit.get('locked_apy', 0):.1f}% APY"
+    )
+
+
 async def cmd_itm(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     uid = update.effective_user.id
     await update.message.reply_text("Running /itm scan…")
-    try:
-        hits = itm.scan_itm()
-    except Exception as e:
-        await update.message.reply_text(f"❌ /itm error: {e}")
-        return
+    hits = _get_itm_hits()
     if not hits:
         await update.message.reply_text("No /itm hits.")
         return
 
     await update.message.reply_text(
-        f"📊 /itm found {len(hits)} hits (showing top {min(MAX_TRADE_BUTTONS, len(hits))} as buttons)."
+        f"📊 /itm found {len(hits)} hits (top {min(MAX_TRADE_BUTTONS, len(hits))} as buttons)."
     )
     pending_itm_trades.setdefault(uid, {})
     expires_at = time.time() + 600
@@ -266,15 +307,15 @@ async def cmd_itm(update, ctx):
     for idx, hit in enumerate(hits[-MAX_TRADE_BUTTONS:], start=1):
         trade_id = _gen_trade_id()
         pending_itm_trades[uid][trade_id] = (hit, 0, expires_at)
-        text = itm.format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
+        text = _format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
         kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"💼 Trade @ {hit['locked_apy']:.1f}% APY",
+            InlineKeyboardButton(f"💼 Trade @ {hit.get('locked_apy', 0):.1f}% APY",
                                  callback_data=f"trade:{trade_id}")
         ]])
         try:
             await update.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"/itm button send failed for {hit['ticker']}: {e}")
+            logger.warning(f"/itm button send failed for {hit.get('ticker')}: {e}")
         await asyncio.sleep(TRADE_BUTTON_DELAY)
 
 
@@ -283,18 +324,15 @@ async def cb_trade(update, ctx):
     uid = q.from_user.id
     logger.info(f"cb_trade FIRED user={uid} data={q.data}")
     await q.answer()
-
     trade_id = q.data.split(":", 1)[1]
     user_pending = pending_itm_trades.get(uid, {})
     if trade_id not in user_pending:
         await ctx.bot.send_message(uid, "⏱ Trade expired or unknown. Re-run /itm.")
         return
-
     hit, walk_step, _ = user_pending[trade_id]
     pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
     user_pending[trade_id] = (hit, walk_step, time.time() + TRADE_CONFIRM_TIMEOUT)
-
     preview = orders.format_order_preview(hit, pricing, next_pricing)
     await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
 
@@ -316,15 +354,12 @@ async def cmd_ritm(update, ctx):
     if not hits:
         await update.message.reply_text("No /ritm hits.")
         return
-
     await update.message.reply_text(
         f"📊 /ritm found {len(hits)} hits.\n"
         f"⚠️ Orders parked $0.50 below fair — will NOT fill until you edit price on Schwab."
     )
-
     pending_ritm_trades.setdefault(uid, {})
     expires_at = time.time() + 600
-
     for idx, hit in enumerate(hits[-MAX_TRADE_BUTTONS:], start=1):
         trade_id = _gen_trade_id()
         pending_ritm_trades[uid][trade_id] = (hit, expires_at)
@@ -345,23 +380,20 @@ async def cb_rtrade(update, ctx):
     uid = q.from_user.id
     logger.info(f"cb_rtrade FIRED user={uid} data={q.data}")
     await q.answer()
-
     trade_id = q.data.split(":", 1)[1]
     user_pending = pending_ritm_trades.get(uid, {})
     if trade_id not in user_pending:
         await ctx.bot.send_message(uid, "⏱ Trade expired or unknown. Re-run /ritm.")
         return
-
     hit, _ = user_pending[trade_id]
     pricing = orders.compute_ritm_pricing(hit)
     user_pending[trade_id] = (hit, time.time() + TRADE_CONFIRM_TIMEOUT)
-
     preview = orders.format_ritm_preview(hit, pricing)
     await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
 
 
 # =========================================================================
-# YES HANDLER (both /itm and /ritm)
+# YES HANDLER
 # =========================================================================
 
 async def handle_yes_reply(update, ctx):
@@ -370,7 +402,6 @@ async def handle_yes_reply(update, ctx):
     uid = update.effective_user.id
     text = update.message.text.strip().upper()
     logger.info(f"handle_yes_reply: text='{text}' user={uid}")
-
     if not text.startswith("YES "):
         return
     parts = text.split()
@@ -488,10 +519,50 @@ async def cb_cancel(update, ctx):
 
 
 # =========================================================================
-# APP BUILD
+# APP BUILD — accepts ANY positional/keyword args from main.py
 # =========================================================================
 
-def build_app(token):
+def build_app(*args, **kwargs):
+    """
+    Flexible build_app: main.py may inject scanner instances and the token in
+    various positions/orders. We ignore the scanners (this bot imports them
+    directly at module top) and locate the Telegram token wherever it is.
+    """
+    token = None
+
+    # 1. Try common kwarg names
+    for k in ("token", "telegram_token", "bot_token", "tg_token"):
+        if k in kwargs and kwargs[k]:
+            token = kwargs[k]
+            logger.info(f"build_app: token from kwarg '{k}'")
+            break
+
+    # 2. Look through positional args for a string that looks like a Telegram token
+    #    (format: "<digits>:<35+ alphanumerics/dashes/underscores>")
+    if not token:
+        for a in args:
+            if isinstance(a, str) and ":" in a and len(a) >= 40:
+                parts = a.split(":", 1)
+                if parts[0].isdigit() and len(parts[1]) >= 30:
+                    token = a
+                    logger.info(f"build_app: token found in positional args")
+                    break
+
+    # 3. Fall back to env var
+    if not token:
+        token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if token:
+            logger.info("build_app: token from env TELEGRAM_BOT_TOKEN")
+
+    if not token:
+        logger.error(f"build_app: NO TOKEN FOUND. args={len(args)}, kwargs keys={list(kwargs.keys())}")
+        raise ValueError(
+            f"build_app couldn't find Telegram token in args ({len(args)}) "
+            f"or kwargs ({list(kwargs.keys())}) or env TELEGRAM_BOT_TOKEN"
+        )
+
+    logger.info(f"build_app: received {len(args)} positional + {len(kwargs)} keyword args (ignoring scanners)")
+
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

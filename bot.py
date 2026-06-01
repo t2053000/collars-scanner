@@ -1,7 +1,8 @@
 """
 bot.py — Telegram handlers and trade flow.
 Defensive imports + flexible build_app signature.
-Verbose logging on /ritm Park flow to diagnose missing preview message.
+Verbose logging on /ritm Park flow.
+Reverted /itm to direct itm.scan_itm() call (the pattern that worked for EOSE).
 """
 
 import asyncio
@@ -255,42 +256,22 @@ async def cmd_csp(update, ctx):
 
 
 # =========================================================================
-# /itm WITH TRADE BUTTONS
+# /itm WITH TRADE BUTTONS — direct call, known working from EOSE trade
 # =========================================================================
-
-def _get_itm_hits():
-    for name in ["scan_itm", "scan", "run_itm", "run", "find_hits"]:
-        fn = getattr(itm, name, None)
-        if callable(fn):
-            try:
-                hits = fn()
-                if isinstance(hits, list):
-                    return hits
-            except Exception as e:
-                logger.warning(f"itm.{name}() failed: {e}")
-    return []
-
-
-def _format_itm_hit(hit, idx, total):
-    fn = getattr(itm, "format_itm_hit", None)
-    if callable(fn):
-        try:
-            return fn(hit, idx, total)
-        except Exception:
-            pass
-    return (
-        f"*{idx}/{total} {hit.get('ticker')}* @ ${hit.get('spot')}\n"
-        f"  strike ${hit.get('strike'):g}  exp {hit.get('exp_date')} ({hit.get('dte')}d)\n"
-        f"  locked ${hit.get('locked_total', 0):.2f} @ {hit.get('locked_apy', 0):.1f}% APY"
-    )
-
 
 async def cmd_itm(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     uid = update.effective_user.id
     await update.message.reply_text("Running /itm scan…")
-    hits = _get_itm_hits()
+    try:
+        hits = itm.scan_itm()
+        logger.info(f"cmd_itm: itm.scan_itm() returned {len(hits) if isinstance(hits, list) else 'non-list'}")
+    except Exception as e:
+        logger.error(f"cmd_itm: itm.scan_itm() raised: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ /itm scan failed: {e}")
+        return
+
     if not hits:
         await update.message.reply_text("No /itm hits.")
         return
@@ -304,7 +285,13 @@ async def cmd_itm(update, ctx):
     for idx, hit in enumerate(hits[-MAX_TRADE_BUTTONS:], start=1):
         trade_id = _gen_trade_id()
         pending_itm_trades[uid][trade_id] = (hit, 0, expires_at)
-        text = _format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
+        try:
+            text = itm.format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
+        except Exception as e:
+            logger.warning(f"itm.format_itm_hit failed for {hit.get('ticker')}: {e}")
+            text = (f"*{idx}/{min(MAX_TRADE_BUTTONS, len(hits))} {hit.get('ticker')}* @ ${hit.get('spot')}\n"
+                    f"  strike ${hit.get('strike'):g}  exp {hit.get('exp_date')} ({hit.get('dte')}d)\n"
+                    f"  locked ${hit.get('locked_total', 0):.2f} @ {hit.get('locked_apy', 0):.1f}% APY")
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(f"💼 Trade @ {hit.get('locked_apy', 0):.1f}% APY",
                                  callback_data=f"trade:{trade_id}")
@@ -420,7 +407,6 @@ async def cb_rtrade(update, ctx):
             pass
         return
 
-    # Try markdown first; if it fails, retry plain text
     try:
         sent = await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
         logger.info(f"cb_rtrade: preview sent (markdown), message_id={sent.message_id}")
@@ -438,7 +424,7 @@ async def cb_rtrade(update, ctx):
 
 
 # =========================================================================
-# YES HANDLER
+# YES HANDLER (both /itm and /ritm)
 # =========================================================================
 
 async def handle_yes_reply(update, ctx):
@@ -564,7 +550,7 @@ async def cb_cancel(update, ctx):
 
 
 # =========================================================================
-# APP BUILD — accepts ANY positional/keyword args from main.py
+# APP BUILD — flexible signature
 # =========================================================================
 
 def build_app(*args, **kwargs):
@@ -580,7 +566,7 @@ def build_app(*args, **kwargs):
                 parts = a.split(":", 1)
                 if parts[0].isdigit() and len(parts[1]) >= 30:
                     token = a
-                    logger.info(f"build_app: token found in positional args")
+                    logger.info("build_app: token found in positional args")
                     break
     if not token:
         token = os.environ.get("TELEGRAM_BOT_TOKEN")

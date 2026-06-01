@@ -2,8 +2,9 @@
 orders.py
 Order construction + price walking for the trade-from-Telegram flow.
 
-ITM conversion: BUY stock + SELL call + BUY put (strike below spot).
-Net cash OUT per share = stock_price - call_credit + put_cost (positive debit).
+ITM conversion:         BUY stock + SELL call + BUY put  (strike below spot) — NET_DEBIT
+Reverse ITM (options):  SELL put  + BUY call             (strike above spot) — NET_CREDIT
+                        Stock leg is shorted manually by user on Schwab.
 """
 
 import logging
@@ -18,7 +19,6 @@ MIN_APY_FLOOR_PCT = 10.0
 
 
 def build_option_symbol(ticker: str, exp_date: str, strike: float, opt_type: str) -> str:
-    """OSI symbol: SYM<spaces>YYMMDDC00012500"""
     exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
     yymmdd = exp_dt.strftime("%y%m%d")
     strike_int = int(round(strike * 1000))
@@ -29,8 +29,8 @@ def build_option_symbol(ticker: str, exp_date: str, strike: float, opt_type: str
 
 def compute_legs_pricing(hit: dict, walk_step: int = 0):
     """
-    Walk pricing: walk_step=0 starts at mid +/- 15%; each step adds 10% toward unfavorable side.
-    Returns dict with limit prices and projected APY.
+    Walk pricing for ITM conversion (3-leg).
+    walk_step=0 starts at mid +/- 15%; each step adds 10% toward unfavorable side.
     """
     call_bid = hit.get("call_bid")
     call_ask = hit.get("call_ask")
@@ -38,7 +38,6 @@ def compute_legs_pricing(hit: dict, walk_step: int = 0):
     put_ask = hit.get("put_ask")
 
     if None in (call_bid, call_ask, put_bid, put_ask):
-        # Fallback: use stored mid-adjusted prices, shrink by walk_step
         call_credit = hit["call_credit"]
         put_cost = hit["put_cost"]
         credit_shrink = 0.02 * walk_step
@@ -50,11 +49,9 @@ def compute_legs_pricing(hit: dict, walk_step: int = 0):
         put_mid = (put_bid + put_ask) / 2.0
         put_spread = put_ask - put_bid
 
-        # SELL call: start mid-15%, walk toward bid (lower price = worse fill for us)
         sell_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         call_credit = call_mid - sell_offset * call_spread
 
-        # BUY put: start mid+15%, walk toward ask (higher price = worse for us)
         buy_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         put_cost = put_mid + buy_offset * put_spread
 
@@ -92,30 +89,82 @@ def compute_legs_pricing(hit: dict, walk_step: int = 0):
     }
 
 
+def compute_reverse_pricing(hit: dict, walk_step: int = 0):
+    """
+    Walk pricing for reverse ITM options legs (SELL put + BUY call).
+    Returns net credit received from the 2 option legs only.
+    """
+    call_bid = hit.get("call_bid")
+    call_ask = hit.get("call_ask")
+    put_bid = hit.get("put_bid")
+    put_ask = hit.get("put_ask")
+
+    if None in (call_bid, call_ask, put_bid, put_ask):
+        # fallback to stored mids
+        put_credit = hit.get("put_cost", 0.01)   # put_cost stores put mid in reverse hits
+        call_cost = hit.get("call_credit", 0.01)  # call_credit stores call mid in reverse hits
+        shrink = 0.02 * walk_step
+        put_credit = max(0.01, put_credit - shrink / 2)
+        call_cost = call_cost + shrink / 2
+    else:
+        put_mid = (put_bid + put_ask) / 2.0
+        put_spread = put_ask - put_bid
+        call_mid = (call_bid + call_ask) / 2.0
+        call_spread = call_ask - call_bid
+
+        # SELL put: start mid-15%, walk toward bid
+        sell_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
+        put_credit = put_mid - sell_offset * put_spread
+
+        # BUY call: start mid+15%, walk toward ask
+        buy_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
+        call_cost = call_mid + buy_offset * call_spread
+
+    put_credit = round(max(0.01, put_credit), 2)
+    call_cost = round(max(0.01, call_cost), 2)
+    net_credit = round(put_credit - call_cost, 2)
+
+    spot = hit["spot"]
+    strike = hit["strike"]
+    dte = hit["dte"]
+    gap = strike - spot  # positive: strike above spot
+
+    locked_per_share = net_credit - gap
+    commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+    locked_per_share_after_comm = locked_per_share - commission_per_share
+    locked_total = locked_per_share_after_comm * 100.0
+
+    cost_basis = spot
+    if cost_basis <= 0 or dte <= 0:
+        apy = 0.0
+    else:
+        apy = (locked_per_share_after_comm / cost_basis) * (365.0 / dte) * 100.0
+
+    return {
+        "put_limit": put_credit,
+        "call_limit": call_cost,
+        "net_credit": net_credit,
+        "locked_per_share": round(locked_per_share, 2),
+        "locked_per_share_after_comm": round(locked_per_share_after_comm, 4),
+        "locked_total": round(locked_total, 2),
+        "apy": round(apy, 1),
+        "walk_step": walk_step,
+    }
+
+
 def can_improve(pricing_next: dict) -> bool:
     return pricing_next["apy"] >= MIN_APY_FLOOR_PCT
 
 
 def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
     """
-    Build a Schwab NET_DEBIT multi-leg order:
-      LEG 1: BUY 100 shares of underlying (equity leg)
-      LEG 2: SELL_TO_OPEN 1 call at strike
-      LEG 3: BUY_TO_OPEN 1 put at same strike
-
-    Net debit per share = stock_price - call_credit + put_cost (POSITIVE NUMBER)
-    This is what you PAY per share. Schwab will fill at this debit or better.
-
-    SAFETY CHECKS:
-      - strike must be < spot (ITM conversion requires this)
-      - net debit must be positive (you should be paying, not receiving)
+    3-leg NET_DEBIT: BUY 100 stock + SELL call + BUY put. Strike must be < spot.
     """
     ticker = hit["ticker"].upper()
     exp_date = hit["exp_date"]
     strike = float(hit["strike"])
     spot = float(pricing["stock_price"])
 
-    # SAFETY: strike must be below spot for ITM conversion
     if strike >= spot:
         raise ValueError(
             f"ITM conversion requires strike < spot. Got strike={strike}, spot={spot}. "
@@ -124,36 +173,30 @@ def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
 
     call_limit = float(pricing["call_limit"])
     put_limit = float(pricing["put_limit"])
-
-    # Net debit per share = pay for stock - get call credit + pay for put
     net_debit_per_share = spot - call_limit + put_limit
 
-    # SAFETY: net debit must be positive (we're paying, not receiving)
     if net_debit_per_share <= 0:
         raise ValueError(
-            f"Net debit must be positive for ITM conversion. Got {net_debit_per_share:.4f}. "
+            f"Net debit must be positive. Got {net_debit_per_share:.4f}. "
             f"spot={spot}, call_credit={call_limit}, put_cost={put_limit}. Aborting."
         )
 
-    # SAFETY: net debit should be roughly equal to strike for a real conversion
-    # (because locked outcome = strike, and small locked profit means debit slightly below strike)
     if net_debit_per_share < strike * 0.5 or net_debit_per_share > spot * 1.1:
         raise ValueError(
-            f"Net debit {net_debit_per_share:.2f} sanity-check failed for strike={strike}, spot={spot}. "
-            f"Expected debit near strike. Aborting."
+            f"Net debit {net_debit_per_share:.2f} sanity-check failed for "
+            f"strike={strike}, spot={spot}. Aborting."
         )
 
     call_symbol = build_option_symbol(ticker, exp_date, strike, "C")
     put_symbol = build_option_symbol(ticker, exp_date, strike, "P")
-
     price_str = f"{net_debit_per_share:.2f}"
 
     logger.info(
-        f"build_itm_conversion_order: ticker={ticker} exp={exp_date} strike={strike} spot={spot} "
-        f"call_credit={call_limit} put_cost={put_limit} NET_DEBIT={price_str}"
+        f"build_itm_conversion_order: ticker={ticker} exp={exp_date} strike={strike} "
+        f"spot={spot} call_credit={call_limit} put_cost={put_limit} NET_DEBIT={price_str}"
     )
 
-    order = {
+    return {
         "orderType": "NET_DEBIT",
         "session": "NORMAL",
         "duration": "DAY",
@@ -165,32 +208,81 @@ def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
                 "orderLegType": "EQUITY",
                 "instruction": "BUY",
                 "quantity": 100,
-                "instrument": {
-                    "symbol": ticker,
-                    "assetType": "EQUITY",
-                },
+                "instrument": {"symbol": ticker, "assetType": "EQUITY"},
             },
             {
                 "orderLegType": "OPTION",
                 "instruction": "SELL_TO_OPEN",
                 "quantity": 1,
-                "instrument": {
-                    "symbol": call_symbol,
-                    "assetType": "OPTION",
-                },
+                "instrument": {"symbol": call_symbol, "assetType": "OPTION"},
             },
             {
                 "orderLegType": "OPTION",
                 "instruction": "BUY_TO_OPEN",
                 "quantity": 1,
-                "instrument": {
-                    "symbol": put_symbol,
-                    "assetType": "OPTION",
-                },
+                "instrument": {"symbol": put_symbol, "assetType": "OPTION"},
             },
         ],
     }
-    return order
+
+
+def build_reverse_itm_order(hit: dict, pricing: dict) -> dict:
+    """
+    2-leg NET_CREDIT: SELL put + BUY call. Strike must be > spot.
+    User shorts stock manually. No equity leg submitted here.
+    """
+    ticker = hit["ticker"].upper()
+    exp_date = hit["exp_date"]
+    strike = float(hit["strike"])
+    spot = float(hit["spot"])
+
+    if strike <= spot:
+        raise ValueError(
+            f"Reverse ITM requires strike > spot. Got strike={strike}, spot={spot}. "
+            f"Ticker={ticker}. Aborting."
+        )
+
+    put_limit = float(pricing["put_limit"])
+    call_limit = float(pricing["call_limit"])
+    net_credit = round(put_limit - call_limit, 2)
+
+    if net_credit <= 0:
+        raise ValueError(
+            f"Net credit must be positive for reverse ITM. Got {net_credit:.4f}. "
+            f"put_credit={put_limit}, call_cost={call_limit}. Aborting."
+        )
+
+    call_symbol = build_option_symbol(ticker, exp_date, strike, "C")
+    put_symbol = build_option_symbol(ticker, exp_date, strike, "P")
+    price_str = f"{net_credit:.2f}"
+
+    logger.info(
+        f"build_reverse_itm_order: ticker={ticker} exp={exp_date} strike={strike} "
+        f"spot={spot} put_credit={put_limit} call_cost={call_limit} NET_CREDIT={price_str}"
+    )
+
+    return {
+        "orderType": "NET_CREDIT",
+        "session": "NORMAL",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "complexOrderStrategyType": "CUSTOM",
+        "price": price_str,
+        "orderLegCollection": [
+            {
+                "orderLegType": "OPTION",
+                "instruction": "SELL_TO_OPEN",
+                "quantity": 1,
+                "instrument": {"symbol": put_symbol, "assetType": "OPTION"},
+            },
+            {
+                "orderLegType": "OPTION",
+                "instruction": "BUY_TO_OPEN",
+                "quantity": 1,
+                "instrument": {"symbol": call_symbol, "assetType": "OPTION"},
+            },
+        ],
+    }
 
 
 def format_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) -> str:
@@ -206,7 +298,7 @@ def format_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) ->
         f"⚠️ *CONFIRM ITM CONVERSION ({walk_label})*",
         f"*{ticker}* @ ${spot}  ·  strike ${strike:g}  ·  exp {hit['exp_date']} ({hit['dte']}d)",
         f"",
-        f"📦 1 spread = 3 legs (atomic combo):",
+        f"📦 3 legs (atomic combo):",
         f"  · BUY 100 shares @ ~${spot:.2f}",
         f"  · SELL 1 C ${strike:g} @ limit ${pricing['call_limit']:.2f}",
         f"  · BUY  1 P ${strike:g} @ limit ${pricing['put_limit']:.2f}",
@@ -217,8 +309,35 @@ def format_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) ->
         f"",
     ]
     if next_pricing and can_improve(next_pricing):
-        lines.append(
-            f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_"
-        )
+        lines.append(f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_")
     lines.append(f"Reply `YES {ticker}` within 60s to submit.")
+    return "\n".join(lines)
+
+
+def format_reverse_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) -> str:
+    ticker = hit["ticker"]
+    walk = pricing["walk_step"]
+    walk_label = "initial" if walk == 0 else f"retry #{walk}"
+
+    strike = hit["strike"]
+    spot = hit["spot"]
+
+    lines = [
+        f"⚠️ *CONFIRM REVERSE ITM — OPTIONS ONLY ({walk_label})*",
+        f"*{ticker}* @ ${spot}  ·  strike ${strike:g}  ·  exp {hit['exp_date']} ({hit['dte']}d)",
+        f"",
+        f"📦 2 legs (options only — short stock manually!):",
+        f"  · SELL 1 P ${strike:g} @ limit ${pricing['put_limit']:.2f}",
+        f"  · BUY  1 C ${strike:g} @ limit ${pricing['call_limit']:.2f}",
+        f"",
+        f"💰 *NET CREDIT: ${pricing['net_credit']:.2f} (= ${pricing['net_credit']*100:.0f} total)*",
+        f"📊 Locked profit after $1.30 comm: *${pricing['locked_total']:.2f}*",
+        f"📈 APY (options legs only): *{pricing['apy']:.1f}%*",
+        f"",
+        f"⚠️ *SHORT {ticker} stock separately on Schwab before this fills.*",
+        f"",
+    ]
+    if next_pricing and can_improve(next_pricing):
+        lines.append(f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_")
+    lines.append(f"Reply `R {ticker}` within 60s to submit.")
     return "\n".join(lines)

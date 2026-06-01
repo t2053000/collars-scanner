@@ -298,12 +298,6 @@ def _run_itm_scan():
     return hits, None
 
 def _format_itm_hit(hit, idx, total):
-    fmt = getattr(itm, "format_itm_hit", None)
-    if callable(fmt):
-        try:
-            return fmt(hit, idx, total)
-        except Exception:
-            pass
     ticker = hit.get("ticker") or "?"
     spot = hit.get("spot") or 0
     strike = hit.get("strike")

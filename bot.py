@@ -294,6 +294,7 @@ def _run_itm_scan():
     hits.sort(key=lambda h: h.get("locked_apy", 0))
     logger.info(f"_run_itm_scan: {len(tickers)} tickers, {len(hits)} hits, {errors} errors")
     if hits:
+        logger.info(f"_run_itm_scan: first hit FULL: {hits[0]}")
         logger.info(f"_run_itm_scan: first hit ticker={hits[0].get('ticker')} strike={hits[0].get('strike')} apy={hits[0].get('locked_apy')}")
     return hits, None
 

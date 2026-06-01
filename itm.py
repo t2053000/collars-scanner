@@ -9,6 +9,8 @@ Ex-div in window:
   - /itm normal: flagged, deprioritized by div_yield_apy_pts
   - /itm r:      flagged with red warning, deprioritized by 25 APY points
                  (you are SHORT stock so you PAY the dividend)
+Borrow cost:
+  - /itm r only: 20% APR applied to spot × dte/365, deducted from locked profit
 """
 
 import logging
@@ -17,17 +19,19 @@ from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-DTE_MIN                              = 1
-DTE_MAX                              = 45
-STRIKES_BELOW_SPOT                   = 4
-MID_ADJUST_FRAC                      = 0.15
-FALLBACK_STEP_FRAC                   = 0.15
-MIN_OI                               = 50
-MAX_SPREAD_PCT                       = 0.40
-COMMISSION_PER_CONTRACT              = 1.30
-MIN_LOCKED_AFTER_COMM_PER_CONTRACT   = 5.0
-HTB_SHORT_INT_THRESHOLD              = 0.20
-REVERSE_EX_DIV_APY_PENALTY           = 25.0   # APY points subtracted from sort key
+DTE_MIN                            = 1
+DTE_MAX                            = 45
+STRIKES_BELOW_SPOT                 = 4
+MID_ADJUST_FRAC                    = 0.15
+FALLBACK_STEP_FRAC                 = 0.15
+MIN_OI                             = 50
+MAX_SPREAD_PCT                     = 0.40
+COMMISSION_PER_CONTRACT            = 1.30
+MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
+HTB_SHORT_INT_THRESHOLD            = 0.20
+REVERSE_EX_DIV_APY_PENALTY         = 25.0
+REVERSE_BORROW_RATE                = 0.20   # 20% APR approximation for short stock
+
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
 
@@ -81,7 +85,6 @@ def _compute_annual_div(fundamentals, spot):
 
 
 def _get_next_ex_div(fundamentals) -> str:
-    """Return next ex-div date as 'YYYY-MM-DD' or '' — fetched live from Schwab."""
     if not fundamentals:
         return ""
     for field in ("exDividendDate", "dividendDate", "nextDividendDate",
@@ -96,7 +99,6 @@ def _get_next_ex_div(fundamentals) -> str:
 
 
 def _get_short_interest(fundamentals) -> float:
-    """Short interest as fraction of float (e.g. 0.25 = 25%)."""
     if not fundamentals:
         return 0.0
     for field in ("shortIntToFloat", "shortInterestRatio", "shortPercent",
@@ -112,7 +114,6 @@ def _get_short_interest(fundamentals) -> float:
 
 
 def _ex_div_before_expiry(next_ex_div_date: str, exp_date: str) -> bool:
-    """True if the live ex-div date falls on or before option expiry."""
     if not next_ex_div_date or not exp_date:
         return False
     try:
@@ -154,27 +155,15 @@ def _locked_and_apy(spot, strike, call_credit, put_cost, dte):
 # Sort key
 # ---------------------------------------------------------------------------
 
-def _sort_key_normal(hit: dict) -> float:
-    """
-    /itm normal: penalize ex-div-in-window hits by div yield in APY points.
-    Higher = better = shown later (best at bottom).
-    """
+def _sort_key(hit: dict) -> float:
     apy = hit.get("locked_apy") or 0.0
     if hit.get("ex_div_in_window"):
-        spot = hit.get("spot") or 1.0
-        annual_div = hit.get("annual_div") or 0.0
-        apy -= (annual_div / spot) * 100.0
-    return apy
-
-
-def _sort_key_reverse(hit: dict) -> float:
-    """
-    /itm r: penalize ex-div-in-window hits by fixed 25 APY points.
-    Short stock means you PAY the dividend — much more harmful.
-    """
-    apy = hit.get("locked_apy") or 0.0
-    if hit.get("ex_div_in_window"):
-        apy -= REVERSE_EX_DIV_APY_PENALTY
+        if hit.get("reverse"):
+            apy -= REVERSE_EX_DIV_APY_PENALTY
+        else:
+            spot = hit.get("spot") or 1.0
+            annual_div = hit.get("annual_div") or 0.0
+            apy -= (annual_div / spot) * 100.0
     return apy
 
 
@@ -199,7 +188,8 @@ class ItmScanner:
             short_int = _get_short_interest(fundamentals)
             if next_ex_div_date:
                 try:
-                    last_ex_div = datetime.strptime(next_ex_div_date[:10], "%Y-%m-%d")
+                    last_ex_div = datetime.strptime(
+                        next_ex_div_date[:10], "%Y-%m-%d")
                 except ValueError:
                     pass
         except Exception:
@@ -331,6 +321,7 @@ class ItmScanner:
                     call_bid=_bid(call_opt), call_ask=_ask(call_opt),
                     put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
                     reverse=False,
+                    borrow_cost=0.0,
                 ))
 
         return results, debug
@@ -339,7 +330,8 @@ class ItmScanner:
         """
         /itm r: strikes ABOVE spot where put_mid > call_mid.
         Short stock + sell put + buy call.
-        Ex-div in window is penalized 25 APY pts in sort (you PAY the dividend).
+        Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
+        Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
         """
         results = []
         debug = Counter()
@@ -389,6 +381,9 @@ class ItmScanner:
             calls = call_map[ck]
             puts  = put_map[pk]
 
+            # Borrow cost for this expiry
+            borrow_cost = spot * REVERSE_BORROW_RATE * (dte / 365.0)
+
             strikes_above = []
             for s in calls:
                 try:
@@ -429,7 +424,9 @@ class ItmScanner:
 
                 gap = strike - spot
                 commission_per_share = COMMISSION_PER_CONTRACT / 100.0
-                locked_p = (net_credit_p - gap) - commission_per_share
+
+                # Locked = options net credit - gap to close - commission - borrow
+                locked_p = net_credit_p - gap - commission_per_share - borrow_cost
                 if locked_p < min_locked:
                     debug["below_min_locked_after_comm"] += 1
                     continue
@@ -437,10 +434,11 @@ class ItmScanner:
                 apy_p = (locked_p / spot) * (365.0 / dte) * 100.0 \
                     if spot > 0 and dte > 0 else 0.0
 
+                # Fallback pricing (same borrow cost applies)
                 put_credit_f = _sell_price(put_opt,  extra_frac=FALLBACK_STEP_FRAC)
                 call_cost_f  = _buy_price(call_opt,  extra_frac=FALLBACK_STEP_FRAC)
                 net_credit_f = put_credit_f - call_cost_f
-                locked_f     = (net_credit_f - gap) - commission_per_share
+                locked_f     = net_credit_f - gap - commission_per_share - borrow_cost
                 apy_f = (locked_f / spot) * (365.0 / dte) * 100.0 \
                     if locked_f > 0 and spot > 0 and dte > 0 else 0.0
 
@@ -476,6 +474,7 @@ class ItmScanner:
                     call_bid=_bid(call_opt), call_ask=_ask(call_opt),
                     put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
                     reverse=True,
+                    borrow_cost=round(borrow_cost, 4),
                 ))
 
         return results, debug
@@ -487,7 +486,6 @@ class ItmScanner:
             "S": "semi-annual", "A": "annual", "?": "unknown",
         }.get(r.get("freq", "?"), r.get("freq", "?"))
 
-        # Ex-div warning — red for reverse (you pay), amber for normal (early assignment risk)
         ex_div_line = ""
         if r.get("ex_div_in_window"):
             ex_date = r.get("next_ex_div_date", "")
@@ -512,6 +510,12 @@ class ItmScanner:
             pct = round(r.get("short_int", 0) * 100, 1)
             htb_line = f"  ⚠️ HTB? Short interest {pct}% of float\n"
 
+        borrow_line = ""
+        if r.get("reverse") and r.get("borrow_cost", 0) > 0:
+            borrow_line = (
+                f"  🏦 Borrow cost (20% APR): −${r['borrow_cost']:.2f}/sh\n"
+            )
+
         return (
             f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
@@ -520,6 +524,7 @@ class ItmScanner:
             f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
             f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
             f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
+            f"{borrow_line}"
             f"{ex_div_line}"
             f"{htb_line}"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
@@ -561,20 +566,7 @@ class ItmScanner:
         if not all_hits:
             return [header + "_No fillable conversions found._"]
 
-        # Sort using appropriate key depending on whether hits are from reverse scan
-        # (mixed runs shouldn't happen but handle gracefully)
-        def sort_key(r):
-            apy = r.get("locked_apy") or 0.0
-            if r.get("ex_div_in_window"):
-                if r.get("reverse"):
-                    apy -= REVERSE_EX_DIV_APY_PENALTY
-                else:
-                    spot = r.get("spot") or 1.0
-                    annual_div = r.get("annual_div") or 0.0
-                    apy -= (annual_div / spot) * 100.0
-            return apy
-
-        all_hits.sort(key=sort_key)
+        all_hits.sort(key=_sort_key)
 
         chunks, current = [], header
         for hit in all_hits:

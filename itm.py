@@ -2,6 +2,7 @@
 itm.py
 ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
 Commission-aware, fillability-filtered, with primary + fallback pricing.
+Includes reverse mode (scan_ticker_reverse) for /itm r.
 """
 
 import logging
@@ -19,6 +20,7 @@ MIN_OI               = 50
 MAX_SPREAD_PCT       = 0.40
 COMMISSION_PER_CONTRACT = 1.30
 MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
+HTB_SHORT_INT_THRESHOLD = 0.20  # flag as hard-to-borrow if short interest > 20%
 
 _FREQ_DAYS = {
     "M": 30, "Q": 91, "S": 182, "A": 365, "W": 7,
@@ -80,6 +82,46 @@ def _compute_annual_div(fundamentals, spot):
     return div_yield * spot
 
 
+def _get_next_ex_div(fundamentals) -> str:
+    """
+    Extract the next ex-dividend date directly from Schwab fundamentals.
+    Returns ISO date string 'YYYY-MM-DD' or '' if unavailable.
+    Tries multiple field names Schwab uses across different endpoints.
+    """
+    if not fundamentals:
+        return ""
+    for field in ("exDividendDate", "dividendDate", "nextDividendDate",
+                  "exDivDate", "nextExDivDate"):
+        val = fundamentals.get(field)
+        if val:
+            # normalize to YYYY-MM-DD
+            try:
+                return str(val)[:10]
+            except Exception:
+                continue
+    return ""
+
+
+def _get_short_interest(fundamentals) -> float:
+    """
+    Returns short interest as a fraction of float (e.g. 0.25 = 25%).
+    Returns 0.0 if unavailable.
+    """
+    if not fundamentals:
+        return 0.0
+    for field in ("shortIntToFloat", "shortInterestRatio", "shortPercent",
+                  "shortPercentOfFloat", "shortInterest"):
+        val = fundamentals.get(field)
+        if val is not None:
+            try:
+                v = float(val)
+                # Schwab sometimes returns as percentage (25.0) vs fraction (0.25)
+                return v / 100.0 if v > 1.0 else v
+            except (ValueError, TypeError):
+                continue
+    return 0.0
+
+
 def _project_ex_div_dates(last_ex_div, freq, until):
     if not last_ex_div:
         return 0
@@ -113,6 +155,27 @@ class ItmScanner:
         self.schwab = schwab_client
         self.ticker_freqs = ticker_freqs or {}
 
+    def _fetch_fundamentals(self, ticker):
+        """Fetch fundamentals and extract ex-div date + short interest."""
+        annual_div = 0.0
+        last_ex_div = None
+        next_ex_div_date = ""
+        short_int = 0.0
+        try:
+            fundamentals = self.schwab.get_fundamentals(ticker)
+            annual_div = _compute_annual_div(fundamentals, 0)
+            next_ex_div_date = _get_next_ex_div(fundamentals)
+            short_int = _get_short_interest(fundamentals)
+            last_ex_div_str = next_ex_div_date  # use same field
+            if last_ex_div_str:
+                try:
+                    last_ex_div = datetime.strptime(last_ex_div_str[:10], "%Y-%m-%d")
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        return annual_div, last_ex_div, next_ex_div_date, short_int
+
     def scan_ticker(self, ticker):
         results = []
         debug = Counter()
@@ -130,19 +193,16 @@ class ItmScanner:
             debug["no_spot"] += 1
             return results, debug
 
-        annual_div = 0.0
-        last_ex_div = None
-        try:
-            fundamentals = self.schwab.get_fundamentals(ticker)
-            annual_div = _compute_annual_div(fundamentals, spot)
-            last_ex_div_str = fundamentals.get("exDividendDate") or fundamentals.get("dividendDate")
-            if last_ex_div_str:
-                try:
-                    last_ex_div = datetime.strptime(last_ex_div_str[:10], "%Y-%m-%d")
-                except ValueError:
-                    pass
-        except Exception:
-            pass
+        annual_div, last_ex_div, next_ex_div_date, short_int = \
+            self._fetch_fundamentals(ticker)
+
+        # recalculate annual_div with correct spot
+        if annual_div == 0.0:
+            try:
+                fundamentals = self.schwab.get_fundamentals(ticker)
+                annual_div = _compute_annual_div(fundamentals, spot)
+            except Exception:
+                pass
 
         call_map = chain.get("callExpDateMap", {})
         put_map = chain.get("putExpDateMap", {})
@@ -154,6 +214,7 @@ class ItmScanner:
                         set(k.split(":")[0] for k in put_map)
 
         min_locked_per_share = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
+        htb = short_int >= HTB_SHORT_INT_THRESHOLD
 
         for exp_date in sorted(all_exp_dates):
             try:
@@ -188,9 +249,7 @@ class ItmScanner:
             for strike in common_strikes_below:
                 debug["candidates"] += 1
                 strike_str = next(
-                    (s for s in calls.keys() if abs(float(s) - strike) < 0.001),
-                    None,
-                )
+                    (s for s in calls.keys() if abs(float(s) - strike) < 0.001), None)
                 if not strike_str or strike_str not in puts:
                     continue
 
@@ -208,7 +267,6 @@ class ItmScanner:
                 if not _has_market(put_opt):
                     debug["put_no_market"] += 1
                     continue
-
                 if _oi(call_opt) < MIN_OI:
                     debug["call_oi_low"] += 1
                     continue
@@ -225,8 +283,7 @@ class ItmScanner:
                 call_credit_p = _sell_price(call_opt)
                 put_cost_p = _buy_price(put_opt)
                 net_credit_p, locked_p, locked_total_p, apy_p = _locked_and_apy(
-                    spot, strike, call_credit_p, put_cost_p, dte
-                )
+                    spot, strike, call_credit_p, put_cost_p, dte)
 
                 if locked_p < min_locked_per_share:
                     debug["below_min_locked_after_comm"] += 1
@@ -235,14 +292,12 @@ class ItmScanner:
                 call_credit_f = _sell_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
                 put_cost_f = _buy_price(put_opt, extra_frac=FALLBACK_STEP_FRAC)
                 net_credit_f, locked_f, locked_total_f, apy_f = _locked_and_apy(
-                    spot, strike, call_credit_f, put_cost_f, dte
-                )
+                    spot, strike, call_credit_f, put_cost_f, dte)
 
                 primary_debit = spot - call_credit_p + put_cost_p
                 fallback_debit = spot - call_credit_f + put_cost_f
-
-                num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
                 div_yield_pct = (annual_div / spot) * 100.0 if spot > 0 else 0.0
+                num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
 
                 debug["passed"] += 1
                 results.append(dict(
@@ -266,6 +321,9 @@ class ItmScanner:
                     annual_div=round(annual_div, 2),
                     div_yield_pct=round(div_yield_pct, 2),
                     num_ex_divs=num_ex_divs,
+                    next_ex_div_date=next_ex_div_date,
+                    short_int=round(short_int, 4),
+                    htb=htb,
                     freq=freq,
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
@@ -279,10 +337,8 @@ class ItmScanner:
 
     def scan_ticker_reverse(self, ticker):
         """
-        Reverse mode: find strikes ABOVE spot where put is expensive relative
-        to call (put_mid > call_mid). Same schema as scan_ticker so the existing
-        _run_scan / format_summary pipeline works unchanged.
-        Usage: /itm r
+        Reverse mode (/itm r): strikes ABOVE spot where put_mid > call_mid.
+        Same dict schema as scan_ticker so format_summary works unchanged.
         """
         results = []
         debug = Counter()
@@ -300,19 +356,9 @@ class ItmScanner:
             debug["no_spot"] += 1
             return results, debug
 
-        annual_div = 0.0
-        last_ex_div = None
-        try:
-            fundamentals = self.schwab.get_fundamentals(ticker)
-            annual_div = _compute_annual_div(fundamentals, spot)
-            last_ex_div_str = fundamentals.get("exDividendDate") or fundamentals.get("dividendDate")
-            if last_ex_div_str:
-                try:
-                    last_ex_div = datetime.strptime(last_ex_div_str[:10], "%Y-%m-%d")
-                except ValueError:
-                    pass
-        except Exception:
-            pass
+        annual_div, last_ex_div, next_ex_div_date, short_int = \
+            self._fetch_fundamentals(ticker)
+        htb = short_int >= HTB_SHORT_INT_THRESHOLD
 
         call_map = chain.get("callExpDateMap", {})
         put_map = chain.get("putExpDateMap", {})
@@ -343,7 +389,6 @@ class ItmScanner:
             calls = call_map[ck]
             puts = put_map[pk]
 
-            # Strikes ABOVE spot
             common_strikes_above = []
             for s in calls.keys():
                 try:
@@ -353,15 +398,13 @@ class ItmScanner:
                 except ValueError:
                     pass
 
-            common_strikes_above.sort()  # ascending: closest to spot first
+            common_strikes_above.sort()
             common_strikes_above = common_strikes_above[:STRIKES_BELOW_SPOT]
 
             for strike in common_strikes_above:
                 debug["candidates"] += 1
                 strike_str = next(
-                    (s for s in calls.keys() if abs(float(s) - strike) < 0.001),
-                    None,
-                )
+                    (s for s in calls.keys() if abs(float(s) - strike) < 0.001), None)
                 if not strike_str or strike_str not in puts:
                     continue
 
@@ -379,7 +422,6 @@ class ItmScanner:
                 if not _has_market(put_opt):
                     debug["put_no_market"] += 1
                     continue
-
                 if _oi(call_opt) < MIN_OI:
                     debug["call_oi_low"] += 1
                     continue
@@ -393,20 +435,17 @@ class ItmScanner:
                     debug["put_spread_wide"] += 1
                     continue
 
-                # Require put_mid > call_mid (put expensive relative to call)
                 put_mid = (_bid(put_opt) + _ask(put_opt)) / 2.0
                 call_mid = (_bid(call_opt) + _ask(call_opt)) / 2.0
                 if put_mid <= call_mid:
                     debug["no_put_skew"] += 1
                     continue
 
-                # Reverse conversion pricing:
-                # SELL put (receive put_credit), BUY call (pay call_cost)
                 put_credit_p = _sell_price(put_opt)
                 call_cost_p = _buy_price(call_opt)
                 net_credit_p = put_credit_p - call_cost_p
 
-                gap = strike - spot  # positive: strike above spot
+                gap = strike - spot
                 commission_per_share = COMMISSION_PER_CONTRACT / 100.0
                 locked_p = (net_credit_p - gap) - commission_per_share
                 if locked_p < min_locked_per_share:
@@ -414,16 +453,18 @@ class ItmScanner:
                     continue
 
                 cost_basis = spot
-                apy_p = (locked_p / cost_basis) * (365.0 / dte) * 100.0 if cost_basis > 0 and dte > 0 else 0.0
+                apy_p = (locked_p / cost_basis) * (365.0 / dte) * 100.0 \
+                    if cost_basis > 0 and dte > 0 else 0.0
 
                 put_credit_f = _sell_price(put_opt, extra_frac=FALLBACK_STEP_FRAC)
                 call_cost_f = _buy_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
                 net_credit_f = put_credit_f - call_cost_f
                 locked_f = (net_credit_f - gap) - commission_per_share
-                apy_f = (locked_f / cost_basis) * (365.0 / dte) * 100.0 if locked_f > 0 and cost_basis > 0 and dte > 0 else 0.0
+                apy_f = (locked_f / cost_basis) * (365.0 / dte) * 100.0 \
+                    if locked_f > 0 and cost_basis > 0 and dte > 0 else 0.0
 
-                num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
                 div_yield_pct = (annual_div / spot) * 100.0 if spot > 0 else 0.0
+                num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
 
                 debug["passed"] += 1
                 results.append(dict(
@@ -432,6 +473,7 @@ class ItmScanner:
                     dte=dte,
                     spot=round(spot, 2),
                     strike=strike,
+                    # stored as call_credit/put_cost to match format_hit schema
                     call_credit=round(call_cost_p, 2),
                     put_cost=round(put_credit_p, 2),
                     net_credit=round(net_credit_p, 2),
@@ -447,6 +489,9 @@ class ItmScanner:
                     annual_div=round(annual_div, 2),
                     div_yield_pct=round(div_yield_pct, 2),
                     num_ex_divs=num_ex_divs,
+                    next_ex_div_date=next_ex_div_date,
+                    short_int=round(short_int, 4),
+                    htb=htb,
                     freq=freq,
                     call_oi=_oi(call_opt),
                     put_oi=_oi(put_opt),
@@ -454,6 +499,7 @@ class ItmScanner:
                     call_ask=_ask(call_opt),
                     put_bid=_bid(put_opt),
                     put_ask=_ask(put_opt),
+                    reverse=True,
                 ))
 
         return results, debug
@@ -464,12 +510,21 @@ class ItmScanner:
             "M": "monthly", "Q": "quarterly", "W": "weekly",
             "S": "semi-annual", "A": "annual", "?": "unknown",
         }.get(r.get("freq", "?"), r.get("freq", "?"))
+
         div_line = ""
-        if r['annual_div'] > 0:
+        if r.get("annual_div", 0) > 0:
+            ex_div = r.get("next_ex_div_date", "")
+            ex_div_str = f" · next ex-div: {ex_div}" if ex_div else ""
             div_line = (
                 f"  💸 Div: ${r['annual_div']}/yr ({r['div_yield_pct']}%) · "
-                f"paid {freq_label} · {r['num_ex_divs']} ex-div in window\n"
+                f"paid {freq_label} · {r['num_ex_divs']} ex-div in window{ex_div_str}\n"
             )
+
+        htb_line = ""
+        if r.get("htb"):
+            pct = round(r.get("short_int", 0) * 100, 1)
+            htb_line = f"  ⚠️ HTB? Short interest {pct}% of float\n"
+
         return (
             f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
             f"  📅 {r['exp_date']} ({r['dte']}d)\n"
@@ -479,6 +534,7 @@ class ItmScanner:
             f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
             f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
             f"{div_line}"
+            f"{htb_line}"
             f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
         )
 

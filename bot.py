@@ -134,7 +134,8 @@ async def cmd_help(update, context):
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
-        "*Trading:* /itm hits have inline Trade buttons (top 20 only).",
+        "*Trading:* /itm hits have inline Trade buttons (top 20 only).\n"
+        "*Reverse scan:* `/itm r` finds strikes above spot where put > call.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -397,9 +398,21 @@ async def cmd_itm(update, context):
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
-    await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
-                    tickers_override=combined,
-                    hits_with_buttons=True, scanner_key="itm")
+
+    reverse_mode = bool(context.args and context.args[0].lower() == "r")
+
+    if reverse_mode:
+        # /itm r — strikes above spot, put expensive vs call
+        original_scan_ticker = scanner.scan_ticker
+        scanner.scan_ticker = scanner.scan_ticker_reverse
+        await _run_scan(update, context, scanner, "🔄", ItmScanner.format_summary,
+                        tickers_override=combined)
+        scanner.scan_ticker = original_scan_ticker
+    else:
+        # /itm — normal mode, strikes below spot
+        await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
+                        tickers_override=combined,
+                        hits_with_buttons=True, scanner_key="itm")
 
 
 @authorized_only

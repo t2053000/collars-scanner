@@ -14,12 +14,11 @@ DTE_MIN              = 1
 DTE_MAX              = 45
 STRIKES_BELOW_SPOT   = 4
 MID_ADJUST_FRAC      = 0.15
-FALLBACK_STEP_FRAC   = 0.15          # fallback walks 15% of spread worse
-MIN_OI               = 50            # fillability: both legs need OI >= this
-MAX_SPREAD_PCT       = 0.40          # fillability: spread <= 40% of mid
+FALLBACK_STEP_FRAC   = 0.15
+MIN_OI               = 50
+MAX_SPREAD_PCT       = 0.40
 COMMISSION_PER_CONTRACT = 1.30
 MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
-
 
 _FREQ_DAYS = {
     "M": 30, "Q": 91, "S": 182, "A": 365, "W": 7,
@@ -54,7 +53,6 @@ def _spread_pct(option):
 
 
 def _sell_price(option, extra_frac=0.0):
-    """Sell at mid - (MID_ADJUST_FRAC + extra_frac) * spread. Higher extra = worse (lower) sell."""
     bid = _bid(option)
     ask = _ask(option)
     mid = (bid + ask) / 2.0
@@ -62,7 +60,6 @@ def _sell_price(option, extra_frac=0.0):
 
 
 def _buy_price(option, extra_frac=0.0):
-    """Buy at mid + (MID_ADJUST_FRAC + extra_frac) * spread. Higher extra = worse (higher) buy."""
     bid = _bid(option)
     ask = _ask(option)
     mid = (bid + ask) / 2.0
@@ -99,7 +96,6 @@ def _project_ex_div_dates(last_ex_div, freq, until):
 
 
 def _locked_and_apy(spot, strike, call_credit, put_cost, dte):
-    """Return (net_credit, locked_after_comm_per_share, locked_total, apy)."""
     net_credit = call_credit - put_cost
     gap = spot - strike
     commission_per_share = COMMISSION_PER_CONTRACT / 100.0
@@ -213,7 +209,6 @@ class ItmScanner:
                     debug["put_no_market"] += 1
                     continue
 
-                # FILLABILITY FILTER — both legs OI >= MIN_OI, spread <= MAX_SPREAD_PCT
                 if _oi(call_opt) < MIN_OI:
                     debug["call_oi_low"] += 1
                     continue
@@ -227,7 +222,6 @@ class ItmScanner:
                     debug["put_spread_wide"] += 1
                     continue
 
-                # PRIMARY pricing (mid-adjusted)
                 call_credit_p = _sell_price(call_opt)
                 put_cost_p = _buy_price(put_opt)
                 net_credit_p, locked_p, locked_total_p, apy_p = _locked_and_apy(
@@ -238,14 +232,12 @@ class ItmScanner:
                     debug["below_min_locked_after_comm"] += 1
                     continue
 
-                # FALLBACK pricing (walk 15% of spread worse on both legs)
                 call_credit_f = _sell_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
                 put_cost_f = _buy_price(put_opt, extra_frac=FALLBACK_STEP_FRAC)
                 net_credit_f, locked_f, locked_total_f, apy_f = _locked_and_apy(
                     spot, strike, call_credit_f, put_cost_f, dte
                 )
 
-                # Net debit per share to enter (stock - call credit + put cost)
                 primary_debit = spot - call_credit_p + put_cost_p
                 fallback_debit = spot - call_credit_f + put_cost_f
 
@@ -267,11 +259,9 @@ class ItmScanner:
                     locked_total=round(locked_total_p, 2),
                     locked_apy=round(apy_p, 1),
                     primary_debit=round(primary_debit, 2),
-                    # fallback
                     fallback_debit=round(fallback_debit, 2),
                     fallback_locked_total=round(locked_total_f, 2),
                     fallback_apy=round(apy_f, 1),
-                    # context
                     cost_basis=round(spot - net_credit_p, 2),
                     annual_div=round(annual_div, 2),
                     div_yield_pct=round(div_yield_pct, 2),
@@ -287,73 +277,80 @@ class ItmScanner:
 
         return results, debug
 
-    @staticmethod
-    def format_hit(r):
-        freq_label = {
-            "M": "monthly", "Q": "quarterly", "W": "weekly",
-            "S": "semi-annual", "A": "annual", "?": "unknown",
-        }.get(r.get("freq", "?"), r.get("freq", "?"))
-        div_line = ""
-        if r['annual_div'] > 0:
-            div_line = (
-                f"  💸 Div: ${r['annual_div']}/yr ({r['div_yield_pct']}%) · "
-                f"paid {freq_label} · {r['num_ex_divs']} ex-div in window\n"
-            )
-        return (
-            f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
-            f"  📅 {r['exp_date']} ({r['dte']}d)\n"
-            f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
-            f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
-            f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
-            f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
-            f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
-            f"{div_line}"
-            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
-        )
+    def scan_ticker_reverse(self, ticker):
+        """
+        Reverse mode: find strikes ABOVE spot where put is expensive relative
+        to call (put_mid > call_mid). Same schema as scan_ticker so the existing
+        _run_scan / format_summary pipeline works unchanged.
+        Usage: /itm r
+        """
+        results = []
+        debug = Counter()
+        ticker = ticker.upper()
+        freq = self.ticker_freqs.get(ticker, "Q")
 
-    @staticmethod
-    def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
-        header = (
-            f"🔒 *ITM Conversion Scan*\n"
-            f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
-            f"Strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} both legs · spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
-            f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after ${COMMISSION_PER_CONTRACT:g} comm\n"
-            f"_Best at BOTTOM_\n"
-        )
-        if debug_totals:
-            d = debug_totals
-            header += (
-                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
-                f"  · call no market:   {d.get('call_no_market', 0):,}\n"
-                f"  · put no market:    {d.get('put_no_market', 0):,}\n"
-                f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"
-                f"  · put OI < {MIN_OI}:     {d.get('put_oi_low', 0):,}\n"
-                f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
-                f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
-                f"  · below min profit: {d.get('below_min_locked_after_comm', 0):,}\n"
-                f"  · ✅ passed:        {d.get('passed', 0):,}\n"
-            )
-        header += f"\nOpportunities: *{len(all_hits)}*\n"
-        if errors:
-            err_block = "\n".join(f"  • {e}" for e in errors[:20])
-            if len(err_block) > 1500:
-                tickers_only = ", ".join(e.split(":")[0] for e in errors)
-                err_block = f"  {tickers_only}\n_(use_ `/logs` _for details)_"
-            header += f"\n⚠️ *Errors:*\n{err_block}\n"
-        header += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        try:
+            chain = self.schwab.get_option_chain(ticker)
+        except Exception as e:
+            logger.error(f"[{ticker}] reverse scan chain fetch failed: {e}")
+            raise
 
-        if not all_hits:
-            return [header + "_No fillable conversions found._"]
+        spot = chain.get("underlyingPrice")
+        if not spot or spot <= 0:
+            debug["no_spot"] += 1
+            return results, debug
 
-        all_hits.sort(key=lambda r: r["locked_apy"])
+        annual_div = 0.0
+        last_ex_div = None
+        try:
+            fundamentals = self.schwab.get_fundamentals(ticker)
+            annual_div = _compute_annual_div(fundamentals, spot)
+            last_ex_div_str = fundamentals.get("exDividendDate") or fundamentals.get("dividendDate")
+            if last_ex_div_str:
+                try:
+                    last_ex_div = datetime.strptime(last_ex_div_str[:10], "%Y-%m-%d")
+                except ValueError:
+                    pass
+        except Exception:
+            pass
 
-        chunks, current = [], header
-        for hit in all_hits:
-            block = ItmScanner.format_hit(hit) + "\n\n"
-            if len(current) + len(block) > 3800:
-                chunks.append(current.rstrip())
-                current = ""
-            current += block
-        if current.strip():
-            chunks.append(current.rstrip())
-        return chunks
+        call_map = chain.get("callExpDateMap", {})
+        put_map = chain.get("putExpDateMap", {})
+        if not call_map or not put_map:
+            debug["empty_chain"] += 1
+            return results, debug
+
+        all_exp_dates = set(k.split(":")[0] for k in call_map) & \
+                        set(k.split(":")[0] for k in put_map)
+
+        min_locked_per_share = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
+
+        for exp_date in sorted(all_exp_dates):
+            try:
+                exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            dte = (exp_dt - datetime.utcnow()).days
+            if dte < DTE_MIN or dte > DTE_MAX:
+                debug["dte_out_of_range"] += 1
+                continue
+
+            ck = next((k for k in call_map if k.startswith(exp_date + ":")), None)
+            pk = next((k for k in put_map if k.startswith(exp_date + ":")), None)
+            if not ck or not pk:
+                continue
+
+            calls = call_map[ck]
+            puts = put_map[pk]
+
+            # Strikes ABOVE spot
+            common_strikes_above = []
+            for s in calls.keys():
+                try:
+                    fs = float(s)
+                    if fs > spot and s in puts:
+                        common_strikes_above.append(fs)
+                except ValueError:
+                    pass
+
+            common_strikes_above.

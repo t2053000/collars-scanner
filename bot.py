@@ -1,6 +1,7 @@
 """
 bot.py — Telegram handlers and trade flow.
 Defensive imports + flexible build_app signature.
+Verbose logging on /ritm Park flow to diagnose missing preview message.
 """
 
 import asyncio
@@ -33,7 +34,6 @@ import github_store as _gs
 
 
 def _gs_try(names, *args, default=None):
-    """Try function names with args; if TypeError, try without args."""
     for name in names:
         fn = getattr(_gs, name, None)
         if not callable(fn):
@@ -193,11 +193,10 @@ async def cmd_submit_token(update, ctx):
 
 
 # =========================================================================
-# SCANNER COMMANDS (passthrough — try multiple entry-point names)
+# SCANNER COMMANDS (passthrough)
 # =========================================================================
 
 def _run_scanner_module(mod, names, *args):
-    """Try multiple function names on a scanner module."""
     for name in names:
         fn = getattr(mod, name, None)
         if callable(fn):
@@ -260,7 +259,6 @@ async def cmd_csp(update, ctx):
 # =========================================================================
 
 def _get_itm_hits():
-    """Try multiple entry-point names to get ITM hits as a list of dicts."""
     for name in ["scan_itm", "scan", "run_itm", "run", "find_hits"]:
         fn = getattr(itm, name, None)
         if callable(fn):
@@ -274,7 +272,6 @@ def _get_itm_hits():
 
 
 def _format_itm_hit(hit, idx, total):
-    """Try itm.format_itm_hit if exists, else build inline."""
     fn = getattr(itm, "format_itm_hit", None)
     if callable(fn):
         try:
@@ -338,7 +335,7 @@ async def cb_trade(update, ctx):
 
 
 # =========================================================================
-# /ritm WITH PARKED TRADE BUTTONS
+# /ritm WITH PARKED TRADE BUTTONS — VERBOSE LOGGING
 # =========================================================================
 
 async def cmd_ritm(update, ctx):
@@ -379,17 +376,65 @@ async def cb_rtrade(update, ctx):
     q = update.callback_query
     uid = q.from_user.id
     logger.info(f"cb_rtrade FIRED user={uid} data={q.data}")
-    await q.answer()
+    try:
+        await q.answer()
+        logger.info(f"cb_rtrade: q.answer() OK")
+    except Exception as e:
+        logger.error(f"cb_rtrade: q.answer() failed: {e}")
+
     trade_id = q.data.split(":", 1)[1]
     user_pending = pending_ritm_trades.get(uid, {})
+    logger.info(f"cb_rtrade: pending lookup trade_id={trade_id} found={trade_id in user_pending}, total pending={len(user_pending)}")
+
     if trade_id not in user_pending:
-        await ctx.bot.send_message(uid, "⏱ Trade expired or unknown. Re-run /ritm.")
+        try:
+            await ctx.bot.send_message(uid, "⏱ Trade expired or unknown. Re-run /ritm.")
+        except Exception as e:
+            logger.error(f"cb_rtrade: expired-msg send failed: {e}")
         return
+
     hit, _ = user_pending[trade_id]
-    pricing = orders.compute_ritm_pricing(hit)
+    logger.info(f"cb_rtrade: ticker={hit['ticker']} strike={hit['strike']} exp={hit['exp_date']}")
+
+    try:
+        pricing = orders.compute_ritm_pricing(hit)
+        logger.info(f"cb_rtrade: pricing computed fair=${pricing['fair_net_credit_per_share']:.2f} parked=${pricing['parked_net_credit_per_share']:.2f}")
+    except Exception as e:
+        logger.error(f"cb_rtrade: pricing failed: {e}", exc_info=True)
+        try:
+            await ctx.bot.send_message(uid, f"❌ pricing error: {e}")
+        except Exception:
+            pass
+        return
+
     user_pending[trade_id] = (hit, time.time() + TRADE_CONFIRM_TIMEOUT)
-    preview = orders.format_ritm_preview(hit, pricing)
-    await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
+
+    try:
+        preview = orders.format_ritm_preview(hit, pricing)
+        logger.info(f"cb_rtrade: preview built, {len(preview)} chars")
+    except Exception as e:
+        logger.error(f"cb_rtrade: format_ritm_preview failed: {e}", exc_info=True)
+        try:
+            await ctx.bot.send_message(uid, f"❌ preview build error: {e}")
+        except Exception:
+            pass
+        return
+
+    # Try markdown first; if it fails, retry plain text
+    try:
+        sent = await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
+        logger.info(f"cb_rtrade: preview sent (markdown), message_id={sent.message_id}")
+    except Exception as e:
+        logger.warning(f"cb_rtrade: markdown send failed: {e}, retrying as plain text")
+        try:
+            sent = await ctx.bot.send_message(uid, preview)
+            logger.info(f"cb_rtrade: preview sent (plain), message_id={sent.message_id}")
+        except Exception as e2:
+            logger.error(f"cb_rtrade: plain-text send ALSO failed: {e2}", exc_info=True)
+            try:
+                await ctx.bot.send_message(uid, "❌ Could not send confirm preview. Check logs.")
+            except Exception:
+                pass
 
 
 # =========================================================================
@@ -523,22 +568,12 @@ async def cb_cancel(update, ctx):
 # =========================================================================
 
 def build_app(*args, **kwargs):
-    """
-    Flexible build_app: main.py may inject scanner instances and the token in
-    various positions/orders. We ignore the scanners (this bot imports them
-    directly at module top) and locate the Telegram token wherever it is.
-    """
     token = None
-
-    # 1. Try common kwarg names
     for k in ("token", "telegram_token", "bot_token", "tg_token"):
         if k in kwargs and kwargs[k]:
             token = kwargs[k]
             logger.info(f"build_app: token from kwarg '{k}'")
             break
-
-    # 2. Look through positional args for a string that looks like a Telegram token
-    #    (format: "<digits>:<35+ alphanumerics/dashes/underscores>")
     if not token:
         for a in args:
             if isinstance(a, str) and ":" in a and len(a) >= 40:
@@ -547,15 +582,12 @@ def build_app(*args, **kwargs):
                     token = a
                     logger.info(f"build_app: token found in positional args")
                     break
-
-    # 3. Fall back to env var
     if not token:
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         if token:
             logger.info("build_app: token from env TELEGRAM_BOT_TOKEN")
 
     if not token:
-        logger.error(f"build_app: NO TOKEN FOUND. args={len(args)}, kwargs keys={list(kwargs.keys())}")
         raise ValueError(
             f"build_app couldn't find Telegram token in args ({len(args)}) "
             f"or kwargs ({list(kwargs.keys())}) or env TELEGRAM_BOT_TOKEN"

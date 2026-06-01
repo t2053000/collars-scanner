@@ -353,4 +353,178 @@ class ItmScanner:
                 except ValueError:
                     pass
 
-            common_strikes_above.
+            common_strikes_above.sort()  # ascending: closest to spot first
+            common_strikes_above = common_strikes_above[:STRIKES_BELOW_SPOT]
+
+            for strike in common_strikes_above:
+                debug["candidates"] += 1
+                strike_str = next(
+                    (s for s in calls.keys() if abs(float(s) - strike) < 0.001),
+                    None,
+                )
+                if not strike_str or strike_str not in puts:
+                    continue
+
+                call_contracts = calls.get(strike_str, [])
+                put_contracts = puts.get(strike_str, [])
+                if not call_contracts or not put_contracts:
+                    continue
+
+                call_opt = call_contracts[0]
+                put_opt = put_contracts[0]
+
+                if not _has_market(call_opt):
+                    debug["call_no_market"] += 1
+                    continue
+                if not _has_market(put_opt):
+                    debug["put_no_market"] += 1
+                    continue
+
+                if _oi(call_opt) < MIN_OI:
+                    debug["call_oi_low"] += 1
+                    continue
+                if _oi(put_opt) < MIN_OI:
+                    debug["put_oi_low"] += 1
+                    continue
+                if _spread_pct(call_opt) > MAX_SPREAD_PCT:
+                    debug["call_spread_wide"] += 1
+                    continue
+                if _spread_pct(put_opt) > MAX_SPREAD_PCT:
+                    debug["put_spread_wide"] += 1
+                    continue
+
+                # Require put_mid > call_mid (put expensive relative to call)
+                put_mid = (_bid(put_opt) + _ask(put_opt)) / 2.0
+                call_mid = (_bid(call_opt) + _ask(call_opt)) / 2.0
+                if put_mid <= call_mid:
+                    debug["no_put_skew"] += 1
+                    continue
+
+                # Reverse conversion pricing:
+                # SELL put (receive put_credit), BUY call (pay call_cost)
+                put_credit_p = _sell_price(put_opt)
+                call_cost_p = _buy_price(call_opt)
+                net_credit_p = put_credit_p - call_cost_p
+
+                gap = strike - spot  # positive: strike above spot
+                commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+                locked_p = (net_credit_p - gap) - commission_per_share
+                if locked_p < min_locked_per_share:
+                    debug["below_min_locked_after_comm"] += 1
+                    continue
+
+                cost_basis = spot
+                apy_p = (locked_p / cost_basis) * (365.0 / dte) * 100.0 if cost_basis > 0 and dte > 0 else 0.0
+
+                put_credit_f = _sell_price(put_opt, extra_frac=FALLBACK_STEP_FRAC)
+                call_cost_f = _buy_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
+                net_credit_f = put_credit_f - call_cost_f
+                locked_f = (net_credit_f - gap) - commission_per_share
+                apy_f = (locked_f / cost_basis) * (365.0 / dte) * 100.0 if locked_f > 0 and cost_basis > 0 and dte > 0 else 0.0
+
+                num_ex_divs = _project_ex_div_dates(last_ex_div, freq, exp_dt)
+                div_yield_pct = (annual_div / spot) * 100.0 if spot > 0 else 0.0
+
+                debug["passed"] += 1
+                results.append(dict(
+                    ticker=ticker,
+                    exp_date=exp_date,
+                    dte=dte,
+                    spot=round(spot, 2),
+                    strike=strike,
+                    call_credit=round(call_cost_p, 2),
+                    put_cost=round(put_credit_p, 2),
+                    net_credit=round(net_credit_p, 2),
+                    gap=round(gap, 2),
+                    locked_profit=round(locked_p, 4),
+                    locked_total=round(locked_p * 100, 2),
+                    locked_apy=round(apy_p, 1),
+                    primary_debit=round(spot - net_credit_p, 2),
+                    fallback_debit=round(spot - net_credit_f, 2),
+                    fallback_locked_total=round(locked_f * 100, 2),
+                    fallback_apy=round(apy_f, 1),
+                    cost_basis=round(spot, 2),
+                    annual_div=round(annual_div, 2),
+                    div_yield_pct=round(div_yield_pct, 2),
+                    num_ex_divs=num_ex_divs,
+                    freq=freq,
+                    call_oi=_oi(call_opt),
+                    put_oi=_oi(put_opt),
+                    call_bid=_bid(call_opt),
+                    call_ask=_ask(call_opt),
+                    put_bid=_bid(put_opt),
+                    put_ask=_ask(put_opt),
+                ))
+
+        return results, debug
+
+    @staticmethod
+    def format_hit(r):
+        freq_label = {
+            "M": "monthly", "Q": "quarterly", "W": "weekly",
+            "S": "semi-annual", "A": "annual", "?": "unknown",
+        }.get(r.get("freq", "?"), r.get("freq", "?"))
+        div_line = ""
+        if r['annual_div'] > 0:
+            div_line = (
+                f"  💸 Div: ${r['annual_div']}/yr ({r['div_yield_pct']}%) · "
+                f"paid {freq_label} · {r['num_ex_divs']} ex-div in window\n"
+            )
+        return (
+            f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
+            f"  📅 {r['exp_date']} ({r['dte']}d)\n"
+            f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
+            f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
+            f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
+            f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
+            f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
+            f"{div_line}"
+            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
+        )
+
+    @staticmethod
+    def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
+        header = (
+            f"🔒 *ITM Conversion Scan*\n"
+            f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
+            f"Strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} both legs · spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
+            f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after ${COMMISSION_PER_CONTRACT:g} comm\n"
+            f"_Best at BOTTOM_\n"
+        )
+        if debug_totals:
+            d = debug_totals
+            header += (
+                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
+                f"  · call no market:   {d.get('call_no_market', 0):,}\n"
+                f"  · put no market:    {d.get('put_no_market', 0):,}\n"
+                f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"
+                f"  · put OI < {MIN_OI}:     {d.get('put_oi_low', 0):,}\n"
+                f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
+                f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
+                f"  · below min profit: {d.get('below_min_locked_after_comm', 0):,}\n"
+                f"  · ✅ passed:        {d.get('passed', 0):,}\n"
+            )
+        header += f"\nOpportunities: *{len(all_hits)}*\n"
+        if errors:
+            err_block = "\n".join(f"  • {e}" for e in errors[:20])
+            if len(err_block) > 1500:
+                tickers_only = ", ".join(e.split(":")[0] for e in errors)
+                err_block = f"  {tickers_only}\n_(use_ `/logs` _for details)_"
+            header += f"\n⚠️ *Errors:*\n{err_block}\n"
+        header += "━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        if not all_hits:
+            return [header + "_No fillable conversions found._"]
+
+        all_hits.sort(key=lambda r: r["locked_apy"])
+
+        chunks, current = [], header
+        for hit in all_hits:
+            block = ItmScanner.format_hit(hit) + "\n\n"
+            if len(current) + len(block) > 3800:
+                chunks.append(current.rstrip())
+                current = ""
+            current += block
+        if current.strip():
+            chunks.append(current.rstrip())
+        return chunks

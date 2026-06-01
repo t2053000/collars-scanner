@@ -299,29 +299,13 @@ def _run_itm_scan():
     return hits, None
 
 def _format_itm_hit(hit, idx, total):
-    ticker = hit.get("ticker") or "?"
-    spot = hit.get("spot") or 0
-    strike = hit.get("strike")
-    exp_date = hit.get("exp_date") or ""
-    dte = hit.get("dte") or 0
-    call_credit = hit.get("call_credit") or 0
-    put_cost = hit.get("put_cost") or 0
-    primary_debit = hit.get("primary_debit") or 0
-    fallback_debit = hit.get("fallback_debit") or 0
-    fallback_apy = hit.get("fallback_apy") or 0
-    locked_total = hit.get("locked_total") or 0
-    locked_apy = hit.get("locked_apy") or 0
-    call_oi = hit.get("call_oi") or 0
-    put_oi = hit.get("put_oi") or 0
-    strike_str = f"{strike:g}" if strike is not None else "N/A"
-    return (
-        f"*{idx}/{total}  {ticker}*  spot ${spot}\n"
-        f"  strike ${strike_str}  exp {exp_date} ({dte}d)\n"
-        f"  call credit ${call_credit}  put cost ${put_cost}\n"
-        f"  primary debit ${primary_debit}  fallback ${fallback_debit} @ {fallback_apy:.1f}%\n"
-        f"  *locked ${locked_total:.2f}* @ *{locked_apy:.1f}% APY*\n"
-        f"  OI call {call_oi} / put {put_oi}"
-    )
+    # Use the scanner's own proven formatter (ItmScanner.format_hit)
+    try:
+        return f"{idx}/{total}\n" + itm.ItmScanner.format_hit(hit)
+    except Exception as e:
+        logger.warning(f"_format_itm_hit: ItmScanner.format_hit failed: {e}; hit keys={list(hit.keys()) if isinstance(hit, dict) else type(hit)}")
+        return f"*{idx}/{total} {hit.get('ticker','?')}* spot ${hit.get('spot',0)} apy {hit.get('locked_apy',0)}%"
+
 
 
 async def cmd_itm(update, ctx):

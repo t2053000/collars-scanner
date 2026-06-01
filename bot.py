@@ -137,7 +137,8 @@ async def cmd_help(update, context):
         "*Trading:* `/itm` hits have Trade buttons. Reply `YES TICKER` to confirm.\n"
         "*Reverse scan:* `/itm r` — strikes above spot, put>call. "
         "Tap R Trade button, reply `R TICKER` to submit 2-leg options order. "
-        "Short stock manually on Schwab.",
+        "Short stock manually on Schwab.\n"
+        "_Borrow cost (20% APR) already deducted from /itm r APY._",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -287,7 +288,8 @@ async def _send_trade_button(update, context, hit):
     """Standard ITM conversion trade button — reply YES TICKER to confirm."""
     trade_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
-    logger.info(f"_send_trade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
+    logger.info(f"_send_trade_button: user={user_id} trade_id={trade_id} "
+                f"ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
 
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit": hit,
@@ -326,7 +328,8 @@ async def _send_rtrade_button(update, context, hit):
     """Reverse ITM trade button (2-leg options only) — reply R TICKER to confirm."""
     trade_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
-    logger.info(f"_send_rtrade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
+    logger.info(f"_send_rtrade_button: user={user_id} trade_id={trade_id} "
+                f"ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
 
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit": hit,
@@ -336,14 +339,25 @@ async def _send_rtrade_button(update, context, hit):
     }
 
     htb_flag = " ⚠️HTB?" if hit.get("htb") else ""
-    ex_div = hit.get("next_ex_div_date", "")
-    ex_div_str = f" · ex-div {ex_div}" if ex_div else ""
+    ex_div_warn = ""
+    if hit.get("ex_div_in_window"):
+        ex_div_warn = f"\n🚨 EX-DIV {hit.get('next_ex_div_date','')} BEFORE EXPIRY"
+    ex_div_str = ""
+    if hit.get("next_ex_div_date") and not hit.get("ex_div_in_window"):
+        ex_div_str = f" · ex-div {hit['next_ex_div_date']}"
+    borrow_str = ""
+    if hit.get("borrow_cost", 0) > 0:
+        borrow_str = f" · borrow −${hit['borrow_cost']:.2f}"
+
     summary = (
-        f"🔄 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d){htb_flag}\n"
-        f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh{ex_div_str}\n"
-        f"💰 Options credit ${hit['primary_debit']:.2f}/sh → *{hit['locked_apy']:.1f}% APY*\n"
+        f"🔄 *{hit['ticker']}* @ ${hit['spot']} · "
+        f"{hit['exp_date']} ({hit['dte']}d){htb_flag}\n"
+        f"Strike ${hit['strike']:g} · "
+        f"Net credit ${hit['net_credit']:.2f}/sh{ex_div_str}{borrow_str}\n"
+        f"💰 Locked ${hit['locked_total']:.0f} → *{hit['locked_apy']:.1f}% APY*\n"
         f"🔄 Fallback ${hit['fallback_debit']:.2f}/sh → {hit['fallback_apy']:.1f}% APY\n"
-        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit['locked_total']:.0f}\n"
+        f"OI {hit['call_oi']}/{hit['put_oi']}"
+        f"{ex_div_warn}\n"
         f"⚠️ Short stock manually on Schwab"
     )
     keyboard = InlineKeyboardMarkup([[
@@ -480,7 +494,7 @@ async def cmd_ritm(update, context):
 
 
 # ---------------------------------------------------------------------------
-# Trade flow — with verbose logging
+# Trade flow
 # ---------------------------------------------------------------------------
 
 @authorized_callback
@@ -501,7 +515,8 @@ async def cb_trade(update, context):
         return
 
     pending = _PENDING_TRADES.get((user_id, trade_id))
-    logger.info(f"cb_trade: pending lookup ({user_id},{trade_id}) found={pending is not None}, total pending={len(_PENDING_TRADES)}")
+    logger.info(f"cb_trade: pending lookup ({user_id},{trade_id}) "
+                f"found={pending is not None}, total pending={len(_PENDING_TRADES)}")
     if not pending:
         await query.message.reply_text(
             f"⏱ Trade expired (no entry for {trade_id}). Re-run /itm."
@@ -560,7 +575,7 @@ async def cb_trade(update, context):
 
 
 async def handle_yes_reply(update, context):
-    """Handles both YES TICKER (ITM) and R TICKER (reverse ITM) confirmations."""
+    """Handles YES TICKER (ITM) and R TICKER (reverse ITM) confirmations."""
     user = update.effective_user
     if not user or not github_store.is_authorized(user.id):
         return
@@ -578,7 +593,8 @@ async def handle_yes_reply(update, context):
     ticker = parts[1].upper()
     user_id = user.id
 
-    logger.info(f"handle_yes_reply: keyword={keyword} ticker={ticker} user={user_id} reverse={is_reverse}")
+    logger.info(f"handle_yes_reply: keyword={keyword} ticker={ticker} "
+                f"user={user_id} reverse={is_reverse}")
 
     now = time.time()
     matching = None
@@ -594,7 +610,6 @@ async def handle_yes_reply(update, context):
         if "pricing" not in pending:
             logger.info(f"handle_yes_reply: skipping {tid}, no pricing (button not tapped)")
             continue
-        # Match YES to non-reverse, R to reverse
         if pending.get("reverse", False) != is_reverse:
             continue
         matching = (uid, tid, pending)
@@ -604,18 +619,20 @@ async def handle_yes_reply(update, context):
         logger.info(f"handle_yes_reply: no matching pending for {ticker}")
         if is_reverse:
             await update.message.reply_text(
-                f"❌ No pending reverse {ticker} trade. Tap R Trade button first, then reply R {ticker} within 60s."
+                f"❌ No pending reverse {ticker} trade. "
+                f"Tap R Trade button first, then reply R {ticker} within 60s."
             )
         else:
             await update.message.reply_text(
-                f"❌ No pending {ticker} trade. Tap Trade button first, then reply YES {ticker} within 60s."
+                f"❌ No pending {ticker} trade. "
+                f"Tap Trade button first, then reply YES {ticker} within 60s."
             )
         return
 
     uid, tid, pending = matching
     hit = pending["hit"]
     pricing = pending["pricing"]
-    logger.info(f"handle_yes_reply: matched pending {tid} reverse={is_reverse}, building order")
+    logger.info(f"handle_yes_reply: matched pending {tid} reverse={is_reverse}")
 
     schwab = context.application.bot_data["schwab_client"]
 
@@ -630,7 +647,8 @@ async def handle_yes_reply(update, context):
         await update.message.reply_text(f"❌ Order build failed: {type(e).__name__}: {e}")
         return
 
-    action_str = f"{ticker} reverse ITM (options only)" if is_reverse else f"{ticker} ITM conversion"
+    action_str = (f"{ticker} reverse ITM (options only)"
+                  if is_reverse else f"{ticker} ITM conversion")
     status_msg = await update.message.reply_text(
         f"📤 Submitting {action_str} at {pricing['apy']:.1f}% APY…"
     )
@@ -641,22 +659,21 @@ async def handle_yes_reply(update, context):
         logger.info(f"handle_yes_reply: order placed, id={order_id}")
     except Exception as e:
         logger.exception("place_order failed")
-        await _edit_robust(status_msg, f"❌ Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        await _edit_robust(
+            status_msg, f"❌ Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
 
     del _PENDING_TRADES[(uid, tid)]
 
     if is_reverse:
-        # Reverse orders: no monitoring (NET_CREDIT, user manages stock leg manually)
         await _edit_robust(
             status_msg,
             f"✅ Order *{order_id}* submitted for {ticker} (options legs)\n"
-            f"SELL put + BUY call at NET_CREDIT ${pricing['net_credit']:.2f}\n"
+            f"SELL put + BUY call · NET_CREDIT ${pricing['net_credit']:.2f}\n"
             f"⚠️ *Remember to short {ticker} stock on Schwab manually.*"
         )
         return
 
-    # Standard ITM — monitor fill
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id,
         "hit": hit,
@@ -687,7 +704,8 @@ async def monitor_order(context, user_id, order_id, status_msg):
     while time.time() - start < 30:
         await asyncio.sleep(5)
         try:
-            status = await loop.run_in_executor(None, schwab.get_order_status, order_id)
+            status = await loop.run_in_executor(
+                None, schwab.get_order_status, order_id)
             status_str = status.get("status", "UNKNOWN")
             logger.info(f"monitor_order: order={order_id} status={status_str}")
             if status_str == "FILLED":
@@ -710,10 +728,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
         active = _ACTIVE_ORDERS.pop(user_id, None)
         hit = active["hit"] if active else None
         tkr = hit["ticker"] if hit else "?"
-        await _edit_robust(
-            status_msg,
-            f"✅ *FILLED* — order {order_id} for {tkr}",
-        )
+        await _edit_robust(status_msg, f"✅ *FILLED* — order {order_id} for {tkr}")
         return
 
     active = _ACTIVE_ORDERS.get(user_id)
@@ -734,18 +749,19 @@ async def monitor_order(context, user_id, order_id, status_msg):
     buttons.append([InlineKeyboardButton(
         "❌ Cancel order", callback_data=f"cancel:{order_id}",
     )])
-    keyboard = InlineKeyboardMarkup(buttons)
 
     floor_note = ""
     if not improve_enabled:
-        floor_note = f"\n⚠️ Can't improve — next would drop below {orders.MIN_APY_FLOOR_PCT:g}% floor."
+        floor_note = (f"\n⚠️ Can't improve — next would drop below "
+                      f"{orders.MIN_APY_FLOOR_PCT:g}% floor.")
 
     await _edit_robust(
         status_msg,
         f"⏳ Order {order_id} for *{hit['ticker']}* not filled after 30s.\n"
-        f"Current limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
+        f"Current limit: ${active['pricing']['call_limit']:.2f} / "
+        f"${active['pricing']['put_limit']:.2f}\n"
         f"Current APY: {active['pricing']['apy']:.1f}%{floor_note}",
-        reply_markup=keyboard,
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
@@ -782,7 +798,8 @@ async def cb_improve(update, context):
 
     try:
         order_payload = orders.build_itm_conversion_order(hit, new_pricing)
-        new_order_id = await loop.run_in_executor(None, schwab.place_order, order_payload)
+        new_order_id = await loop.run_in_executor(
+            None, schwab.place_order, order_payload)
     except Exception as e:
         logger.exception("improve resubmit failed")
         await query.message.reply_text(f"❌ Resubmit failed: {type(e).__name__}: {e}")

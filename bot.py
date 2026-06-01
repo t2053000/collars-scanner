@@ -1,5 +1,7 @@
 """
 bot.py — Telegram handlers and trade flow.
+Scanner selection by EXACT class type (itm.ItmScanner), not duck-typing,
+because DcaScanner/CspScanner share the scan_ticker+ticker_freqs interface.
 """
 
 import asyncio
@@ -25,12 +27,10 @@ import orders
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# Injected from main.py via build_app
 _itm_scanner = None
 _schwab_client = None
 
 
-# ---------- Defensive github_store wrapper ----------
 import github_store as _gs
 
 
@@ -57,7 +57,7 @@ def _gs_try(names, *args, default=None):
 
 def _load_tickers():
     return _gs_try(
-        ["load_tickers", "read_tickers", "get_tickers", "list_tickers", "load_file", "read_file"],
+        ["load_tickers", "read_tickers", "get_tickers", "list_tickers", "get_div_tickers", "load_file", "read_file"],
         "tickers.txt", default=[]
     ) or []
 
@@ -199,7 +199,7 @@ async def cmd_submit_token(update, ctx):
 
 
 # =========================================================================
-# SCANNER COMMANDS (passthrough)
+# SCANNER COMMANDS (passthrough) — these use module-level functions if present
 # =========================================================================
 
 def _run_scanner_module(mod, names, *args):
@@ -261,7 +261,7 @@ async def cmd_csp(update, ctx):
 
 
 # =========================================================================
-# /itm WITH TRADE BUTTONS
+# /itm WITH TRADE BUTTONS — uses the REAL injected ItmScanner
 # =========================================================================
 
 def _run_itm_scan():
@@ -278,11 +278,7 @@ def _run_itm_scan():
     for t in tickers:
         try:
             raw = _itm_scanner.scan_ticker(t)
-            # scan_ticker returns (results_list, debug_counter)
-            if isinstance(raw, tuple):
-                results = raw[0]
-            else:
-                results = raw
+            results = raw[0] if isinstance(raw, tuple) else raw
             if results:
                 for item in results:
                     if isinstance(item, dict) and item.get("ticker"):
@@ -291,21 +287,20 @@ def _run_itm_scan():
             errors += 1
             logger.warning(f"_run_itm_scan: scan_ticker({t}) failed: {e}")
 
-    hits.sort(key=lambda h: h.get("locked_apy", 0))
+    hits.sort(key=lambda h: h.get("locked_apy", 0) or 0)
     logger.info(f"_run_itm_scan: {len(tickers)} tickers, {len(hits)} hits, {errors} errors")
     if hits:
-        logger.info(f"_run_itm_scan: first hit FULL: {hits[0]}")
-        logger.info(f"_run_itm_scan: first hit ticker={hits[0].get('ticker')} strike={hits[0].get('strike')} apy={hits[0].get('locked_apy')}")
+        logger.info(f"_run_itm_scan: first hit ticker={hits[0].get('ticker')} strike={hits[0].get('strike')} locked_apy={hits[0].get('locked_apy')}")
     return hits, None
 
+
 def _format_itm_hit(hit, idx, total):
-    # Use the scanner's own proven formatter (ItmScanner.format_hit)
     try:
         return f"{idx}/{total}\n" + itm.ItmScanner.format_hit(hit)
     except Exception as e:
-        logger.warning(f"_format_itm_hit: ItmScanner.format_hit failed: {e}; hit keys={list(hit.keys()) if isinstance(hit, dict) else type(hit)}")
-        return f"*{idx}/{total} {hit.get('ticker','?')}* spot ${hit.get('spot',0)} apy {hit.get('locked_apy',0)}%"
-
+        logger.warning(f"_format_itm_hit: format_hit failed: {e}; keys={list(hit.keys()) if isinstance(hit, dict) else type(hit)}")
+        return (f"*{idx}/{total} {hit.get('ticker','?')}* spot ${hit.get('spot',0)} "
+                f"strike ${hit.get('strike','?')} apy {hit.get('locked_apy',0)}%")
 
 
 async def cmd_itm(update, ctx):
@@ -331,11 +326,7 @@ async def cmd_itm(update, ctx):
     for idx, hit in enumerate(hits[-MAX_TRADE_BUTTONS:], start=1):
         trade_id = _gen_trade_id()
         pending_itm_trades[uid][trade_id] = (hit, 0, expires_at)
-        try:
-            text = _format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
-        except Exception as e:
-            logger.warning(f"_format_itm_hit failed for {hit.get('ticker')}: {e}")
-            text = f"*{idx} {hit.get('ticker','?')}* spot ${hit.get('spot',0)} apy {hit.get('locked_apy',0):.1f}%"
+        text = _format_itm_hit(hit, idx, min(MAX_TRADE_BUTTONS, len(hits)))
         kb = InlineKeyboardMarkup([[
             InlineKeyboardButton(
                 f"💼 Trade @ {hit.get('locked_apy', 0):.1f}% APY",
@@ -427,7 +418,6 @@ async def cb_rtrade(update, ctx):
     logger.info(f"cb_rtrade FIRED user={uid} data={q.data}")
     try:
         await q.answer()
-        logger.info("cb_rtrade: q.answer() OK")
     except Exception as e:
         logger.error(f"cb_rtrade: q.answer() failed: {e}")
 
@@ -447,7 +437,7 @@ async def cb_rtrade(update, ctx):
 
     try:
         pricing = orders.compute_ritm_pricing(hit)
-        logger.info(f"cb_rtrade: pricing fair=${pricing['fair_net_credit_per_share']:.2f} parked=${pricing['parked_net_credit_per_share']:.2f}")
+        logger.info(f"cb_rtrade: fair=${pricing['fair_net_credit_per_share']:.2f} parked=${pricing['parked_net_credit_per_share']:.2f}")
     except Exception as e:
         logger.error(f"cb_rtrade: pricing failed: {e}", exc_info=True)
         try:
@@ -460,7 +450,6 @@ async def cb_rtrade(update, ctx):
 
     try:
         preview = orders.format_ritm_preview(hit, pricing)
-        logger.info(f"cb_rtrade: preview built {len(preview)} chars")
     except Exception as e:
         logger.error(f"cb_rtrade: preview build failed: {e}", exc_info=True)
         try:
@@ -601,8 +590,7 @@ async def _monitor_order(update, ctx, order_id, hit, pricing):
 async def cb_improve(update, ctx):
     q = update.callback_query
     await q.answer()
-    await ctx.bot.send_message(q.from_user.id,
-        "🔧 Improve: cancel on Schwab and re-run /itm.")
+    await ctx.bot.send_message(q.from_user.id, "🔧 Improve: cancel on Schwab and re-run /itm.")
 
 
 async def cb_cancel(update, ctx):
@@ -618,7 +606,7 @@ async def cb_cancel(update, ctx):
 
 
 # =========================================================================
-# APP BUILD
+# APP BUILD — select scanners by EXACT class type
 # =========================================================================
 
 def build_app(*args, **kwargs):
@@ -628,7 +616,6 @@ def build_app(*args, **kwargs):
     for k in ("token", "telegram_token", "bot_token", "tg_token"):
         if k in kwargs and kwargs[k]:
             token = kwargs[k]
-            logger.info(f"build_app: token from kwarg '{k}'")
             break
     if not token:
         for a in args:
@@ -636,38 +623,27 @@ def build_app(*args, **kwargs):
                 parts = a.split(":", 1)
                 if parts[0].isdigit() and len(parts[1]) >= 30:
                     token = a
-                    logger.info("build_app: token found in positional args")
                     break
     if not token:
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
-        if token:
-            logger.info("build_app: token from env TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("build_app: no token found")
 
     logger.info(f"build_app: received {len(args)} positional + {len(kwargs)} keyword args")
-    for i, a in enumerate(args):
-        atype = type(a).__name__
-        aattrs = [x for x in ["scan_ticker", "ticker_freqs", "place_order", "cancel_order",
-                               "get_order_status", "get_account_numbers", "get_account_hash",
-                               "get_quote", "get_option_chain"] if hasattr(a, x)]
-        logger.info(f"build_app: arg[{i}] type={atype} has={aattrs}")
 
-for a in args:
+    # Select by EXACT class — DcaScanner/CspScanner share the scan_ticker interface
+    # so duck-typing picks the wrong one. itm.ItmScanner is unambiguous.
+    for a in args:
         if isinstance(a, itm.ItmScanner):
             _itm_scanner = a
             logger.info(f"build_app: injected ItmScanner (exact type) tickers={len(a.ticker_freqs)}")
+        # schwab client: has place_order + order-status/cancel, and is NOT a scanner
         if (_schwab_client is None and not isinstance(a, str)
                 and hasattr(a, "place_order")
-                and (hasattr(a, "cancel_order") or hasattr(a, "get_order_status"))):
+                and (hasattr(a, "cancel_order") or hasattr(a, "get_order_status"))
+                and not hasattr(a, "scan_ticker")):
             _schwab_client = a
             logger.info(f"build_app: injected schwab_client type={type(a).__name__}")
-            # Schwab client: has place_order AND (cancel_order OR get_order_status)
-            if (_schwab_client is None and
-                    hasattr(a, "place_order") and
-                    (hasattr(a, "cancel_order") or hasattr(a, "get_order_status"))):
-                _schwab_client = a
-                logger.info(f"build_app: injected schwab_client type={type(a).__name__}")
 
     if _itm_scanner is None:
         logger.warning("build_app: no ItmScanner found — /itm will fail")

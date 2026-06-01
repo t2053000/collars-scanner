@@ -278,26 +278,24 @@ def _run_itm_scan():
     for t in tickers:
         try:
             raw = _itm_scanner.scan_ticker(t)
-            if not raw:
-                continue
-            for item in raw:
-                if isinstance(item, dict):
-                    hits.append(item)
-                elif isinstance(item, (list, tuple)):
-                    for subitem in item:
-                        if isinstance(subitem, dict):
-                            hits.append(subitem)
+            # scan_ticker returns (results_list, debug_counter)
+            if isinstance(raw, tuple):
+                results = raw[0]
+            else:
+                results = raw
+            if results:
+                for item in results:
+                    if isinstance(item, dict) and item.get("ticker"):
+                        hits.append(item)
         except Exception as e:
             errors += 1
             logger.warning(f"_run_itm_scan: scan_ticker({t}) failed: {e}")
 
-    hits.sort(key=lambda h: h.get("locked_apy", 0) if isinstance(h, dict) else 0)
+    hits.sort(key=lambda h: h.get("locked_apy", 0))
     logger.info(f"_run_itm_scan: {len(tickers)} tickers, {len(hits)} hits, {errors} errors")
     if hits:
-        logger.info(f"_run_itm_scan: first hit keys={list(hits[0].keys())}")
         logger.info(f"_run_itm_scan: first hit ticker={hits[0].get('ticker')} strike={hits[0].get('strike')} apy={hits[0].get('locked_apy')}")
     return hits, None
-
 
 def _format_itm_hit(hit, idx, total):
     fmt = getattr(itm, "format_itm_hit", None)

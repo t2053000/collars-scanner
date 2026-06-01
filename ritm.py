@@ -19,7 +19,6 @@ MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
 FALLBACK_STEP_FRAC = 0.15
 MAX_HITS = 50
 
-# Module-level cached schwab client, injected by RitmScanner
 _schwab_client = None
 
 
@@ -54,7 +53,6 @@ def _load_tickers_safely():
 
 
 def _get_client():
-    """Return cached schwab client, or try to construct one as fallback."""
     global _schwab_client
     if _schwab_client is not None:
         return _schwab_client
@@ -85,7 +83,6 @@ def _spread_pct(bid, ask):
 
 
 def _try_get_quote(client, ticker):
-    """Try multiple known method names for getting a quote."""
     for name in ["get_quote", "quote", "get_price", "fetch_quote"]:
         fn = getattr(client, name, None)
         if callable(fn):
@@ -97,7 +94,6 @@ def _try_get_quote(client, ticker):
 
 
 def _try_get_chain(client, ticker):
-    """Try multiple known method names for getting option chain."""
     for name in ["get_option_chain", "option_chain", "chain", "get_chain", "fetch_option_chain"]:
         fn = getattr(client, name, None)
         if callable(fn):
@@ -105,6 +101,18 @@ def _try_get_chain(client, ticker):
                 return fn(ticker)
             except Exception:
                 continue
+    return None
+
+
+def _extract_spot(quote):
+    """quote may be a float (price) or dict (full quote object). Return spot price."""
+    if quote is None:
+        return None
+    if isinstance(quote, (int, float)):
+        return float(quote)
+    if isinstance(quote, dict):
+        return (quote.get("last") or quote.get("mark") or
+                quote.get("lastPrice") or quote.get("price"))
     return None
 
 
@@ -126,14 +134,12 @@ def scan_ritm(tickers=None, schwab_client=None):
             continue
         try:
             quote = _try_get_quote(client, ticker)
-            if not quote:
-                continue
-            spot = quote.get("last") or quote.get("mark") or quote.get("lastPrice")
+            spot = _extract_spot(quote)
             if not spot or spot <= 0:
                 continue
 
             chain = _try_get_chain(client, ticker)
-            if not chain:
+            if not chain or not isinstance(chain, dict):
                 continue
 
             call_map = chain.get("callExpDateMap", {})
@@ -244,15 +250,13 @@ def format_ritm_hit(hit, idx, total):
 
 
 class RitmScanner:
-    """Shim accepting whatever args main.py passes. Caches schwab client globally."""
-
     def __init__(self, schwab_client=None, div_freqs=None, *args, **kwargs):
         global _schwab_client
         self.schwab = schwab_client
         self.div_freqs = div_freqs or {}
         if schwab_client is not None:
             _schwab_client = schwab_client
-            logger.info(f"RitmScanner init: cached schwab client globally for scan_ritm()")
+            logger.info("RitmScanner init: cached schwab client globally for scan_ritm()")
         logger.info(f"RitmScanner init: schwab={'set' if schwab_client else 'none'}, "
                     f"div_freqs_count={len(self.div_freqs) if hasattr(self.div_freqs, '__len__') else 0}")
 

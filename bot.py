@@ -653,15 +653,15 @@ def build_app(*args, **kwargs):
                                "get_quote", "get_option_chain"] if hasattr(a, x)]
         logger.info(f"build_app: arg[{i}] type={atype} has={aattrs}")
 
-    for a in args:
-        if not isinstance(a, str):
-            # ItmScanner: prefer larger ticker_freqs universe
-            if hasattr(a, "scan_ticker") and hasattr(a, "ticker_freqs"):
-                count = len(a.ticker_freqs) if a.ticker_freqs else 0
-                current = len(_itm_scanner.ticker_freqs) if _itm_scanner and _itm_scanner.ticker_freqs else 0
-                if _itm_scanner is None or count > current:
-                    _itm_scanner = a
-                    logger.info(f"build_app: injected ItmScanner tickers={count} type={type(a).__name__}")
+for a in args:
+        if isinstance(a, itm.ItmScanner):
+            _itm_scanner = a
+            logger.info(f"build_app: injected ItmScanner (exact type) tickers={len(a.ticker_freqs)}")
+        if (_schwab_client is None and not isinstance(a, str)
+                and hasattr(a, "place_order")
+                and (hasattr(a, "cancel_order") or hasattr(a, "get_order_status"))):
+            _schwab_client = a
+            logger.info(f"build_app: injected schwab_client type={type(a).__name__}")
             # Schwab client: has place_order AND (cancel_order OR get_order_status)
             if (_schwab_client is None and
                     hasattr(a, "place_order") and

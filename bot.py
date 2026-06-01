@@ -1,7 +1,5 @@
 """
 bot.py — Telegram handlers and trade flow.
-Defensive imports + flexible build_app signature.
-ItmScanner injected from main.py via build_app args.
 """
 
 import asyncio
@@ -15,7 +13,6 @@ from telegram.ext import (
     ContextTypes, filters,
 )
 
-from schwab_client import SchwabClient
 import scanner
 import spreads as spreads_mod
 import deepcall
@@ -28,8 +25,9 @@ import orders
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 
-# Injected scanner instances — populated in build_app from main.py args
+# Injected from main.py via build_app
 _itm_scanner = None
+_schwab_client = None  # used for order placement
 
 
 # ---------- Defensive github_store wrapper ----------
@@ -60,16 +58,14 @@ def _gs_try(names, *args, default=None):
 def _load_tickers():
     return _gs_try(
         ["load_tickers", "read_tickers", "get_tickers", "list_tickers", "load_file", "read_file"],
-        "tickers.txt",
-        default=[]
+        "tickers.txt", default=[]
     ) or []
 
 
 def _load_whitelist():
     res = _gs_try(
         ["load_whitelist", "read_whitelist", "get_whitelist", "load_file", "read_file"],
-        "whitelist.txt",
-        default=None
+        "whitelist.txt", default=None
     )
     if res:
         return res
@@ -78,10 +74,7 @@ def _load_whitelist():
 
 
 def _save_tickers(tickers):
-    return _gs_try(
-        ["save_tickers", "write_tickers", "write_file", "save_file"],
-        "tickers.txt", tickers,
-    )
+    return _gs_try(["save_tickers", "write_tickers", "write_file", "save_file"], "tickers.txt", tickers)
 
 
 def _add_ticker_helper(t):
@@ -109,6 +102,20 @@ def _remove_ticker_helper(t):
     tickers = [x for x in tickers if x != t]
     _save_tickers(tickers)
     return tickers
+
+
+def _get_schwab():
+    """Return injected schwab client, falling back to SchwabClient() construction."""
+    if _schwab_client is not None:
+        return _schwab_client
+    try:
+        from schwab_client import SchwabClient
+        c = SchwabClient()
+        if c is not None:
+            return c
+    except Exception as e:
+        logger.warning(f"_get_schwab: SchwabClient() fallback failed: {e}")
+    return None
 
 
 WHITELIST = _load_whitelist()
@@ -159,10 +166,7 @@ async def cmd_whoami(update, ctx):
 
 async def cmd_list(update, ctx):
     tickers = _load_tickers()
-    if tickers:
-        await update.message.reply_text("Tickers: " + ", ".join(tickers))
-    else:
-        await update.message.reply_text("(no tickers loaded)")
+    await update.message.reply_text("Tickers: " + ", ".join(tickers) if tickers else "(none loaded)")
 
 
 async def cmd_add(update, ctx):
@@ -236,7 +240,7 @@ async def cmd_deepcall(update, ctx):
     if not _is_whitelisted(update.effective_user.id):
         return
     n = int(ctx.args[0]) if ctx.args else 5
-    await update.message.reply_text(f"Running deepcall scan (top {n})…")
+    await update.message.reply_text(f"Running deepcall (top {n})…")
     msg = _run_scanner_module(deepcall, ["run_deepcall", "scan", "run", "main"], n)
     await update.message.reply_text(str(msg)[:4000])
 
@@ -258,15 +262,13 @@ async def cmd_csp(update, ctx):
 
 
 # =========================================================================
-# /itm WITH TRADE BUTTONS — uses injected ItmScanner from main.py
+# /itm WITH TRADE BUTTONS
 # =========================================================================
 
 def _run_itm_scan():
-    """Run full ITM scan using injected ItmScanner instance."""
     global _itm_scanner
     if _itm_scanner is None:
-        logger.error("_run_itm_scan: _itm_scanner is None — not injected yet")
-        return None, "❌ /itm scanner not initialized. Try restarting the bot."
+        return None, "❌ /itm scanner not initialized."
 
     tickers = list(_itm_scanner.ticker_freqs.keys()) if _itm_scanner.ticker_freqs else _load_tickers()
     if not tickers:
@@ -276,50 +278,41 @@ def _run_itm_scan():
     errors = 0
     for t in tickers:
         try:
-            results = _itm_scanner.scan_ticker(t)
-            if results:
-                hits.extend(results)
+            raw = _itm_scanner.scan_ticker(t)
+            if not raw:
+                continue
+            # scan_ticker may return list-of-dicts OR list-of-lists — flatten safely
+            for item in raw:
+                if isinstance(item, dict):
+                    hits.append(item)
+                elif isinstance(item, (list, tuple)):
+                    for subitem in item:
+                        if isinstance(subitem, dict):
+                            hits.append(subitem)
         except Exception as e:
             errors += 1
             logger.warning(f"_run_itm_scan: scan_ticker({t}) failed: {e}")
 
-    hits.sort(key=lambda h: h.get("locked_apy", 0))
+    hits.sort(key=lambda h: h.get("locked_apy", 0) if isinstance(h, dict) else 0)
     logger.info(f"_run_itm_scan: {len(tickers)} tickers, {len(hits)} hits, {errors} errors")
     return hits, None
 
 
 def _format_itm_hit(hit, idx, total):
-    """Format an ItmScanner hit dict for Telegram display."""
-    ticker = hit.get("ticker", "?")
-    spot = hit.get("spot", 0)
-    strike = hit.get("strike", 0)
-    exp_date = hit.get("exp_date", "")
-    dte = hit.get("dte", 0)
-    call_credit = hit.get("call_credit", 0)
-    put_cost = hit.get("put_cost", 0)
-    locked_total = hit.get("locked_total", 0)
-    locked_apy = hit.get("locked_apy", 0)
-    fallback_apy = hit.get("fallback_apy", 0)
-    primary_debit = hit.get("primary_debit", 0)
-    fallback_debit = hit.get("fallback_debit", 0)
-    call_oi = hit.get("call_oi", 0)
-    put_oi = hit.get("put_oi", 0)
-
-    # Try itm.format_itm_hit first in case it exists
     fmt = getattr(itm, "format_itm_hit", None)
     if callable(fmt):
         try:
             return fmt(hit, idx, total)
         except Exception:
             pass
-
     return (
-        f"*{idx}/{total}  {ticker}*  spot ${spot}\n"
-        f"  strike ${strike:g}  exp {exp_date} ({dte}d)\n"
-        f"  call credit ${call_credit}  put cost ${put_cost}\n"
-        f"  primary debit ${primary_debit}  ·  fallback ${fallback_debit} @ {fallback_apy:.1f}% APY\n"
-        f"  *locked ${locked_total:.2f}* @ *{locked_apy:.1f}% APY*\n"
-        f"  OI call {call_oi} / put {put_oi}"
+        f"*{idx}/{total}  {hit.get('ticker')}*  spot ${hit.get('spot')}\n"
+        f"  strike ${hit.get('strike'):g}  exp {hit.get('exp_date')} ({hit.get('dte')}d)\n"
+        f"  call credit ${hit.get('call_credit', 0)}  put cost ${hit.get('put_cost', 0)}\n"
+        f"  primary debit ${hit.get('primary_debit', 0)}  "
+        f"fallback ${hit.get('fallback_debit', 0)} @ {hit.get('fallback_apy', 0):.1f}%\n"
+        f"  *locked ${hit.get('locked_total', 0):.2f}* @ *{hit.get('locked_apy', 0):.1f}% APY*\n"
+        f"  OI call {hit.get('call_oi', 0)} / put {hit.get('put_oi', 0)}"
     )
 
 
@@ -375,18 +368,9 @@ async def cb_trade(update, ctx):
     hit, walk_step, _ = user_pending[trade_id]
     logger.info(f"cb_trade: ticker={hit.get('ticker')} walk_step={walk_step}")
 
-    # Build pricing from hit fields — ItmScanner uses call_credit/put_cost not call_bid/ask
-    # Ensure orders.compute_legs_pricing can find bid/ask fields
-    hit_for_pricing = dict(hit)
-    if "call_bid" not in hit_for_pricing or hit_for_pricing.get("call_bid") is None:
-        hit_for_pricing["call_bid"] = hit.get("call_bid", 0)
-        hit_for_pricing["call_ask"] = hit.get("call_ask", 0)
-        hit_for_pricing["put_bid"] = hit.get("put_bid", 0)
-        hit_for_pricing["put_ask"] = hit.get("put_ask", 0)
-
     try:
-        pricing = orders.compute_legs_pricing(hit_for_pricing, walk_step=walk_step)
-        next_pricing = orders.compute_legs_pricing(hit_for_pricing, walk_step=walk_step + 1)
+        pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
+        next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
         logger.info(f"cb_trade: pricing computed apy={pricing['apy']}")
     except Exception as e:
         logger.error(f"cb_trade: pricing failed: {e}", exc_info=True)
@@ -394,14 +378,14 @@ async def cb_trade(update, ctx):
         return
 
     user_pending[trade_id] = (hit, walk_step, time.time() + TRADE_CONFIRM_TIMEOUT)
-    preview = orders.format_order_preview(hit_for_pricing, pricing, next_pricing)
+    preview = orders.format_order_preview(hit, pricing, next_pricing)
     logger.info(f"cb_trade: preview built {len(preview)} chars")
     await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
-    logger.info(f"cb_trade: preview sent")
+    logger.info("cb_trade: preview sent")
 
 
 # =========================================================================
-# /ritm WITH PARKED TRADE BUTTONS — VERBOSE LOGGING
+# /ritm WITH PARKED TRADE BUTTONS
 # =========================================================================
 
 async def cmd_ritm(update, ctx):
@@ -494,7 +478,7 @@ async def cb_rtrade(update, ctx):
         sent = await ctx.bot.send_message(uid, preview, parse_mode="Markdown")
         logger.info(f"cb_rtrade: preview sent (markdown) message_id={sent.message_id}")
     except Exception as e:
-        logger.warning(f"cb_rtrade: markdown failed: {e} — retrying plain text")
+        logger.warning(f"cb_rtrade: markdown failed: {e} — retrying plain")
         try:
             sent = await ctx.bot.send_message(uid, preview)
             logger.info(f"cb_rtrade: preview sent (plain) message_id={sent.message_id}")
@@ -507,7 +491,7 @@ async def cb_rtrade(update, ctx):
 
 
 # =========================================================================
-# YES HANDLER (both /itm and /ritm)
+# YES HANDLER
 # =========================================================================
 
 async def handle_yes_reply(update, ctx):
@@ -548,19 +532,18 @@ async def handle_yes_reply(update, ctx):
 async def _submit_itm(update, ctx, hit, walk_step):
     await update.message.reply_text("📤 Submitting /itm order…")
     try:
-        hit_for_pricing = dict(hit)
-        pricing = orders.compute_legs_pricing(hit_for_pricing, walk_step=walk_step)
-        payload = orders.build_itm_conversion_order(hit_for_pricing, pricing)
-        client = SchwabClient()
+        pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
+        payload = orders.build_itm_conversion_order(hit, pricing)
+        client = _get_schwab()
+        if client is None:
+            raise RuntimeError("No Schwab client available — check token")
         order_id = client.place_order(payload)
         net_debit = pricing["stock_price"] - pricing["call_limit"] + pricing["put_limit"]
         logger.info(f"_submit_itm: order placed id={order_id} ticker={hit['ticker']} net_debit={net_debit:.2f}")
         await update.message.reply_text(
-            f"✅ Order #{order_id}\n"
-            f"{hit['ticker']} ITM @ NET_DEBIT ${net_debit:.2f}\n"
-            f"Monitoring 30s…"
+            f"✅ Order #{order_id}\n{hit['ticker']} ITM @ NET_DEBIT ${net_debit:.2f}\nMonitoring 30s…"
         )
-        await _monitor_order(update, ctx, order_id, hit_for_pricing, pricing)
+        await _monitor_order(update, ctx, order_id, hit, pricing)
     except Exception as e:
         logger.error(f"_submit_itm failed: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Order failed: {e}")
@@ -571,7 +554,9 @@ async def _submit_ritm_parked(update, ctx, hit):
     try:
         pricing = orders.compute_ritm_pricing(hit)
         payload = orders.build_ritm_conversion_order(hit, pricing)
-        client = SchwabClient()
+        client = _get_schwab()
+        if client is None:
+            raise RuntimeError("No Schwab client available — check token")
         order_id = client.place_order(payload)
         logger.info(f"_submit_ritm_parked: order placed id={order_id} ticker={hit['ticker']}")
         await update.message.reply_text(
@@ -588,7 +573,7 @@ async def _submit_ritm_parked(update, ctx, hit):
 
 
 async def _monitor_order(update, ctx, order_id, hit, pricing):
-    client = SchwabClient()
+    client = _get_schwab()
     elapsed = 0
     while elapsed < MONITOR_TIMEOUT_SEC:
         await asyncio.sleep(MONITOR_POLL_SEC)
@@ -621,10 +606,8 @@ async def _monitor_order(update, ctx, order_id, hit, pricing):
 async def cb_improve(update, ctx):
     q = update.callback_query
     await q.answer()
-    await ctx.bot.send_message(
-        q.from_user.id,
-        "🔧 Improve flow: cancel manually on Schwab and re-run /itm."
-    )
+    await ctx.bot.send_message(q.from_user.id,
+        "🔧 Improve: cancel manually on Schwab and re-run /itm.")
 
 
 async def cb_cancel(update, ctx):
@@ -632,7 +615,7 @@ async def cb_cancel(update, ctx):
     await q.answer()
     order_id = q.data.split(":", 1)[1]
     try:
-        client = SchwabClient()
+        client = _get_schwab()
         client.cancel_order(order_id)
         await ctx.bot.send_message(q.from_user.id, f"❌ Cancel sent #{order_id}")
     except Exception as e:
@@ -640,11 +623,11 @@ async def cb_cancel(update, ctx):
 
 
 # =========================================================================
-# APP BUILD — flexible signature, injects ItmScanner from main.py args
+# APP BUILD
 # =========================================================================
 
 def build_app(*args, **kwargs):
-    global _itm_scanner
+    global _itm_scanner, _schwab_client
 
     token = None
     for k in ("token", "telegram_token", "bot_token", "tg_token"):
@@ -664,22 +647,22 @@ def build_app(*args, **kwargs):
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         if token:
             logger.info("build_app: token from env TELEGRAM_BOT_TOKEN")
-
     if not token:
-        raise ValueError(
-            f"build_app: no Telegram token found in args ({len(args)}) "
-            f"or kwargs ({list(kwargs.keys())}) or env TELEGRAM_BOT_TOKEN"
-        )
+        raise ValueError(f"build_app: no token found in args/kwargs/env")
 
-    # Inject ItmScanner instance from main.py args
+    # Inject ItmScanner and schwab client from main.py args
     for a in args:
-        if hasattr(a, "scan_ticker") and hasattr(a, "ticker_freqs"):
+        if _itm_scanner is None and hasattr(a, "scan_ticker") and hasattr(a, "ticker_freqs"):
             _itm_scanner = a
             logger.info(f"build_app: injected ItmScanner, tickers={len(a.ticker_freqs)}")
-            break
+        if _schwab_client is None and hasattr(a, "get_account_numbers") and not isinstance(a, str):
+            _schwab_client = a
+            logger.info(f"build_app: injected schwab_client={type(a).__name__}")
 
     if _itm_scanner is None:
         logger.warning("build_app: no ItmScanner found in args — /itm will fail")
+    if _schwab_client is None:
+        logger.warning("build_app: no schwab_client found in args — order placement will fall back to SchwabClient()")
 
     logger.info(f"build_app: received {len(args)} positional + {len(kwargs)} keyword args")
 

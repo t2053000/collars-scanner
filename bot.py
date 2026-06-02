@@ -349,13 +349,18 @@ async def _send_rtrade_button(update, context, hit):
     if hit.get("borrow_cost", 0) > 0:
         borrow_str = f" · borrow −${hit['borrow_cost']:.2f}"
 
+    fallback_line = (
+        f"🔄 Fallback → {hit['fallback_apy']:.1f}% APY\n"
+        if hit.get("fallback_apy", 0) > 0
+        else ""
+    )
     summary = (
         f"🔄 *{hit['ticker']}* @ ${hit['spot']} · "
         f"{hit['exp_date']} ({hit['dte']}d){htb_flag}\n"
         f"Strike ${hit['strike']:g} · "
         f"Net credit ${hit['net_credit']:.2f}/sh{ex_div_str}{borrow_str}\n"
         f"💰 Locked ${hit['locked_total']:.0f} → *{hit['locked_apy']:.1f}% APY*\n"
-        f"🔄 Fallback ${hit['fallback_debit']:.2f}/sh → {hit['fallback_apy']:.1f}% APY\n"
+        f"{fallback_line}"
         f"OI {hit['call_oi']}/{hit['put_oi']}"
         f"{ex_div_warn}\n"
         f"⚠️ Short stock manually on Schwab"

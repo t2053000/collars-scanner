@@ -302,7 +302,7 @@ async def _send_trade_button(update, context, hit):
         f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
         f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh\n"
         f"💳 Pay ${hit['primary_debit']:.2f}/sh → *{hit['locked_apy']:.1f}% APY*\n"
-        f"🔄 Fallback ${hit['fallback_debit']:.2f}/sh → {hit['fallback_apy']:.1f}% APY\n"
+        f"🔄 Fallback APY: {hit['fallback_apy']:.1f}%\n" if hit.get('fallback_apy', 0) > 0 else ""
         f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit['locked_total']:.0f}"
     )
     keyboard = InlineKeyboardMarkup([[

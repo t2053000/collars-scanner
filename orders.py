@@ -4,7 +4,7 @@ Order construction + price walking for the trade-from-Telegram flow.
 
 ITM conversion:         BUY stock + SELL call + BUY put  (strike below spot) — NET_DEBIT
 Reverse ITM (options):  SELL put  + BUY call             (strike above spot) — NET_CREDIT
-                        Stock leg is shorted manually by user on Schwab.
+DCA collar:             BUY stock + SELL call + BUY put  (same-strike, dividend capture) — NET_DEBIT
 """
 
 import logging
@@ -29,8 +29,9 @@ def build_option_symbol(ticker: str, exp_date: str, strike: float, opt_type: str
 
 def compute_legs_pricing(hit: dict, walk_step: int = 0):
     """
-    Walk pricing for ITM conversion (3-leg).
+    Walk pricing for ITM conversion or DCA collar (3-leg).
     walk_step=0 starts at mid +/- 15%; each step adds 10% toward unfavorable side.
+    Works with both ITM hits (has call_bid/ask) and DCA hits (uses stored call_credit/put_cost).
     """
     call_bid = hit.get("call_bid")
     call_ask = hit.get("call_ask")
@@ -38,8 +39,9 @@ def compute_legs_pricing(hit: dict, walk_step: int = 0):
     put_ask = hit.get("put_ask")
 
     if None in (call_bid, call_ask, put_bid, put_ask):
-        call_credit = hit["call_credit"]
-        put_cost = hit["put_cost"]
+        # DCA hits don't store raw bid/ask — use stored mid-adjusted prices
+        call_credit = hit.get("call_credit", 0.01)
+        put_cost = hit.get("put_cost", 0.01)
         credit_shrink = 0.02 * walk_step
         call_credit = max(0.01, call_credit - credit_shrink / 2)
         put_cost = put_cost + credit_shrink / 2
@@ -100,9 +102,8 @@ def compute_reverse_pricing(hit: dict, walk_step: int = 0):
     put_ask = hit.get("put_ask")
 
     if None in (call_bid, call_ask, put_bid, put_ask):
-        # fallback to stored mids
-        put_credit = hit.get("put_cost", 0.01)   # put_cost stores put mid in reverse hits
-        call_cost = hit.get("call_credit", 0.01)  # call_credit stores call mid in reverse hits
+        put_credit = hit.get("put_cost", 0.01)
+        call_cost = hit.get("call_credit", 0.01)
         shrink = 0.02 * walk_step
         put_credit = max(0.01, put_credit - shrink / 2)
         call_cost = call_cost + shrink / 2
@@ -112,11 +113,9 @@ def compute_reverse_pricing(hit: dict, walk_step: int = 0):
         call_mid = (call_bid + call_ask) / 2.0
         call_spread = call_ask - call_bid
 
-        # SELL put: start mid-15%, walk toward bid
         sell_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         put_credit = put_mid - sell_offset * put_spread
 
-        # BUY call: start mid+15%, walk toward ask
         buy_offset = min(INITIAL_MID_FRAC + (IMPROVE_STEP_FRAC * walk_step), 0.5)
         call_cost = call_mid + buy_offset * call_spread
 
@@ -127,7 +126,7 @@ def compute_reverse_pricing(hit: dict, walk_step: int = 0):
     spot = hit["spot"]
     strike = hit["strike"]
     dte = hit["dte"]
-    gap = strike - spot  # positive: strike above spot
+    gap = strike - spot
 
     locked_per_share = net_credit - gap
     commission_per_share = COMMISSION_PER_CONTRACT / 100.0
@@ -159,6 +158,7 @@ def can_improve(pricing_next: dict) -> bool:
 def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
     """
     3-leg NET_DEBIT: BUY 100 stock + SELL call + BUY put. Strike must be < spot.
+    Used for both ITM and DCA trades.
     """
     ticker = hit["ticker"].upper()
     exp_date = hit["exp_date"]
@@ -229,7 +229,7 @@ def build_itm_conversion_order(hit: dict, pricing: dict) -> dict:
 def build_reverse_itm_order(hit: dict, pricing: dict) -> dict:
     """
     2-leg NET_CREDIT: SELL put + BUY call. Strike must be > spot.
-    User shorts stock manually. No equity leg submitted here.
+    User shorts stock manually.
     """
     ticker = hit["ticker"].upper()
     exp_date = hit["exp_date"]
@@ -306,6 +306,50 @@ def format_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) ->
         f"💳 *NET DEBIT: ${net_debit:.2f}/sh (= ${net_debit*100:.0f} total)*",
         f"📊 Locked profit after $1.30 comm: *${pricing['locked_total']:.2f}*",
         f"📈 APY: *{pricing['apy']:.1f}%*",
+        f"",
+    ]
+    if next_pricing and can_improve(next_pricing):
+        lines.append(f"_If unfilled in 30s: improve → {next_pricing['apy']:.1f}% APY_")
+    lines.append(f"Reply `YES {ticker}` within 60s to submit.")
+    return "\n".join(lines)
+
+
+def format_dca_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) -> str:
+    """
+    DCA-specific confirmation preview. Shows dividend context alongside
+    the standard locked profit so user can make an informed decision.
+    """
+    ticker = hit["ticker"]
+    walk = pricing["walk_step"]
+    walk_label = "initial" if walk == 0 else f"retry #{walk}"
+
+    spot = pricing["stock_price"]
+    strike = hit["strike"]
+    net_debit = spot - pricing["call_limit"] + pricing["put_limit"]
+
+    # Dividend context from the hit
+    score_dollars = hit.get("score_dollars", 0)
+    score_apy = hit.get("score_apy", 0)
+    expected_div = hit.get("expected_div_dollars", 0)
+    annual_div = hit.get("annual_div", 0)
+    freq = hit.get("freq", "?")
+    num_ex_divs = hit.get("expected_ex_divs_collected", 0)
+    safety_dollars = hit.get("safety_dollars", 0)
+    safety_sign = "+" if safety_dollars >= 0 else ""
+
+    lines = [
+        f"⚠️ *CONFIRM DCA COLLAR ({walk_label})*",
+        f"*{ticker}* @ ${spot}  ·  strike ${strike:g}  ·  exp {hit['exp_date']} ({hit['dte']}d)",
+        f"",
+        f"📦 3 legs (atomic combo):",
+        f"  · BUY 100 shares @ ~${spot:.2f}",
+        f"  · SELL 1 C ${strike:g} @ limit ${pricing['call_limit']:.2f}",
+        f"  · BUY  1 P ${strike:g} @ limit ${pricing['put_limit']:.2f}",
+        f"",
+        f"💳 *NET DEBIT: ${net_debit:.2f}/sh (= ${net_debit*100:.0f} total)*",
+        f"🛡️ Safety (options only): *{safety_sign}${safety_dollars:.2f}/sh*",
+        f"💸 Div: ${annual_div}/yr · {num_ex_divs} ex-div(s) → +${expected_div:.2f}/sh expected",
+        f"🎯 *Score (with div): ${score_dollars:.2f}/sh · {score_apy:.1f}% APY*",
         f"",
     ]
     if next_pricing and can_improve(next_pricing):

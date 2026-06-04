@@ -1,6 +1,6 @@
 """
 bot.py
-Telegram bot — scanners + ITM trade execution with improve/cancel flow.
+Telegram bot — scanners + ITM/DCA trade execution with improve/cancel flow.
 Heavy logging on trade flow for debugging.
 """
 
@@ -134,11 +134,11 @@ async def cmd_help(update, context):
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm`\n"
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
-        "*Trading:* `/itm` hits have Trade buttons. Reply `YES TICKER` to confirm.\n"
-        "*Reverse scan:* `/itm r` — strikes above spot, put>call. "
-        "Tap R Trade button, reply `R TICKER` to submit 2-leg options order. "
-        "Short stock manually on Schwab.\n"
-        "_Borrow cost (20% APR) already deducted from /itm r APY._",
+        "*Trading:*\n"
+        "· `/itm` and `/dca` hits have Trade buttons → reply `YES TICKER`\n"
+        "· `/itm r` reverse scan → tap R Trade button → reply `R TICKER`\n"
+        "· Short stock manually on Schwab for /itm r\n"
+        "_Borrow cost (20% APR) deducted from /itm r APY._",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -268,48 +268,79 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
         await _send_robust(update.message.reply_text, extra)
 
     if hits_with_buttons and all_hits:
-        all_hits.sort(key=lambda r: r["locked_apy"])
-        top_hits = all_hits[-MAX_TRADE_BUTTONS:]
-        is_reverse = scanner_key == "itm_r"
-        logger.info(f"_run_scan: sending {len(top_hits)} trade buttons (reverse={is_reverse})")
-        for hit in top_hits:
-            try:
-                if is_reverse:
+        if scanner_key == "itm":
+            all_hits.sort(key=lambda r: r.get("locked_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
+                    await _send_trade_button(update, context, hit, trade_type="itm")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"trade button send failed for {hit.get('ticker')}: {e}")
+
+        elif scanner_key == "itm_r":
+            all_hits.sort(key=lambda r: r.get("locked_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
                     await _send_rtrade_button(update, context, hit)
-                else:
-                    await _send_trade_button(update, context, hit)
-                await asyncio.sleep(0.5)
-            except Exception as e:
-                logger.warning(f"trade button send failed for {hit.get('ticker')}: {e}")
-                continue
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"rtrade button send failed for {hit.get('ticker')}: {e}")
+
+        elif scanner_key == "dca":
+            all_hits.sort(key=lambda r: r.get("score_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
+                    await _send_trade_button(update, context, hit, trade_type="dca")
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"dca button send failed for {hit.get('ticker')}: {e}")
 
 
-async def _send_trade_button(update, context, hit):
-    """Standard ITM conversion trade button — reply YES TICKER to confirm."""
+async def _send_trade_button(update, context, hit, trade_type="itm"):
+    """
+    ITM or DCA trade button — reply YES TICKER to confirm.
+    trade_type: "itm" or "dca"
+    """
     trade_id = uuid.uuid4().hex[:8]
     user_id = update.effective_user.id
+
+    apy = hit.get("score_apy", 0) if trade_type == "dca" else hit.get("locked_apy", 0)
     logger.info(f"_send_trade_button: user={user_id} trade_id={trade_id} "
-                f"ticker={hit.get('ticker')} apy={hit.get('locked_apy')}")
+                f"ticker={hit.get('ticker')} apy={apy} type={trade_type}")
 
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit": hit,
         "walk_step": 0,
         "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
         "reverse": False,
+        "trade_type": trade_type,
     }
 
-    summary = (
-        f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
-        f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh\n"
-        f"💳 Pay ${hit['primary_debit']:.2f}/sh → *{hit['locked_apy']:.1f}% APY*\n"
-        f"🔄 Fallback APY: {hit['fallback_apy']:.1f}%\n" if hit.get('fallback_apy', 0) > 0 else ""
-        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit['locked_total']:.0f}"
-    )
+    if trade_type == "dca":
+        score_sign = "+" if hit.get("score_dollars", 0) >= 0 else ""
+        summary = (
+            f"💰 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+            f"Strike ${hit['strike']:g} · Net premium ${hit.get('net_premium', 0):.2f}/sh\n"
+            f"🛡️ Safety ${hit.get('safety_dollars', 0):.2f}/sh · "
+            f"💸 Div +${hit.get('expected_div_dollars', 0):.2f}/sh\n"
+            f"🎯 Score: *{score_sign}${hit.get('score_dollars', 0):.2f}/sh · {apy:.1f}% APY*\n"
+            f"OI {hit['call_oi']}/{hit['put_oi']}"
+        )
+        button_label = f"💰 DCA Trade @ {apy:.1f}% APY"
+    else:
+        summary = (
+            f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+            f"Strike ${hit['strike']:g} · Net credit ${hit.get('net_credit', 0):.2f}/sh\n"
+            f"💳 Pay ${hit.get('primary_debit', 0):.2f}/sh → *{apy:.1f}% APY*\n"
+            f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit.get('locked_total', 0):.0f}"
+        )
+        button_label = f"💼 Trade @ {apy:.1f}% APY"
+
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"💼 Trade @ {hit['locked_apy']:.1f}% APY",
-            callback_data=f"trade:{trade_id}",
-        ),
+        InlineKeyboardButton(button_label, callback_data=f"trade:{trade_id}"),
     ]])
     try:
         await update.message.reply_text(
@@ -336,12 +367,13 @@ async def _send_rtrade_button(update, context, hit):
         "walk_step": 0,
         "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
         "reverse": True,
+        "trade_type": "itm_r",
     }
 
     htb_flag = " ⚠️HTB?" if hit.get("htb") else ""
     ex_div_warn = ""
     if hit.get("ex_div_in_window"):
-        ex_div_warn = f"\n🚨 EX-DIV {hit.get('next_ex_div_date','')} BEFORE EXPIRY"
+        ex_div_warn = f"\n🚨 EX-DIV {hit.get('next_ex_div_date', '')} BEFORE EXPIRY"
     ex_div_str = ""
     if hit.get("next_ex_div_date") and not hit.get("ex_div_in_window"):
         ex_div_str = f" · ex-div {hit['next_ex_div_date']}"
@@ -442,7 +474,8 @@ async def cmd_dca(update, context):
     scanner.ticker_freqs = div_tickers
     tickers = sorted(div_tickers.keys())
     await _run_scan(update, context, scanner, "💰", DcaScanner.format_summary,
-                    tickers_override=tickers)
+                    tickers_override=tickers,
+                    hits_with_buttons=True, scanner_key="dca")
 
 
 @authorized_only
@@ -524,14 +557,16 @@ async def cb_trade(update, context):
                 f"found={pending is not None}, total pending={len(_PENDING_TRADES)}")
     if not pending:
         await query.message.reply_text(
-            f"⏱ Trade expired (no entry for {trade_id}). Re-run /itm."
+            f"⏱ Trade expired (no entry for {trade_id}). Re-run scan."
         )
         return
 
     hit = pending["hit"]
     walk_step = pending["walk_step"]
     is_reverse = pending.get("reverse", False)
-    logger.info(f"cb_trade: ticker={hit.get('ticker')} walk_step={walk_step} reverse={is_reverse}")
+    trade_type = pending.get("trade_type", "itm")
+    logger.info(f"cb_trade: ticker={hit.get('ticker')} walk_step={walk_step} "
+                f"reverse={is_reverse} type={trade_type}")
 
     try:
         if is_reverse:
@@ -554,6 +589,8 @@ async def cb_trade(update, context):
     try:
         if is_reverse:
             preview = orders.format_reverse_order_preview(hit, pricing, next_pricing)
+        elif trade_type == "dca":
+            preview = orders.format_dca_order_preview(hit, pricing, next_pricing)
         else:
             preview = orders.format_order_preview(hit, pricing, next_pricing)
         logger.info(f"cb_trade: preview built, {len(preview)} chars")
@@ -580,7 +617,11 @@ async def cb_trade(update, context):
 
 
 async def handle_yes_reply(update, context):
-    """Handles YES TICKER (ITM) and R TICKER (reverse ITM) confirmations."""
+    """
+    Handles:
+      YES TICKER  → ITM or DCA trade (3-leg, NET_DEBIT)
+      R TICKER    → Reverse ITM trade (2-leg, NET_CREDIT)
+    """
     user = update.effective_user
     if not user or not github_store.is_authorized(user.id):
         return
@@ -637,7 +678,8 @@ async def handle_yes_reply(update, context):
     uid, tid, pending = matching
     hit = pending["hit"]
     pricing = pending["pricing"]
-    logger.info(f"handle_yes_reply: matched pending {tid} reverse={is_reverse}")
+    trade_type = pending.get("trade_type", "itm")
+    logger.info(f"handle_yes_reply: matched pending {tid} type={trade_type}")
 
     schwab = context.application.bot_data["schwab_client"]
 
@@ -645,15 +687,21 @@ async def handle_yes_reply(update, context):
         if is_reverse:
             order_payload = orders.build_reverse_itm_order(hit, pricing)
         else:
+            # Both ITM and DCA use the same 3-leg NET_DEBIT order structure
             order_payload = orders.build_itm_conversion_order(hit, pricing)
-        logger.info(f"handle_yes_reply: order payload built")
+        logger.info(f"handle_yes_reply: order payload built type={trade_type}")
     except Exception as e:
         logger.exception("order build failed")
         await update.message.reply_text(f"❌ Order build failed: {type(e).__name__}: {e}")
         return
 
-    action_str = (f"{ticker} reverse ITM (options only)"
-                  if is_reverse else f"{ticker} ITM conversion")
+    if trade_type == "dca":
+        action_str = f"{ticker} DCA collar"
+    elif is_reverse:
+        action_str = f"{ticker} reverse ITM (options only)"
+    else:
+        action_str = f"{ticker} ITM conversion"
+
     status_msg = await update.message.reply_text(
         f"📤 Submitting {action_str} at {pricing['apy']:.1f}% APY…"
     )
@@ -679,18 +727,20 @@ async def handle_yes_reply(update, context):
         )
         return
 
+    # ITM and DCA: monitor for fill
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id,
         "hit": hit,
         "pricing": pricing,
         "walk_step": pending["walk_step"],
+        "trade_type": trade_type,
         "chat_id": status_msg.chat_id,
         "message_id": status_msg.message_id,
     }
 
     await _edit_robust(
         status_msg,
-        f"📤 Order *{order_id}* submitted for {ticker}\n"
+        f"📤 Order *{order_id}* submitted for {ticker} ({trade_type.upper()})\n"
         f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
         f"APY if filled: *{pricing['apy']:.1f}%*\n"
         f"⏳ Monitoring for fill (30s)…"
@@ -822,6 +872,7 @@ async def cb_improve(update, context):
         "hit": hit,
         "pricing": new_pricing,
         "walk_step": new_walk,
+        "trade_type": active.get("trade_type", "itm"),
         "chat_id": status_msg.chat_id,
         "message_id": status_msg.message_id,
     }

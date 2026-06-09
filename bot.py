@@ -960,16 +960,19 @@ def build_app(telegram_token,
               csp_scanner,
               itm_scanner,
               ritm_scanner,
-              schwab_client):
+              schwab_clients: dict,      # {user_id: SchwabClient}
+              primary_user_id: int):     # fallback user
     app = Application.builder().token(telegram_token).build()
-    app.bot_data["collar_scanner"]   = collar_scanner
-    app.bot_data["spread_scanner"]   = spread_scanner
-    app.bot_data["deepcall_scanner"] = deepcall_scanner
-    app.bot_data["dca_scanner"]      = dca_scanner
-    app.bot_data["csp_scanner"]      = csp_scanner
-    app.bot_data["itm_scanner"]      = itm_scanner
-    app.bot_data["ritm_scanner"]     = ritm_scanner
-    app.bot_data["schwab_client"]    = schwab_client
+    app.bot_data["collar_scanner"]    = collar_scanner
+    app.bot_data["spread_scanner"]    = spread_scanner
+    app.bot_data["deepcall_scanner"]  = deepcall_scanner
+    app.bot_data["dca_scanner"]       = dca_scanner
+    app.bot_data["csp_scanner"]       = csp_scanner
+    app.bot_data["itm_scanner"]       = itm_scanner
+    app.bot_data["ritm_scanner"]      = ritm_scanner
+    app.bot_data["schwab_clients"]    = schwab_clients
+    app.bot_data["primary_user_id"]   = primary_user_id
+
 
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))

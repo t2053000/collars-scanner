@@ -128,7 +128,7 @@ def compute_reverse_pricing(hit: dict, walk_step: int = 0):
     dte = hit["dte"]
     gap = strike - spot
 
-        borrow_cost = hit.get("borrow_cost", 0.0)
+    borrow_cost = hit.get("borrow_cost", 0.0)
 
     locked_per_share = net_credit - gap
     commission_per_share = COMMISSION_PER_CONTRACT / 100.0

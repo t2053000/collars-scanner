@@ -426,10 +426,18 @@ class ItmScanner:
                 commission_per_share = COMMISSION_PER_CONTRACT / 100.0
 
                 # Locked = options net credit - gap to close - commission - borrow
-                locked_p = net_credit_p - gap - commission_per_share - borrow_cost
+                                # Deduct dividend payment if ex-div falls before expiry
+                # (short stock = you PAY the dividend)
+                div_cost = 0.0
+                if in_window and annual_div > 0:
+                    cycles = {"M": 12, "Q": 4, "S": 2, "A": 1, "W": 52}.get(freq, 4)
+                    div_cost = annual_div / cycles
+
+                locked_p = net_credit_p - gap - commission_per_share - borrow_cost - div_cost
                 if locked_p < min_locked:
                     debug["below_min_locked_after_comm"] += 1
                     continue
+
 
                 apy_p = (locked_p / spot) * (365.0 / dte) * 100.0 \
                     if spot > 0 and dte > 0 else 0.0

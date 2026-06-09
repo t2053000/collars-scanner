@@ -700,7 +700,7 @@ async def handle_yes_reply(update, context):
     trade_type = pending.get("trade_type", "itm")
     logger.info(f"handle_yes_reply: matched pending {tid} type={trade_type}")
 
-    schwab = context.application.bot_data["schwab_client"]
+    schwab = _get_schwab_for_user(context, user_id)
 
     try:
         if is_reverse:
@@ -770,7 +770,7 @@ async def handle_yes_reply(update, context):
 
 async def monitor_order(context, user_id, order_id, status_msg):
     logger.info(f"monitor_order START: user={user_id} order={order_id}")
-    schwab = context.application.bot_data["schwab_client"]
+    schwab = _get_schwab_for_user(context, user_id)
     loop = asyncio.get_running_loop()
     start = time.time()
     filled = False
@@ -852,7 +852,7 @@ async def cb_improve(update, context):
         await query.message.reply_text("⏱ Order session expired.")
         return
 
-    schwab = context.application.bot_data["schwab_client"]
+    schwab = _get_schwab_for_user(context, user_id)
     loop = asyncio.get_running_loop()
     hit = active["hit"]
 
@@ -911,7 +911,7 @@ async def cb_cancel(update, context):
         await query.message.reply_text("⏱ No active order.")
         return
 
-    schwab = context.application.bot_data["schwab_client"]
+    schwab = _get_schwab_for_user(context, user_id)
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, schwab.cancel_order, order_id)
@@ -927,7 +927,7 @@ async def cb_cancel(update, context):
 
 @authorized_only
 async def cmd_refresh_token(update, context):
-    schwab_client = context.application.bot_data["schwab_client"]
+    schwab_client = _get_schwab_for_user(context, user_id)
     auth_url = schwab_client.build_authorize_url()
     msg = (
         "🔐 Schwab Token Refresh\n\n"
@@ -945,7 +945,7 @@ async def cmd_refresh_token(update, context):
 
 @authorized_only
 async def cmd_submit_token(update, context):
-    schwab_client = context.application.bot_data["schwab_client"]
+    schwab_client = _get_schwab_for_user(context, user_id)
     text = update.message.text or ""
     parts = text.split(maxsplit=1)
     if len(parts) < 2:

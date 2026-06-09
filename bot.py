@@ -42,6 +42,25 @@ _ACTIVE_ORDERS: dict = {}
 MAX_TRADE_BUTTONS = 20
 
 
+def _get_schwab_for_user(context, user_id: int) -> "SchwabClient":
+    """
+    Return the SchwabClient for this Telegram user.
+    Falls back to primary user's client if no dedicated client exists.
+    """
+    clients        = context.application.bot_data["schwab_clients"]
+    primary_uid    = context.application.bot_data["primary_user_id"]
+    client         = clients.get(user_id) or clients.get(primary_uid)
+    if client is None:
+        raise RuntimeError(
+            f"No Schwab client available for user {user_id} "
+            f"and no primary fallback."
+        )
+    logger.info(
+        f"_get_schwab_for_user: user={user_id} "
+        f"using={'own' if user_id in clients else 'primary'} client"
+    )
+    return client
+
 def authorized_only(func):
     @wraps(func)
     async def wrapper(update, context):

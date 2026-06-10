@@ -151,9 +151,9 @@ async def cmd_help(update, context):
         "`/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
         "*Trading:*\n"
-        "· `/itm` — tap ✅ Confirm to place order instantly\n"
-        "· `/itm r` — tap ✅ Confirm R to place options order, then short stock\n"
-        "· `/dca` hits → reply `YES TICKER`\n"
+        "· `/itm` — tap Confirm to place order instantly\n"
+        "· `/itm r` — tap Confirm R, wait for fill, then short stock via button\n"
+        "· `/dca` hits — reply YES TICKER\n"
         "_Borrow cost (20% APR) deducted from /itm r APY._",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -393,7 +393,7 @@ async def _send_dca_trade_button(update, context, hit):
         f"💸 Div +${hit.get('expected_div_dollars', 0):.2f}/sh\n"
         f"🎯 Score: *{score_sign}${hit.get('score_dollars', 0):.2f}/sh · {apy:.1f}% APY*\n"
         f"OI {hit['call_oi']}/{hit['put_oi']}\n"
-        f"_Reply `YES {hit['ticker']}` to confirm_"
+        f"_Reply YES {hit['ticker']} to confirm_"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
@@ -680,7 +680,7 @@ async def cb_cancel_trade(update, context):
 
 @authorized_callback
 async def cb_confirm_rtrade(update, context):
-    """User tapped Confirm R on reverse ITM — submit 2-leg options order immediately."""
+    """User tapped Confirm R — submit 2-leg options order, monitor for fill."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -724,21 +724,22 @@ async def cb_confirm_rtrade(update, context):
 
     del _PENDING_TRADES[(user_id, trade_id)]
 
-    # Show confirmation + button to open Schwab to short the stock
-    schwab_url = f"https://client.schwab.com/app/trade/tom/trade#symbol/{ticker}"
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(
-            f"📱 Short {ticker} on Schwab",
-            url=schwab_url,
-        ),
-    ]])
+    _ACTIVE_ORDERS[user_id] = {
+        "order_id":   order_id,
+        "hit":        hit,
+        "pricing":    pricing,
+        "walk_step":  walk_step,
+        "trade_type": "itm_r",
+    }
 
     await _edit_robust(
         query.message,
         f"Order *{order_id}* submitted · {ticker} options\n"
         f"SELL put + BUY call · NET CREDIT ${pricing['net_credit']:.2f}\n"
-        f"NOW SHORT 100 {ticker} ON SCHWAB",
-        reply_markup=keyboard,
+        f"Monitoring for fill (30s)..."
+    )
+    asyncio.create_task(
+        monitor_rtrade_order(context, user_id, order_id, query.message, ticker)
     )
 
 
@@ -848,7 +849,7 @@ async def handle_yes_reply(update, context):
             logger.info(f"handle_yes_reply: skipping {tid}, no pricing")
             continue
         if pending.get("reverse", False):
-            continue  # reverse ITM uses inline buttons now
+            continue
         matching = (uid, tid, pending)
         break
 
@@ -911,7 +912,7 @@ async def handle_yes_reply(update, context):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring
+# Order monitoring — ITM / DCA
 # ---------------------------------------------------------------------------
 
 async def monitor_order(context, user_id, order_id, status_msg):
@@ -981,6 +982,72 @@ async def monitor_order(context, user_id, order_id, status_msg):
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
+
+# ---------------------------------------------------------------------------
+# Order monitoring — Reverse ITM (shows Short button only on fill)
+# ---------------------------------------------------------------------------
+
+async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
+    """Monitor reverse ITM options order. Show Short on Schwab button only on fill."""
+    logger.info(f"monitor_rtrade_order START: user={user_id} order={order_id}")
+    schwab = _get_schwab_for_user(context, user_id)
+    loop   = asyncio.get_running_loop()
+    start  = time.time()
+    filled = False
+
+    while time.time() - start < 30:
+        await asyncio.sleep(5)
+        try:
+            status     = await loop.run_in_executor(
+                None, schwab.get_order_status, order_id)
+            status_str = status.get("status", "UNKNOWN")
+            logger.info(
+                f"monitor_rtrade_order: id={order_id} status={status_str}")
+            if status_str == "FILLED":
+                filled = True
+                break
+            if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
+                _ACTIVE_ORDERS.pop(user_id, None)
+                await _edit_robust(
+                    status_msg,
+                    f"Order {order_id} for {ticker} ended: {status_str}"
+                )
+                return
+        except Exception as e:
+            logger.warning(f"monitor_rtrade_order: poll failed: {e}")
+            continue
+
+    _ACTIVE_ORDERS.pop(user_id, None)
+
+    if filled:
+        schwab_url = (
+            f"https://client.schwab.com/app/trade/tom/trade#symbol/{ticker}"
+        )
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"📱 Short {ticker} on Schwab",
+                url=schwab_url,
+            ),
+        ]])
+        await _edit_robust(
+            status_msg,
+            f"FILLED — order {order_id} · {ticker} options\n"
+            f"NOW SHORT 100 {ticker} ON SCHWAB",
+            reply_markup=keyboard,
+        )
+    else:
+        # Not filled in 30s — leave working on Schwab, no improve flow for reverse
+        await _edit_robust(
+            status_msg,
+            f"Order {order_id} · {ticker} not filled after 30s.\n"
+            f"Order remains working on Schwab.\n"
+            f"Short stock only after it fills."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Improve / Cancel
+# ---------------------------------------------------------------------------
 
 @authorized_callback
 async def cb_improve(update, context):

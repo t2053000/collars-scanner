@@ -363,6 +363,20 @@ def format_dca_order_preview(hit: dict, pricing: dict, next_pricing: dict = None
     lines.append(f"Reply `YES {ticker}` within 60s to submit.")
     return "\n".join(lines)
 
+def build_short_stock_order(ticker: str, quantity: int = 100) -> dict:
+    """Market order to short stock — used after reverse ITM options fill."""
+    return {
+        "orderType": "MARKET",
+        "session": "NORMAL",
+        "duration": "DAY",
+        "orderStrategyType": "SINGLE",
+        "orderLegCollection": [{
+            "orderLegType": "EQUITY",
+            "instruction": "SELL_SHORT",
+            "quantity": quantity,
+            "instrument": {"symbol": ticker.upper(), "assetType": "EQUITY"},
+        }],
+    }
 
 def format_reverse_order_preview(hit: dict, pricing: dict, next_pricing: dict = None) -> str:
     ticker = hit["ticker"]

@@ -967,14 +967,27 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
                 f"SHORT order FAILED: {type(e).__name__}: {str(e)[:200]}\n"
                 f"SHORT {ticker} MANUALLY ON SCHWAB NOW."
             )
-    else:
-        # Not filled in 30s — order still working on Schwab
-        await _edit_robust(
-            status_msg,
-            f"Order {order_id} · {ticker} not filled after 30s.\n"
-            f"Order remains working on Schwab.\n"
-            f"Short stock will be placed automatically when options fill — do NOT short manually yet."
-        )
+        else:
+        # Not filled in 30s — auto-cancel to prevent orphaned options order
+        try:
+            schwab = _get_schwab_for_user(context, user_id)
+            loop   = asyncio.get_running_loop()
+            await loop.run_in_executor(None, schwab.cancel_order, order_id)
+            await _edit_robust(
+                status_msg,
+                f"Order {order_id} · {ticker} not filled after 30s — auto-cancelled.\n"
+                f"Re-run /itm r to try again."
+            )
+            logger.info(f"monitor_rtrade_order: auto-cancelled {order_id} for {ticker}")
+        except Exception as e:
+            logger.warning(f"monitor_rtrade_order: auto-cancel failed: {e}")
+            await _edit_robust(
+                status_msg,
+                f"Order {order_id} · {ticker} not filled after 30s.\n"
+                f"Auto-cancel failed — cancel manually on Schwab.\n"
+                f"Do NOT short {ticker} manually."
+            )
+
 
 
 

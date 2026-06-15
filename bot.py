@@ -152,7 +152,7 @@ async def cmd_help(update, context):
        "`/refresh_token` `/submit_token`\n\n"
        "*Trading:*\n"
        "· `/itm` — tap Confirm to place order instantly\n"
-       "· `/itm r` — tap Confirm R, wait for fill, then short stock via button\n"
+       "· `/itm r` — tap Confirm R, wait for fill, then short stock auto-placed\n"
        "· `/dca` — tap Confirm to place order instantly\n"
        "_Borrow cost (20% APR) deducted from /itm r APY._",
        parse_mode=ParseMode.MARKDOWN,
@@ -910,85 +910,81 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM (shows Short button only on fill)
+# Order monitoring — Reverse ITM (auto-short on fill, auto-cancel if not filled)
 # ---------------------------------------------------------------------------
 
 async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
-    """Monitor reverse ITM options order. On fill, auto-place short stock market order."""
-    logger.info(f"monitor_rtrade_order START: user={user_id} order={order_id}")
-    schwab = _get_schwab_for_user(context, user_id)
-    loop   = asyncio.get_running_loop()
-    start  = time.time()
-    filled = False
+   """Monitor reverse ITM options order. On fill auto-place short. If not filled auto-cancel."""
+   logger.info(f"monitor_rtrade_order START: user={user_id} order={order_id}")
+   schwab = _get_schwab_for_user(context, user_id)
+   loop   = asyncio.get_running_loop()
+   start  = time.time()
+   filled = False
 
-    while time.time() - start < 30:
-        await asyncio.sleep(5)
-        try:
-            status     = await loop.run_in_executor(
-                None, schwab.get_order_status, order_id)
-            status_str = status.get("status", "UNKNOWN")
-            logger.info(
-                f"monitor_rtrade_order: id={order_id} status={status_str}")
-            if status_str == "FILLED":
-                filled = True
-                break
-            if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
-                _ACTIVE_ORDERS.pop(user_id, None)
-                await _edit_robust(
-                    status_msg,
-                    f"Order {order_id} for {ticker} ended: {status_str}"
-                )
-                return
-        except Exception as e:
-            logger.warning(f"monitor_rtrade_order: poll failed: {e}")
-            continue
+   while time.time() - start < 30:
+       await asyncio.sleep(5)
+       try:
+           status     = await loop.run_in_executor(
+               None, schwab.get_order_status, order_id)
+           status_str = status.get("status", "UNKNOWN")
+           logger.info(
+               f"monitor_rtrade_order: id={order_id} status={status_str}")
+           if status_str == "FILLED":
+               filled = True
+               break
+           if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
+               _ACTIVE_ORDERS.pop(user_id, None)
+               await _edit_robust(
+                   status_msg,
+                   f"Order {order_id} for {ticker} ended: {status_str}"
+               )
+               return
+       except Exception as e:
+           logger.warning(f"monitor_rtrade_order: poll failed: {e}")
+           continue
 
-    _ACTIVE_ORDERS.pop(user_id, None)
+   _ACTIVE_ORDERS.pop(user_id, None)
 
-    if filled:
-        # Auto-place short stock market order immediately
-        try:
-            short_payload  = orders.build_short_stock_order(ticker)
-            short_order_id = await loop.run_in_executor(
-                None, schwab.place_order, short_payload)
-            logger.info(
-                f"monitor_rtrade_order: short placed id={short_order_id} ticker={ticker}")
-            await _edit_robust(
-                status_msg,
-                f"OPTIONS FILLED — order {order_id} · {ticker}\n"
-                f"SHORT order *{short_order_id}* submitted · SELL SHORT 100 {ticker} @ MKT\n"
-                f"Check Schwab to confirm both legs are working."
-            )
-        except Exception as e:
-            logger.exception(f"monitor_rtrade_order: short stock order failed: {e}")
-            await _edit_robust(
-                status_msg,
-                f"OPTIONS FILLED — order {order_id} · {ticker}\n"
-                f"SHORT order FAILED: {type(e).__name__}: {str(e)[:200]}\n"
-                f"SHORT {ticker} MANUALLY ON SCHWAB NOW."
-            )
-        else:
-        # Not filled in 30s — auto-cancel to prevent orphaned options order
-        try:
-            schwab = _get_schwab_for_user(context, user_id)
-            loop   = asyncio.get_running_loop()
-            await loop.run_in_executor(None, schwab.cancel_order, order_id)
-            await _edit_robust(
-                status_msg,
-                f"Order {order_id} · {ticker} not filled after 30s — auto-cancelled.\n"
-                f"Re-run /itm r to try again."
-            )
-            logger.info(f"monitor_rtrade_order: auto-cancelled {order_id} for {ticker}")
-        except Exception as e:
-            logger.warning(f"monitor_rtrade_order: auto-cancel failed: {e}")
-            await _edit_robust(
-                status_msg,
-                f"Order {order_id} · {ticker} not filled after 30s.\n"
-                f"Auto-cancel failed — cancel manually on Schwab.\n"
-                f"Do NOT short {ticker} manually."
-            )
-
-
+   if filled:
+       # Auto-place short stock market order immediately
+       try:
+           short_payload  = orders.build_short_stock_order(ticker)
+           short_order_id = await loop.run_in_executor(
+               None, schwab.place_order, short_payload)
+           logger.info(
+               f"monitor_rtrade_order: short placed id={short_order_id} ticker={ticker}")
+           await _edit_robust(
+               status_msg,
+               f"OPTIONS FILLED — order {order_id} · {ticker}\n"
+               f"SHORT order *{short_order_id}* submitted · SELL SHORT 100 {ticker} @ MKT\n"
+               f"Check Schwab to confirm both legs are working."
+           )
+       except Exception as e:
+           logger.exception(f"monitor_rtrade_order: short stock order failed: {e}")
+           await _edit_robust(
+               status_msg,
+               f"OPTIONS FILLED — order {order_id} · {ticker}\n"
+               f"SHORT order FAILED: {type(e).__name__}: {str(e)[:200]}\n"
+               f"SHORT {ticker} MANUALLY ON SCHWAB NOW."
+           )
+   else:
+       # Not filled in 30s — auto-cancel to prevent orphaned options order
+       try:
+           await loop.run_in_executor(None, schwab.cancel_order, order_id)
+           await _edit_robust(
+               status_msg,
+               f"Order {order_id} · {ticker} not filled after 30s — auto-cancelled.\n"
+               f"Re-run /itm r to try again."
+           )
+           logger.info(f"monitor_rtrade_order: auto-cancelled {order_id} for {ticker}")
+       except Exception as e:
+           logger.warning(f"monitor_rtrade_order: auto-cancel failed: {e}")
+           await _edit_robust(
+               status_msg,
+               f"Order {order_id} · {ticker} not filled after 30s.\n"
+               f"Auto-cancel failed — cancel manually on Schwab.\n"
+               f"Do NOT short {ticker} manually."
+           )
 
 
 # ---------------------------------------------------------------------------
@@ -1211,8 +1207,6 @@ async def handle_yes_reply(update, context):
    if keyword != "YES":
        return
 
-   # YES TICKER fallback — only matches DCA pending trades that still have
-   # pricing set (i.e. user somehow went through old cb_trade preview flow)
    ticker  = parts[1].upper()
    user_id = user.id
 
@@ -1237,7 +1231,7 @@ async def handle_yes_reply(update, context):
        break
 
    if not matching:
-       return  # silently ignore — DCA now uses inline buttons
+       return
 
    uid, tid, pending = matching
    hit        = pending["hit"]

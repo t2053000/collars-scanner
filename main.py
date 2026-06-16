@@ -133,6 +133,7 @@ def main():
         ritm_scanner,
         schwab_clients,        # dict instead of single client
         primary_user_id,       # so bot knows whose client is the fallback
+        itm_ibkr_scanner,
     )
 
     log.info("Bot starting – polling Telegram…")

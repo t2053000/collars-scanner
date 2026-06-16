@@ -23,7 +23,7 @@ except ImportError:
     logger.warning("ib_insync not installed — IBKR scanning unavailable")
 
 
-IBKR_HOST     = "100.115.213.45"   # Tailscale IP of Hostinger VPS
+IBKR_HOST     = "localhost"   # Tailscale IP of Hostinger VPS
 IBKR_PORT     = 4002               # IB Gateway paper port
 IBKR_CLIENT_ID = 10               # unique client ID for scanner
 

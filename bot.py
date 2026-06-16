@@ -42,6 +42,25 @@ _ACTIVE_ORDERS: dict = {}
 
 MAX_TRADE_BUTTONS = 20
 
+@authorized_only
+async def cmd_itmib(update, context):
+    scanner = context.application.bot_data.get("itm_ibkr_scanner")
+    if scanner is None:
+        await update.message.reply_text("IBKR scanner unavailable.")
+        return
+    div_tickers = github_store.get_div_tickers()
+    watchlist   = github_store.get_tickers()
+    combined    = sorted(set(watchlist) | set(div_tickers.keys()))
+    if not combined:
+        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
+        return
+    scanner.ticker_freqs = div_tickers
+    original = scanner.scan_ticker
+    scanner.scan_ticker = scanner.scan_ticker_reverse
+    await _run_scan(update, context, scanner, "🔄", ItmIbkrScanner.format_summary,
+                    tickers_override=combined,
+                    hits_with_buttons=True, scanner_key="itm_r")
+    scanner.scan_ticker = original
 
 def _get_schwab_for_user(context, user_id: int):
    clients     = context.application.bot_data["schwab_clients"]

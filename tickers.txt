@@ -2,6 +2,7 @@ HIMS
 AGQ
 TSLL
 TQQQ
+purr
 SQQQ
 MO
 GDX

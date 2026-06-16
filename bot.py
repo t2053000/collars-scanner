@@ -4,6 +4,7 @@ Telegram bot — scanners + ITM/DCA trade execution with improve/cancel flow.
 Heavy logging on trade flow for debugging.
 """
 
+from itm_ibkr import ItmIbkrScanner
 import asyncio
 import logging
 import time

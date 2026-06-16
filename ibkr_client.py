@@ -7,6 +7,7 @@ Used for scanning only — order execution stays on Schwab.
 Connection: Railway → Tailscale → Hostinger VPS → IB Gateway port 4002
 """
 
+import os
 import logging
 import threading
 from datetime import datetime, date

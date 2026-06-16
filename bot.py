@@ -1158,6 +1158,7 @@ def build_app(telegram_token,
              schwab_clients: dict,
              primary_user_id: int,
              itm_ibkr_scanner=None):
+   app.add_handler(CommandHandler("itmib", cmd_itmib))
    app = Application.builder().token(telegram_token).build()
    app.bot_data["collar_scanner"]   = collar_scanner
    app.bot_data["spread_scanner"]   = spread_scanner

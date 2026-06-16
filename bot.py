@@ -1136,7 +1136,8 @@ def build_app(telegram_token,
              itm_scanner,
              ritm_scanner,
              schwab_clients: dict,
-             primary_user_id: int):
+             primary_user_id: int,
+             itm_ibkr_scanner=None):
    app = Application.builder().token(telegram_token).build()
    app.bot_data["collar_scanner"]   = collar_scanner
    app.bot_data["spread_scanner"]   = spread_scanner

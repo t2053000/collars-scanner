@@ -138,6 +138,17 @@ def main():
     log.info("Bot starting – polling Telegram…")
     app.run_polling(allowed_updates=["message", "callback_query"])
 
+from ibkr_client import IbkrClient
+from itm_ibkr   import ItmIbkrScanner
 
+# IBKR scanner — scanning only, execution stays on Schwab
+try:
+    ibkr_client     = IbkrClient()
+    ibkr_client.connect()
+    itm_ibkr_scanner = ItmIbkrScanner(ibkr_client, initial_div_freqs)
+    log.info("IBKR scanner connected")
+except Exception as e:
+    itm_ibkr_scanner = None
+    log.warning(f"IBKR scanner unavailable: {e}")
 if __name__ == "__main__":
     main()

@@ -4,6 +4,12 @@ ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
 Commission-aware, fillability-filtered, with primary + fallback pricing.
 Includes reverse mode (scan_ticker_reverse) for /itm r.
 
+Two-stage scanning:
+  Stage 1 — IV skew filter (fast, 2-strike chain fetch):
+    /itm normal:  keep tickers with call skew (call IV > put IV, ratio < threshold)
+    /itm r:       keep tickers with put skew  (put IV > call IV, ratio > threshold)
+  Stage 2 — Full scan (existing logic, runs only on filtered universe)
+
 Sorting: best APY at bottom (shown last = closest to message field on phone).
 Ex-div in window:
  - /itm normal: flagged, deprioritized by div_yield_apy_pts
@@ -33,6 +39,12 @@ MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
 HTB_SHORT_INT_THRESHOLD            = 0.20
 REVERSE_EX_DIV_APY_PENALTY         = 25.0
 REVERSE_BORROW_RATE                = 0.20
+
+# IV skew filter thresholds
+# put/call IV ratio > PUT_SKEW_MIN  → has put skew  (good for /itm r)
+# put/call IV ratio < CALL_SKEW_MAX → has call skew (good for /itm normal)
+PUT_SKEW_MIN  = 1.05   # put IV at least 5% above call IV
+CALL_SKEW_MAX = 0.95   # call IV at least 5% above put IV
 
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
@@ -198,11 +210,55 @@ class ItmScanner:
            pass
        return annual_div, last_ex_div, next_ex_div_date, short_int
 
-   def scan_ticker(self, ticker):
+   def _has_put_skew(self, ticker: str) -> bool:
+       """
+       Stage 1 filter for /itm r.
+       Returns True if put IV / call IV >= PUT_SKEW_MIN (put skew present).
+       Returns True on data error (don't filter on uncertainty).
+       """
+       try:
+           ratio = self.schwab.get_atm_iv_ratio(ticker)
+           if ratio is None:
+               return True  # no data → pass through
+           result = ratio >= PUT_SKEW_MIN
+           if not result:
+               logger.debug(f"[{ticker}] filtered: put/call IV ratio {ratio:.3f} < {PUT_SKEW_MIN}")
+           return result
+       except Exception:
+           return True  # on error → pass through
+
+   def _has_call_skew(self, ticker: str) -> bool:
+       """
+       Stage 1 filter for /itm normal.
+       Returns True if put IV / call IV <= CALL_SKEW_MAX (call skew present).
+       Returns True on data error (don't filter on uncertainty).
+       """
+       try:
+           ratio = self.schwab.get_atm_iv_ratio(ticker)
+           if ratio is None:
+               return True  # no data → pass through
+           result = ratio <= CALL_SKEW_MAX
+           if not result:
+               logger.debug(f"[{ticker}] filtered: put/call IV ratio {ratio:.3f} > {CALL_SKEW_MAX}")
+           return result
+       except Exception:
+           return True  # on error → pass through
+
+   def scan_ticker(self, ticker, skip_skew_filter: bool = False):
+       """
+       /itm normal scan.
+       Stage 1: call skew filter (skip if skip_skew_filter=True).
+       Stage 2: full chain scan for ITM conversions.
+       """
        results = []
        debug = Counter()
        ticker = ticker.upper()
        freq = self.ticker_freqs.get(ticker, "Q")
+
+       # Stage 1 — call skew filter
+       if not skip_skew_filter and not self._has_call_skew(ticker):
+           debug["skew_filtered"] += 1
+           return results, debug
 
        try:
            chain = self.schwab.get_option_chain(ticker)
@@ -332,22 +388,25 @@ class ItmScanner:
 
        return results, debug
 
-   def scan_ticker_reverse(self, ticker):
+   def scan_ticker_reverse(self, ticker, skip_skew_filter: bool = False):
        """
        /itm r: strikes ABOVE spot where put_mid > call_mid.
+       Stage 1: put skew filter (skip if skip_skew_filter=True).
+       Stage 2: full chain scan.
        Short stock + sell put + buy call.
        Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
        Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
        Div cost: actual dividend payment deducted from locked profit when ex-div in window.
-       Optimizations:
-         - REVERSE_DTE_MAX=14 (borrow kills edge beyond 14d)
-         - STRIKES_ABOVE_SPOT_REVERSE=2 (nearest 2 strikes capture most edge)
-         - Pre-built key lookup dicts (avoids O(n) scan per expiry)
        """
        results = []
-       debug = Counter()
-       ticker = ticker.upper()
-       freq = self.ticker_freqs.get(ticker, "Q")
+       debug   = Counter()
+       ticker  = ticker.upper()
+       freq    = self.ticker_freqs.get(ticker, "Q")
+
+       # Stage 1 — put skew filter
+       if not skip_skew_filter and not self._has_put_skew(ticker):
+           debug["skew_filtered"] += 1
+           return results, debug
 
        try:
            chain = self.schwab.get_option_chain(ticker)
@@ -440,11 +499,8 @@ class ItmScanner:
                gap = strike - spot
                commission_per_share = COMMISSION_PER_CONTRACT / 100.0
 
-               # in_window must be computed BEFORE div_cost
                in_window = _ex_div_before_expiry(next_ex_div_date, exp_date)
 
-               # Deduct dividend payment if ex-div falls before expiry
-               # (short stock = you PAY the dividend)
                div_cost = 0.0
                if in_window and annual_div > 0:
                    cycles = {"M": 12, "Q": 4, "S": 2, "A": 1, "W": 52}.get(freq, 4)
@@ -459,7 +515,6 @@ class ItmScanner:
                apy_p = (locked_p / spot) * (365.0 / dte) * 100.0 \
                    if spot > 0 and dte > 0 else 0.0
 
-               # Fallback pricing (same borrow + div cost applies)
                put_credit_f = _sell_price(put_opt,  extra_frac=FALLBACK_STEP_FRAC)
                call_cost_f  = _buy_price(call_opt,  extra_frac=FALLBACK_STEP_FRAC)
                net_credit_f = put_credit_f - call_cost_f
@@ -574,6 +629,7 @@ class ItmScanner:
            d = debug_totals
            header += (
                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
+               f"  · skew filtered:    {d.get('skew_filtered', 0):,}\n"
                f"  · call no market:   {d.get('call_no_market', 0):,}\n"
                f"  · put no market:    {d.get('put_no_market', 0):,}\n"
                f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"

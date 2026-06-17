@@ -4,11 +4,9 @@ ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
 Commission-aware, fillability-filtered, with primary + fallback pricing.
 Includes reverse mode (scan_ticker_reverse) for /itm r.
 
-Two-stage scanning:
-  Stage 1 — IV skew filter (fast, 2-strike chain fetch):
-    /itm normal:  keep tickers with call skew (call IV > put IV, ratio < threshold)
-    /itm r:       keep tickers with put skew  (put IV > call IV, ratio > threshold)
-  Stage 2 — Full scan (existing logic, runs only on filtered universe)
+IV skew filter — uses already-fetched chain data, zero extra API calls:
+  /itm normal:  skip tickers without call skew (call IV > put IV)
+  /itm r:       skip tickers without put skew  (put IV > call IV)
 
 Sorting: best APY at bottom (shown last = closest to message field on phone).
 Ex-div in window:
@@ -40,11 +38,9 @@ HTB_SHORT_INT_THRESHOLD            = 0.20
 REVERSE_EX_DIV_APY_PENALTY         = 25.0
 REVERSE_BORROW_RATE                = 0.20
 
-# IV skew filter thresholds
-# put/call IV ratio > PUT_SKEW_MIN  → has put skew  (good for /itm r)
-# put/call IV ratio < CALL_SKEW_MAX → has call skew (good for /itm normal)
-PUT_SKEW_MIN  = 1.00   # put IV at least 5% above call IV
-CALL_SKEW_MAX = 1.00   # call IV at least 5% above put IV
+# IV skew filter thresholds (applied to already-fetched chain data)
+PUT_SKEW_MIN  = 1.02   # put IV / call IV must be >= this for /itm r
+CALL_SKEW_MAX = 0.98   # put IV / call IV must be <= this for /itm normal
 
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
@@ -55,31 +51,70 @@ _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
 # ---------------------------------------------------------------------------
 
 def _has_market(option):
-   return (option.get("bid") or 0.0) > 0 and (option.get("ask") or 0.0) > 0
+    return (option.get("bid") or 0.0) > 0 and (option.get("ask") or 0.0) > 0
 
 def _bid(option):
-   return float(option.get("bid") or 0.0)
+    return float(option.get("bid") or 0.0)
 
 def _ask(option):
-   return float(option.get("ask") or 0.0)
+    return float(option.get("ask") or 0.0)
 
 def _oi(option):
-   return int(option.get("openInterest") or 0)
+    return int(option.get("openInterest") or 0)
 
 def _spread_pct(option):
-   bid, ask = _bid(option), _ask(option)
-   mid = (bid + ask) / 2.0
-   return 99.0 if mid <= 0 else (ask - bid) / mid
+    bid, ask = _bid(option), _ask(option)
+    mid = (bid + ask) / 2.0
+    return 99.0 if mid <= 0 else (ask - bid) / mid
 
 def _sell_price(option, extra_frac=0.0):
-   bid, ask = _bid(option), _ask(option)
-   mid = (bid + ask) / 2.0
-   return mid - (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
+    bid, ask = _bid(option), _ask(option)
+    mid = (bid + ask) / 2.0
+    return mid - (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
 
 def _buy_price(option, extra_frac=0.0):
-   bid, ask = _bid(option), _ask(option)
-   mid = (bid + ask) / 2.0
-   return mid + (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
+    bid, ask = _bid(option), _ask(option)
+    mid = (bid + ask) / 2.0
+    return mid + (MID_ADJUST_FRAC + extra_frac) * (ask - bid)
+
+
+# ---------------------------------------------------------------------------
+# IV skew helpers — operate on already-fetched chain data, zero extra API calls
+# ---------------------------------------------------------------------------
+
+def _chain_put_call_iv_ratio(call_map: dict, put_map: dict, spot: float):
+    """
+    Sample ATM put/call IV ratio from the nearest expiry with valid IV data.
+    Returns put_iv / call_iv, or None if data unavailable.
+    """
+    for exp_key in sorted(call_map.keys()):
+        calls = call_map[exp_key]
+        puts  = put_map.get(exp_key, {})
+        common = set(calls.keys()) & set(puts.keys())
+        if not common:
+            continue
+        atm = min(common, key=lambda s: abs(float(s) - spot))
+        call_iv = float((calls.get(atm) or [{}])[0].get("volatility") or 0.0)
+        put_iv  = float((puts.get(atm)  or [{}])[0].get("volatility") or 0.0)
+        if call_iv > 0 and put_iv > 0 and call_iv != -999.0 and put_iv != -999.0:
+            return put_iv / call_iv
+    return None
+
+
+def _has_put_skew(call_map: dict, put_map: dict, spot: float) -> bool:
+    """True if put skew present, or if data unavailable (pass through)."""
+    ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
+    if ratio is None:
+        return True
+    return ratio >= PUT_SKEW_MIN
+
+
+def _has_call_skew(call_map: dict, put_map: dict, spot: float) -> bool:
+    """True if call skew present, or if data unavailable (pass through)."""
+    ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
+    if ratio is None:
+        return True
+    return ratio <= CALL_SKEW_MAX
 
 
 # ---------------------------------------------------------------------------
@@ -87,82 +122,82 @@ def _buy_price(option, extra_frac=0.0):
 # ---------------------------------------------------------------------------
 
 def _compute_annual_div(fundamentals, spot):
-   if not fundamentals:
-       return 0.0
-   annual_div = float(fundamentals.get("dividendAmount") or 0.0)
-   if annual_div > 0:
-       return annual_div
-   div_yield = float(fundamentals.get("dividendYield") or 0.0)
-   if div_yield <= 0:
-       return 0.0
-   return (div_yield / 100.0 if div_yield > 1 else div_yield) * spot
+    if not fundamentals:
+        return 0.0
+    annual_div = float(fundamentals.get("dividendAmount") or 0.0)
+    if annual_div > 0:
+        return annual_div
+    div_yield = float(fundamentals.get("dividendYield") or 0.0)
+    if div_yield <= 0:
+        return 0.0
+    return (div_yield / 100.0 if div_yield > 1 else div_yield) * spot
 
 
 def _get_next_ex_div(fundamentals) -> str:
-   if not fundamentals:
-       return ""
-   for field in ("exDividendDate", "dividendDate", "nextDividendDate",
-                 "exDivDate", "nextExDivDate"):
-       val = fundamentals.get(field)
-       if val:
-           try:
-               return str(val)[:10]
-           except Exception:
-               continue
-   return ""
+    if not fundamentals:
+        return ""
+    for field in ("exDividendDate", "dividendDate", "nextDividendDate",
+                  "exDivDate", "nextExDivDate"):
+        val = fundamentals.get(field)
+        if val:
+            try:
+                return str(val)[:10]
+            except Exception:
+                continue
+    return ""
 
 
 def _get_short_interest(fundamentals) -> float:
-   if not fundamentals:
-       return 0.0
-   for field in ("shortIntToFloat", "shortInterestRatio", "shortPercent",
-                 "shortPercentOfFloat", "shortInterest"):
-       val = fundamentals.get(field)
-       if val is not None:
-           try:
-               v = float(val)
-               return v / 100.0 if v > 1.0 else v
-           except (ValueError, TypeError):
-               continue
-   return 0.0
+    if not fundamentals:
+        return 0.0
+    for field in ("shortIntToFloat", "shortInterestRatio", "shortPercent",
+                  "shortPercentOfFloat", "shortInterest"):
+        val = fundamentals.get(field)
+        if val is not None:
+            try:
+                v = float(val)
+                return v / 100.0 if v > 1.0 else v
+            except (ValueError, TypeError):
+                continue
+    return 0.0
 
 
 def _ex_div_before_expiry(next_ex_div_date: str, exp_date: str) -> bool:
-   if not next_ex_div_date or not exp_date:
-       return False
-   try:
-       return (datetime.strptime(next_ex_div_date[:10], "%Y-%m-%d") <=
-               datetime.strptime(exp_date[:10], "%Y-%m-%d"))
-   except ValueError:
-       return False
+    if not next_ex_div_date or not exp_date:
+        return False
+    try:
+        return (datetime.strptime(next_ex_div_date[:10], "%Y-%m-%d") <=
+                datetime.strptime(exp_date[:10], "%Y-%m-%d"))
+    except ValueError:
+        return False
 
 
 def _project_ex_div_dates(last_ex_div, freq, until):
-   if not last_ex_div:
-       return 0
-   interval = _FREQ_DAYS.get(freq, 91)
-   today = datetime.utcnow()
-   next_div = last_ex_div + timedelta(days=interval)
-   while next_div < today:
-       next_div += timedelta(days=interval)
-   count = 0
-   while next_div <= until:
-       count += 1
-       next_div += timedelta(days=interval)
-   return count
+    if not last_ex_div:
+        return 0
+    interval = _FREQ_DAYS.get(freq, 91)
+    today = datetime.utcnow()
+    next_div = last_ex_div + timedelta(days=interval)
+    while next_div < today:
+        next_div += timedelta(days=interval)
+    count = 0
+    while next_div <= until:
+        count += 1
+        next_div += timedelta(days=interval)
+    return count
 
 
 def _locked_and_apy(spot, strike, call_credit, put_cost, dte):
-   net_credit = call_credit - put_cost
-   gap = spot - strike
-   commission_per_share = COMMISSION_PER_CONTRACT / 100.0
-   locked = (net_credit - gap) - commission_per_share
-   cost_basis = spot - net_credit
-   if cost_basis <= 0 or dte <= 0:
-       apy = 0.0
-   else:
-       apy = (locked / cost_basis) * (365.0 / dte) * 100.0
-   return net_credit, locked, locked * 100.0, apy
+    net_credit = call_credit - put_cost
+    gap = spot - strike
+    commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+    locked = (net_credit - gap) - commission_per_share
+    cost_basis = spot - net_credit
+    if cost_basis <= 0 or dte <= 0:
+        apy = 0.0
+    else:
+        apy = (locked / cost_basis) * (365.0 / dte) * 100.0
+    return net_credit, locked, locked * 100.0, apy
 
 
 # ---------------------------------------------------------------------------
@@ -170,15 +205,15 @@ def _locked_and_apy(spot, strike, call_credit, put_cost, dte):
 # ---------------------------------------------------------------------------
 
 def _sort_key(hit: dict) -> float:
-   apy = hit.get("locked_apy") or 0.0
-   if hit.get("ex_div_in_window"):
-       if hit.get("reverse"):
-           apy -= REVERSE_EX_DIV_APY_PENALTY
-       else:
-           spot = hit.get("spot") or 1.0
-           annual_div = hit.get("annual_div") or 0.0
-           apy -= (annual_div / spot) * 100.0
-   return apy
+    apy = hit.get("locked_apy") or 0.0
+    if hit.get("ex_div_in_window"):
+        if hit.get("reverse"):
+            apy -= REVERSE_EX_DIV_APY_PENALTY
+        else:
+            spot = hit.get("spot") or 1.0
+            annual_div = hit.get("annual_div") or 0.0
+            apy -= (annual_div / spot) * 100.0
+    return apy
 
 
 # ---------------------------------------------------------------------------
@@ -186,480 +221,440 @@ def _sort_key(hit: dict) -> float:
 # ---------------------------------------------------------------------------
 
 class ItmScanner:
-   def __init__(self, schwab_client, ticker_freqs=None):
-       self.schwab = schwab_client
-       self.ticker_freqs = ticker_freqs or {}
+    def __init__(self, schwab_client, ticker_freqs=None):
+        self.schwab = schwab_client
+        self.ticker_freqs = ticker_freqs or {}
 
-   def _fetch_fundamentals(self, ticker, spot=0.0):
-       annual_div = 0.0
-       last_ex_div = None
-       next_ex_div_date = ""
-       short_int = 0.0
-       try:
-           fundamentals = self.schwab.get_fundamentals(ticker)
-           annual_div = _compute_annual_div(fundamentals, spot)
-           next_ex_div_date = _get_next_ex_div(fundamentals)
-           short_int = _get_short_interest(fundamentals)
-           if next_ex_div_date:
-               try:
-                   last_ex_div = datetime.strptime(
-                       next_ex_div_date[:10], "%Y-%m-%d")
-               except ValueError:
-                   pass
-       except Exception:
-           pass
-       return annual_div, last_ex_div, next_ex_div_date, short_int
+    def _fetch_fundamentals(self, ticker, spot=0.0):
+        annual_div = 0.0
+        last_ex_div = None
+        next_ex_div_date = ""
+        short_int = 0.0
+        try:
+            fundamentals = self.schwab.get_fundamentals(ticker)
+            annual_div = _compute_annual_div(fundamentals, spot)
+            next_ex_div_date = _get_next_ex_div(fundamentals)
+            short_int = _get_short_interest(fundamentals)
+            if next_ex_div_date:
+                try:
+                    last_ex_div = datetime.strptime(
+                        next_ex_div_date[:10], "%Y-%m-%d")
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+        return annual_div, last_ex_div, next_ex_div_date, short_int
 
-   def _has_put_skew(self, ticker: str) -> bool:
-       """
-       Stage 1 filter for /itm r.
-       Returns True if put IV / call IV >= PUT_SKEW_MIN (put skew present).
-       Returns True on data error (don't filter on uncertainty).
-       """
-       try:
-           ratio = self.schwab.get_atm_iv_ratio(ticker)
-           if ratio is None:
-               return True  # no data → pass through
-           result = ratio >= PUT_SKEW_MIN
-           if not result:
-               logger.debug(f"[{ticker}] filtered: put/call IV ratio {ratio:.3f} < {PUT_SKEW_MIN}")
-           return result
-       except Exception:
-           return True  # on error → pass through
+    def scan_ticker(self, ticker, skip_skew_filter: bool = False):
+        """
+        /itm normal scan.
+        Fetches chain once, checks call skew from that data, then scans.
+        """
+        results = []
+        debug = Counter()
+        ticker = ticker.upper()
+        freq = self.ticker_freqs.get(ticker, "Q")
 
-   def _has_call_skew(self, ticker: str) -> bool:
-       """
-       Stage 1 filter for /itm normal.
-       Returns True if put IV / call IV <= CALL_SKEW_MAX (call skew present).
-       Returns True on data error (don't filter on uncertainty).
-       """
-       try:
-           ratio = self.schwab.get_atm_iv_ratio(ticker)
-           if ratio is None:
-               return True  # no data → pass through
-           result = ratio <= CALL_SKEW_MAX
-           if not result:
-               logger.debug(f"[{ticker}] filtered: put/call IV ratio {ratio:.3f} > {CALL_SKEW_MAX}")
-           return result
-       except Exception:
-           return True  # on error → pass through
+        try:
+            chain = self.schwab.get_option_chain(ticker)
+        except Exception as e:
+            logger.error(f"[{ticker}] option chain fetch failed: {e}")
+            raise
 
-   def scan_ticker(self, ticker, skip_skew_filter: bool = False):
-       """
-       /itm normal scan.
-       Stage 1: call skew filter (skip if skip_skew_filter=True).
-       Stage 2: full chain scan for ITM conversions.
-       """
-       results = []
-       debug = Counter()
-       ticker = ticker.upper()
-       freq = self.ticker_freqs.get(ticker, "Q")
+        spot = chain.get("underlyingPrice")
+        if not spot or spot <= 0:
+            debug["no_spot"] += 1
+            return results, debug
 
-       # Stage 1 — call skew filter
-       if not skip_skew_filter and not self._has_call_skew(ticker):
-           debug["skew_filtered"] += 1
-           return results, debug
+        call_map = chain.get("callExpDateMap", {})
+        put_map  = chain.get("putExpDateMap",  {})
+        if not call_map or not put_map:
+            debug["empty_chain"] += 1
+            return results, debug
 
-       try:
-           chain = self.schwab.get_option_chain(ticker)
-       except Exception as e:
-           logger.error(f"[{ticker}] option chain fetch failed: {e}")
-           raise
+        # Stage 1 — call skew filter (uses already-fetched chain data)
+        if not skip_skew_filter and not _has_call_skew(call_map, put_map, spot):
+            debug["skew_filtered"] += 1
+            return results, debug
 
-       spot = chain.get("underlyingPrice")
-       if not spot or spot <= 0:
-           debug["no_spot"] += 1
-           return results, debug
+        annual_div, last_ex_div, next_ex_div_date, short_int = \
+            self._fetch_fundamentals(ticker, spot)
+        htb = short_int >= HTB_SHORT_INT_THRESHOLD
 
-       annual_div, last_ex_div, next_ex_div_date, short_int = \
-           self._fetch_fundamentals(ticker, spot)
-       htb = short_int >= HTB_SHORT_INT_THRESHOLD
+        all_exp_dates = (set(k.split(":")[0] for k in call_map) &
+                         set(k.split(":")[0] for k in put_map))
+        min_locked = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
 
-       call_map = chain.get("callExpDateMap", {})
-       put_map  = chain.get("putExpDateMap",  {})
-       if not call_map or not put_map:
-           debug["empty_chain"] += 1
-           return results, debug
+        call_key_map = {k.split(":")[0]: k for k in call_map}
+        put_key_map  = {k.split(":")[0]: k for k in put_map}
 
-       all_exp_dates = (set(k.split(":")[0] for k in call_map) &
-                        set(k.split(":")[0] for k in put_map))
-       min_locked = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
+        for exp_date in sorted(all_exp_dates):
+            try:
+                exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            dte = (exp_dt - datetime.utcnow()).days
+            if dte < DTE_MIN or dte > DTE_MAX:
+                debug["dte_out_of_range"] += 1
+                continue
 
-       # Pre-build key lookup dicts — avoids O(n) scan per expiry
-       call_key_map = {k.split(":")[0]: k for k in call_map}
-       put_key_map  = {k.split(":")[0]: k for k in put_map}
+            ck = call_key_map.get(exp_date)
+            pk = put_key_map.get(exp_date)
+            if not ck or not pk:
+                continue
 
-       for exp_date in sorted(all_exp_dates):
-           try:
-               exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
-           except ValueError:
-               continue
-           dte = (exp_dt - datetime.utcnow()).days
-           if dte < DTE_MIN or dte > DTE_MAX:
-               debug["dte_out_of_range"] += 1
-               continue
+            calls = call_map[ck]
+            puts  = put_map[pk]
 
-           ck = call_key_map.get(exp_date)
-           pk = put_key_map.get(exp_date)
-           if not ck or not pk:
-               continue
+            strikes_below = []
+            for s in calls:
+                try:
+                    fs = float(s)
+                    if fs < spot and s in puts:
+                        strikes_below.append(fs)
+                except ValueError:
+                    pass
+            strikes_below.sort(reverse=True)
+            strikes_below = strikes_below[:STRIKES_BELOW_SPOT]
 
-           calls = call_map[ck]
-           puts  = put_map[pk]
+            for strike in strikes_below:
+                debug["candidates"] += 1
+                strike_str = next(
+                    (s for s in calls if abs(float(s) - strike) < 0.001), None)
+                if not strike_str or strike_str not in puts:
+                    continue
 
-           strikes_below = []
-           for s in calls:
-               try:
-                   fs = float(s)
-                   if fs < spot and s in puts:
-                       strikes_below.append(fs)
-               except ValueError:
-                   pass
-           strikes_below.sort(reverse=True)
-           strikes_below = strikes_below[:STRIKES_BELOW_SPOT]
+                call_opt = (calls.get(strike_str) or [{}])[0]
+                put_opt  = (puts.get(strike_str)  or [{}])[0]
 
-           for strike in strikes_below:
-               debug["candidates"] += 1
-               strike_str = next(
-                   (s for s in calls if abs(float(s) - strike) < 0.001), None)
-               if not strike_str or strike_str not in puts:
-                   continue
+                if not _has_market(call_opt): debug["call_no_market"] += 1; continue
+                if not _has_market(put_opt):  debug["put_no_market"]  += 1; continue
+                if _oi(call_opt) < MIN_OI:    debug["call_oi_low"]    += 1; continue
+                if _oi(put_opt)  < MIN_OI:    debug["put_oi_low"]     += 1; continue
+                if _spread_pct(call_opt) > MAX_SPREAD_PCT: debug["call_spread_wide"] += 1; continue
+                if _spread_pct(put_opt)  > MAX_SPREAD_PCT: debug["put_spread_wide"]  += 1; continue
 
-               call_opt = (calls.get(strike_str) or [{}])[0]
-               put_opt  = (puts.get(strike_str)  or [{}])[0]
+                call_credit_p = _sell_price(call_opt)
+                put_cost_p    = _buy_price(put_opt)
+                net_credit_p, locked_p, locked_total_p, apy_p = \
+                    _locked_and_apy(spot, strike, call_credit_p, put_cost_p, dte)
 
-               if not _has_market(call_opt): debug["call_no_market"] += 1; continue
-               if not _has_market(put_opt):  debug["put_no_market"]  += 1; continue
-               if _oi(call_opt) < MIN_OI:    debug["call_oi_low"]    += 1; continue
-               if _oi(put_opt)  < MIN_OI:    debug["put_oi_low"]     += 1; continue
-               if _spread_pct(call_opt) > MAX_SPREAD_PCT: debug["call_spread_wide"] += 1; continue
-               if _spread_pct(put_opt)  > MAX_SPREAD_PCT: debug["put_spread_wide"]  += 1; continue
+                if locked_p < min_locked:
+                    debug["below_min_locked_after_comm"] += 1
+                    continue
 
-               call_credit_p = _sell_price(call_opt)
-               put_cost_p    = _buy_price(put_opt)
-               net_credit_p, locked_p, locked_total_p, apy_p = \
-                   _locked_and_apy(spot, strike, call_credit_p, put_cost_p, dte)
+                call_credit_f = _sell_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
+                put_cost_f    = _buy_price(put_opt,   extra_frac=FALLBACK_STEP_FRAC)
+                _, locked_f, locked_total_f, apy_f = \
+                    _locked_and_apy(spot, strike, call_credit_f, put_cost_f, dte)
 
-               if locked_p < min_locked:
-                   debug["below_min_locked_after_comm"] += 1
-                   continue
+                primary_debit  = spot - call_credit_p + put_cost_p
+                fallback_debit = spot - call_credit_f + put_cost_f
+                div_yield_pct  = (annual_div / spot * 100.0) if spot > 0 else 0.0
+                num_ex_divs    = _project_ex_div_dates(last_ex_div, freq, exp_dt)
+                in_window      = _ex_div_before_expiry(next_ex_div_date, exp_date)
 
-               call_credit_f = _sell_price(call_opt, extra_frac=FALLBACK_STEP_FRAC)
-               put_cost_f    = _buy_price(put_opt,   extra_frac=FALLBACK_STEP_FRAC)
-               _, locked_f, locked_total_f, apy_f = \
-                   _locked_and_apy(spot, strike, call_credit_f, put_cost_f, dte)
+                debug["passed"] += 1
+                results.append(dict(
+                    ticker=ticker, exp_date=exp_date, dte=dte,
+                    spot=round(spot, 2), strike=strike,
+                    call_credit=round(call_credit_p, 2),
+                    put_cost=round(put_cost_p, 2),
+                    net_credit=round(net_credit_p, 2),
+                    gap=round(spot - strike, 2),
+                    locked_profit=round(locked_p, 4),
+                    locked_total=round(locked_total_p, 2),
+                    locked_apy=round(apy_p, 1),
+                    primary_debit=round(primary_debit, 2),
+                    fallback_debit=round(fallback_debit, 2),
+                    fallback_locked_total=round(locked_total_f, 2),
+                    fallback_apy=round(apy_f, 1),
+                    cost_basis=round(spot - net_credit_p, 2),
+                    annual_div=round(annual_div, 2),
+                    div_yield_pct=round(div_yield_pct, 2),
+                    num_ex_divs=num_ex_divs,
+                    next_ex_div_date=next_ex_div_date,
+                    ex_div_in_window=in_window,
+                    short_int=round(short_int, 4),
+                    htb=htb,
+                    freq=freq,
+                    call_oi=_oi(call_opt), put_oi=_oi(put_opt),
+                    call_bid=_bid(call_opt), call_ask=_ask(call_opt),
+                    put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
+                    reverse=False,
+                    borrow_cost=0.0,
+                ))
 
-               primary_debit  = spot - call_credit_p + put_cost_p
-               fallback_debit = spot - call_credit_f + put_cost_f
-               div_yield_pct  = (annual_div / spot * 100.0) if spot > 0 else 0.0
-               num_ex_divs    = _project_ex_div_dates(last_ex_div, freq, exp_dt)
-               in_window      = _ex_div_before_expiry(next_ex_div_date, exp_date)
+        return results, debug
 
-               debug["passed"] += 1
-               results.append(dict(
-                   ticker=ticker, exp_date=exp_date, dte=dte,
-                   spot=round(spot, 2), strike=strike,
-                   call_credit=round(call_credit_p, 2),
-                   put_cost=round(put_cost_p, 2),
-                   net_credit=round(net_credit_p, 2),
-                   gap=round(spot - strike, 2),
-                   locked_profit=round(locked_p, 4),
-                   locked_total=round(locked_total_p, 2),
-                   locked_apy=round(apy_p, 1),
-                   primary_debit=round(primary_debit, 2),
-                   fallback_debit=round(fallback_debit, 2),
-                   fallback_locked_total=round(locked_total_f, 2),
-                   fallback_apy=round(apy_f, 1),
-                   cost_basis=round(spot - net_credit_p, 2),
-                   annual_div=round(annual_div, 2),
-                   div_yield_pct=round(div_yield_pct, 2),
-                   num_ex_divs=num_ex_divs,
-                   next_ex_div_date=next_ex_div_date,
-                   ex_div_in_window=in_window,
-                   short_int=round(short_int, 4),
-                   htb=htb,
-                   freq=freq,
-                   call_oi=_oi(call_opt), put_oi=_oi(put_opt),
-                   call_bid=_bid(call_opt), call_ask=_ask(call_opt),
-                   put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
-                   reverse=False,
-                   borrow_cost=0.0,
-               ))
+    def scan_ticker_reverse(self, ticker, skip_skew_filter: bool = False):
+        """
+        /itm r: strikes ABOVE spot where put_mid > call_mid.
+        Fetches chain once, checks put skew from that data, then scans.
+        Short stock + sell put + buy call.
+        Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
+        Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
+        """
+        results = []
+        debug   = Counter()
+        ticker  = ticker.upper()
+        freq    = self.ticker_freqs.get(ticker, "Q")
 
-       return results, debug
+        try:
+            chain = self.schwab.get_option_chain(ticker)
+        except Exception as e:
+            logger.error(f"[{ticker}] reverse scan chain fetch failed: {e}")
+            raise
 
-   def scan_ticker_reverse(self, ticker, skip_skew_filter: bool = False):
-       """
-       /itm r: strikes ABOVE spot where put_mid > call_mid.
-       Stage 1: put skew filter (skip if skip_skew_filter=True).
-       Stage 2: full chain scan.
-       Short stock + sell put + buy call.
-       Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
-       Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
-       Div cost: actual dividend payment deducted from locked profit when ex-div in window.
-       """
-       results = []
-       debug   = Counter()
-       ticker  = ticker.upper()
-       freq    = self.ticker_freqs.get(ticker, "Q")
+        spot = chain.get("underlyingPrice")
+        if not spot or spot <= 0:
+            debug["no_spot"] += 1
+            return results, debug
 
-       # Stage 1 — put skew filter
-       if not skip_skew_filter and not self._has_put_skew(ticker):
-           debug["skew_filtered"] += 1
-           return results, debug
+        call_map = chain.get("callExpDateMap", {})
+        put_map  = chain.get("putExpDateMap",  {})
+        if not call_map or not put_map:
+            debug["empty_chain"] += 1
+            return results, debug
 
-       try:
-           chain = self.schwab.get_option_chain(ticker)
-       except Exception as e:
-           logger.error(f"[{ticker}] reverse scan chain fetch failed: {e}")
-           raise
+        # Stage 1 — put skew filter (uses already-fetched chain data)
+        if not skip_skew_filter and not _has_put_skew(call_map, put_map, spot):
+            debug["skew_filtered"] += 1
+            return results, debug
 
-       spot = chain.get("underlyingPrice")
-       if not spot or spot <= 0:
-           debug["no_spot"] += 1
-           return results, debug
+        annual_div, last_ex_div, next_ex_div_date, short_int = \
+            self._fetch_fundamentals(ticker, spot)
+        htb = short_int >= HTB_SHORT_INT_THRESHOLD
 
-       annual_div, last_ex_div, next_ex_div_date, short_int = \
-           self._fetch_fundamentals(ticker, spot)
-       htb = short_int >= HTB_SHORT_INT_THRESHOLD
+        all_exp_dates = (set(k.split(":")[0] for k in call_map) &
+                         set(k.split(":")[0] for k in put_map))
+        min_locked = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
 
-       call_map = chain.get("callExpDateMap", {})
-       put_map  = chain.get("putExpDateMap",  {})
-       if not call_map or not put_map:
-           debug["empty_chain"] += 1
-           return results, debug
+        call_key_map = {k.split(":")[0]: k for k in call_map}
+        put_key_map  = {k.split(":")[0]: k for k in put_map}
 
-       all_exp_dates = (set(k.split(":")[0] for k in call_map) &
-                        set(k.split(":")[0] for k in put_map))
-       min_locked = MIN_LOCKED_AFTER_COMM_PER_CONTRACT / 100.0
+        for exp_date in sorted(all_exp_dates):
+            try:
+                exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+            dte = (exp_dt - datetime.utcnow()).days
+            if dte < DTE_MIN or dte > REVERSE_DTE_MAX:
+                debug["dte_out_of_range"] += 1
+                continue
 
-       # Pre-build key lookup dicts — avoids O(n) scan per expiry
-       call_key_map = {k.split(":")[0]: k for k in call_map}
-       put_key_map  = {k.split(":")[0]: k for k in put_map}
+            ck = call_key_map.get(exp_date)
+            pk = put_key_map.get(exp_date)
+            if not ck or not pk:
+                continue
 
-       for exp_date in sorted(all_exp_dates):
-           try:
-               exp_dt = datetime.strptime(exp_date, "%Y-%m-%d")
-           except ValueError:
-               continue
-           dte = (exp_dt - datetime.utcnow()).days
-           if dte < DTE_MIN or dte > REVERSE_DTE_MAX:
-               debug["dte_out_of_range"] += 1
-               continue
+            calls = call_map[ck]
+            puts  = put_map[pk]
 
-           ck = call_key_map.get(exp_date)
-           pk = put_key_map.get(exp_date)
-           if not ck or not pk:
-               continue
+            borrow_cost = spot * REVERSE_BORROW_RATE * (dte / 365.0)
 
-           calls = call_map[ck]
-           puts  = put_map[pk]
+            strikes_above = []
+            for s in calls:
+                try:
+                    fs = float(s)
+                    if fs > spot and s in puts:
+                        strikes_above.append(fs)
+                except ValueError:
+                    pass
+            strikes_above.sort()
+            strikes_above = strikes_above[:STRIKES_ABOVE_SPOT_REVERSE]
 
-           # Borrow cost for this expiry
-           borrow_cost = spot * REVERSE_BORROW_RATE * (dte / 365.0)
+            for strike in strikes_above:
+                debug["candidates"] += 1
+                strike_str = next(
+                    (s for s in calls if abs(float(s) - strike) < 0.001), None)
+                if not strike_str or strike_str not in puts:
+                    continue
 
-           strikes_above = []
-           for s in calls:
-               try:
-                   fs = float(s)
-                   if fs > spot and s in puts:
-                       strikes_above.append(fs)
-               except ValueError:
-                   pass
-           strikes_above.sort()
-           strikes_above = strikes_above[:STRIKES_ABOVE_SPOT_REVERSE]
+                call_opt = (calls.get(strike_str) or [{}])[0]
+                put_opt  = (puts.get(strike_str)  or [{}])[0]
 
-           for strike in strikes_above:
-               debug["candidates"] += 1
-               strike_str = next(
-                   (s for s in calls if abs(float(s) - strike) < 0.001), None)
-               if not strike_str or strike_str not in puts:
-                   continue
+                if not _has_market(call_opt): debug["call_no_market"] += 1; continue
+                if not _has_market(put_opt):  debug["put_no_market"]  += 1; continue
+                if _oi(call_opt) < MIN_OI:    debug["call_oi_low"]    += 1; continue
+                if _oi(put_opt)  < MIN_OI:    debug["put_oi_low"]     += 1; continue
+                if _spread_pct(call_opt) > MAX_SPREAD_PCT: debug["call_spread_wide"] += 1; continue
+                if _spread_pct(put_opt)  > MAX_SPREAD_PCT: debug["put_spread_wide"]  += 1; continue
 
-               call_opt = (calls.get(strike_str) or [{}])[0]
-               put_opt  = (puts.get(strike_str)  or [{}])[0]
+                put_mid  = (_bid(put_opt)  + _ask(put_opt))  / 2.0
+                call_mid = (_bid(call_opt) + _ask(call_opt)) / 2.0
+                if put_mid <= call_mid:
+                    debug["no_put_skew"] += 1
+                    continue
 
-               if not _has_market(call_opt): debug["call_no_market"] += 1; continue
-               if not _has_market(put_opt):  debug["put_no_market"]  += 1; continue
-               if _oi(call_opt) < MIN_OI:    debug["call_oi_low"]    += 1; continue
-               if _oi(put_opt)  < MIN_OI:    debug["put_oi_low"]     += 1; continue
-               if _spread_pct(call_opt) > MAX_SPREAD_PCT: debug["call_spread_wide"] += 1; continue
-               if _spread_pct(put_opt)  > MAX_SPREAD_PCT: debug["put_spread_wide"]  += 1; continue
+                put_credit_p = _sell_price(put_opt)
+                call_cost_p  = _buy_price(call_opt)
+                net_credit_p = put_credit_p - call_cost_p
 
-               put_mid  = (_bid(put_opt)  + _ask(put_opt))  / 2.0
-               call_mid = (_bid(call_opt) + _ask(call_opt)) / 2.0
-               if put_mid <= call_mid:
-                   debug["no_put_skew"] += 1
-                   continue
+                gap = strike - spot
+                commission_per_share = COMMISSION_PER_CONTRACT / 100.0
 
-               put_credit_p = _sell_price(put_opt)
-               call_cost_p  = _buy_price(call_opt)
-               net_credit_p = put_credit_p - call_cost_p
+                in_window = _ex_div_before_expiry(next_ex_div_date, exp_date)
 
-               gap = strike - spot
-               commission_per_share = COMMISSION_PER_CONTRACT / 100.0
+                div_cost = 0.0
+                if in_window and annual_div > 0:
+                    cycles = {"M": 12, "Q": 4, "S": 2, "A": 1, "W": 52}.get(freq, 4)
+                    div_cost = annual_div / cycles
 
-               in_window = _ex_div_before_expiry(next_ex_div_date, exp_date)
+                locked_p = (net_credit_p - gap - commission_per_share
+                            - borrow_cost - div_cost)
+                if locked_p < min_locked:
+                    debug["below_min_locked_after_comm"] += 1
+                    continue
 
-               div_cost = 0.0
-               if in_window and annual_div > 0:
-                   cycles = {"M": 12, "Q": 4, "S": 2, "A": 1, "W": 52}.get(freq, 4)
-                   div_cost = annual_div / cycles
+                apy_p = (locked_p / spot) * (365.0 / dte) * 100.0 \
+                    if spot > 0 and dte > 0 else 0.0
 
-               locked_p = (net_credit_p - gap - commission_per_share
-                           - borrow_cost - div_cost)
-               if locked_p < min_locked:
-                   debug["below_min_locked_after_comm"] += 1
-                   continue
+                put_credit_f = _sell_price(put_opt,  extra_frac=FALLBACK_STEP_FRAC)
+                call_cost_f  = _buy_price(call_opt,  extra_frac=FALLBACK_STEP_FRAC)
+                net_credit_f = put_credit_f - call_cost_f
+                locked_f     = (net_credit_f - gap - commission_per_share
+                                - borrow_cost - div_cost)
+                apy_f = (locked_f / spot) * (365.0 / dte) * 100.0 \
+                    if locked_f > 0 and spot > 0 and dte > 0 else 0.0
 
-               apy_p = (locked_p / spot) * (365.0 / dte) * 100.0 \
-                   if spot > 0 and dte > 0 else 0.0
+                div_yield_pct = (annual_div / spot * 100.0) if spot > 0 else 0.0
+                num_ex_divs   = _project_ex_div_dates(last_ex_div, freq, exp_dt)
 
-               put_credit_f = _sell_price(put_opt,  extra_frac=FALLBACK_STEP_FRAC)
-               call_cost_f  = _buy_price(call_opt,  extra_frac=FALLBACK_STEP_FRAC)
-               net_credit_f = put_credit_f - call_cost_f
-               locked_f     = (net_credit_f - gap - commission_per_share
-                               - borrow_cost - div_cost)
-               apy_f = (locked_f / spot) * (365.0 / dte) * 100.0 \
-                   if locked_f > 0 and spot > 0 and dte > 0 else 0.0
+                debug["passed"] += 1
+                results.append(dict(
+                    ticker=ticker, exp_date=exp_date, dte=dte,
+                    spot=round(spot, 2), strike=strike,
+                    call_credit=round(call_cost_p, 2),
+                    put_cost=round(put_credit_p, 2),
+                    net_credit=round(net_credit_p, 2),
+                    gap=round(gap, 2),
+                    locked_profit=round(locked_p, 4),
+                    locked_total=round(locked_p * 100, 2),
+                    locked_apy=round(apy_p, 1),
+                    primary_debit=round(spot - net_credit_p, 2),
+                    fallback_debit=round(spot - net_credit_f, 2),
+                    fallback_locked_total=round(locked_f * 100, 2),
+                    fallback_apy=round(apy_f, 1),
+                    cost_basis=round(spot, 2),
+                    annual_div=round(annual_div, 2),
+                    div_yield_pct=round(div_yield_pct, 2),
+                    num_ex_divs=num_ex_divs,
+                    next_ex_div_date=next_ex_div_date,
+                    ex_div_in_window=in_window,
+                    short_int=round(short_int, 4),
+                    htb=htb,
+                    freq=freq,
+                    call_oi=_oi(call_opt), put_oi=_oi(put_opt),
+                    call_bid=_bid(call_opt), call_ask=_ask(call_opt),
+                    put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
+                    reverse=True,
+                    borrow_cost=round(borrow_cost, 4),
+                    div_cost=round(div_cost, 4),
+                ))
 
-               div_yield_pct = (annual_div / spot * 100.0) if spot > 0 else 0.0
-               num_ex_divs   = _project_ex_div_dates(last_ex_div, freq, exp_dt)
+        return results, debug
 
-               debug["passed"] += 1
-               results.append(dict(
-                   ticker=ticker, exp_date=exp_date, dte=dte,
-                   spot=round(spot, 2), strike=strike,
-                   call_credit=round(call_cost_p, 2),
-                   put_cost=round(put_credit_p, 2),
-                   net_credit=round(net_credit_p, 2),
-                   gap=round(gap, 2),
-                   locked_profit=round(locked_p, 4),
-                   locked_total=round(locked_p * 100, 2),
-                   locked_apy=round(apy_p, 1),
-                   primary_debit=round(spot - net_credit_p, 2),
-                   fallback_debit=round(spot - net_credit_f, 2),
-                   fallback_locked_total=round(locked_f * 100, 2),
-                   fallback_apy=round(apy_f, 1),
-                   cost_basis=round(spot, 2),
-                   annual_div=round(annual_div, 2),
-                   div_yield_pct=round(div_yield_pct, 2),
-                   num_ex_divs=num_ex_divs,
-                   next_ex_div_date=next_ex_div_date,
-                   ex_div_in_window=in_window,
-                   short_int=round(short_int, 4),
-                   htb=htb,
-                   freq=freq,
-                   call_oi=_oi(call_opt), put_oi=_oi(put_opt),
-                   call_bid=_bid(call_opt), call_ask=_ask(call_opt),
-                   put_bid=_bid(put_opt),  put_ask=_ask(put_opt),
-                   reverse=True,
-                   borrow_cost=round(borrow_cost, 4),
-                   div_cost=round(div_cost, 4),
-               ))
+    @staticmethod
+    def format_hit(r):
+        freq_label = {
+            "M": "monthly", "Q": "quarterly", "W": "weekly",
+            "S": "semi-annual", "A": "annual", "?": "unknown",
+        }.get(r.get("freq", "?"), r.get("freq", "?"))
 
-       return results, debug
+        ex_div_line = ""
+        if r.get("ex_div_in_window"):
+            ex_date = r.get("next_ex_div_date", "")
+            if r.get("reverse"):
+                div_cost = r.get("div_cost", 0)
+                div_str = f" · div −${div_cost:.2f}/sh" if div_cost > 0 else ""
+                ex_div_line = (
+                    f"  🚨 EX-DIV {ex_date} BEFORE EXPIRY — "
+                    f"you PAY dividend (short stock){div_str}\n"
+                )
+            else:
+                ex_div_line = (
+                    f"  ⚠️ Ex-div {ex_date} before expiry — early assignment risk\n"
+                )
+        elif r.get("annual_div", 0) > 0:
+            ex_date = r.get("next_ex_div_date", "")
+            ex_date_str = f" · next ex-div: {ex_date}" if ex_date else ""
+            ex_div_line = (
+                f"  💸 Div: ${r['annual_div']}/yr ({r['div_yield_pct']}%) · "
+                f"paid {freq_label} · {r['num_ex_divs']} ex-div in window{ex_date_str}\n"
+            )
 
-   @staticmethod
-   def format_hit(r):
-       freq_label = {
-           "M": "monthly", "Q": "quarterly", "W": "weekly",
-           "S": "semi-annual", "A": "annual", "?": "unknown",
-       }.get(r.get("freq", "?"), r.get("freq", "?"))
+        htb_line = ""
+        if r.get("htb"):
+            pct = round(r.get("short_int", 0) * 100, 1)
+            htb_line = f"  ⚠️ HTB? Short interest {pct}% of float\n"
 
-       ex_div_line = ""
-       if r.get("ex_div_in_window"):
-           ex_date = r.get("next_ex_div_date", "")
-           if r.get("reverse"):
-               div_cost = r.get("div_cost", 0)
-               div_str = f" · div −${div_cost:.2f}/sh" if div_cost > 0 else ""
-               ex_div_line = (
-                   f"  🚨 EX-DIV {ex_date} BEFORE EXPIRY — "
-                   f"you PAY dividend (short stock){div_str}\n"
-               )
-           else:
-               ex_div_line = (
-                   f"  ⚠️ Ex-div {ex_date} before expiry — early assignment risk\n"
-               )
-       elif r.get("annual_div", 0) > 0:
-           ex_date = r.get("next_ex_div_date", "")
-           ex_date_str = f" · next ex-div: {ex_date}" if ex_date else ""
-           ex_div_line = (
-               f"  💸 Div: ${r['annual_div']}/yr ({r['div_yield_pct']}%) · "
-               f"paid {freq_label} · {r['num_ex_divs']} ex-div in window{ex_date_str}\n"
-           )
+        borrow_line = ""
+        if r.get("reverse") and r.get("borrow_cost", 0) > 0:
+            borrow_line = (
+                f"  🏦 Borrow cost (20% APR): −${r['borrow_cost']:.2f}/sh\n"
+            )
 
-       htb_line = ""
-       if r.get("htb"):
-           pct = round(r.get("short_int", 0) * 100, 1)
-           htb_line = f"  ⚠️ HTB? Short interest {pct}% of float\n"
+        return (
+            f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
+            f"  📅 {r['exp_date']} ({r['dte']}d)\n"
+            f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
+            f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
+            f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
+            f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
+            f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
+            f"{borrow_line}"
+            f"{ex_div_line}"
+            f"{htb_line}"
+            f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
+        )
 
-       borrow_line = ""
-       if r.get("reverse") and r.get("borrow_cost", 0) > 0:
-           borrow_line = (
-               f"  🏦 Borrow cost (20% APR): −${r['borrow_cost']:.2f}/sh\n"
-           )
+    @staticmethod
+    def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
+        header = (
+            f"🔒 *ITM Conversion Scan*\n"
+            f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
+            f"Strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} both legs · "
+            f"spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
+            f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after "
+            f"${COMMISSION_PER_CONTRACT:g} comm\n"
+            f"_Best at BOTTOM_\n"
+        )
+        if debug_totals:
+            d = debug_totals
+            header += (
+                f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
+                f"  · skew filtered:    {d.get('skew_filtered', 0):,}\n"
+                f"  · call no market:   {d.get('call_no_market', 0):,}\n"
+                f"  · put no market:    {d.get('put_no_market', 0):,}\n"
+                f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"
+                f"  · put OI < {MIN_OI}:     {d.get('put_oi_low', 0):,}\n"
+                f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
+                f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
+                f"  · below min profit: {d.get('below_min_locked_after_comm', 0):,}\n"
+                f"  · ✅ passed:        {d.get('passed', 0):,}\n"
+            )
+        header += f"\nOpportunities: *{len(all_hits)}*\n"
+        if errors:
+            err_block = "\n".join(f"  • {e}" for e in errors[:20])
+            if len(err_block) > 1500:
+                tickers_only = ", ".join(e.split(":")[0] for e in errors)
+                err_block = f"  {tickers_only}\n_(use_ `/logs` _for details)_"
+            header += f"\n⚠️ *Errors:*\n{err_block}\n"
+        header += "━━━━━━━━━━━━━━━━━━━━━━\n"
 
-       return (
-           f"🔒 *{r['ticker']}* @ ${r['spot']}\n"
-           f"  📅 {r['exp_date']} ({r['dte']}d)\n"
-           f"  📞 Sell C ${r['strike']:g} @ ${r['call_credit']}\n"
-           f"  🛡️ Buy  P ${r['strike']:g} @ ${r['put_cost']}\n"
-           f"  💵 Net credit: ${r['net_credit']}/sh · Gap: ${r['gap']}/sh\n"
-           f"  💳 Pay ${r['primary_debit']}/sh net → *{r['locked_apy']}% APY* (${r['locked_total']:.0f})\n"
-           f"  🔄 If unfilled, pay ${r['fallback_debit']}/sh → {r['fallback_apy']}% APY (${r['fallback_locked_total']:.0f})\n"
-           f"{borrow_line}"
-           f"{ex_div_line}"
-           f"{htb_line}"
-           f"  📊 OI call/put: {r['call_oi']}/{r['put_oi']}"
-       )
+        if not all_hits:
+            return [header + "_No fillable conversions found._"]
 
-   @staticmethod
-   def format_summary(all_hits, scanned, successful, errors, debug_totals=None):
-       header = (
-           f"🔒 *ITM Conversion Scan*\n"
-           f"Tickers: {scanned} · ✅ {successful} scanned · ⚠️ {len(errors)} errored\n"
-           f"Strike < spot · {DTE_MIN}-{DTE_MAX}d · OI ≥ {MIN_OI} both legs · "
-           f"spread ≤ {int(MAX_SPREAD_PCT*100)}%\n"
-           f"Min ${MIN_LOCKED_AFTER_COMM_PER_CONTRACT:g} profit/spread after "
-           f"${COMMISSION_PER_CONTRACT:g} comm\n"
-           f"_Best at BOTTOM_\n"
-       )
-       if debug_totals:
-           d = debug_totals
-           header += (
-               f"\n🔬 *Debug — candidates: {d.get('candidates', 0):,}*\n"
-               f"  · skew filtered:    {d.get('skew_filtered', 0):,}\n"
-               f"  · call no market:   {d.get('call_no_market', 0):,}\n"
-               f"  · put no market:    {d.get('put_no_market', 0):,}\n"
-               f"  · call OI < {MIN_OI}:    {d.get('call_oi_low', 0):,}\n"
-               f"  · put OI < {MIN_OI}:     {d.get('put_oi_low', 0):,}\n"
-               f"  · call spread wide: {d.get('call_spread_wide', 0):,}\n"
-               f"  · put spread wide:  {d.get('put_spread_wide', 0):,}\n"
-               f"  · below min profit: {d.get('below_min_locked_after_comm', 0):,}\n"
-               f"  · ✅ passed:        {d.get('passed', 0):,}\n"
-           )
-       header += f"\nOpportunities: *{len(all_hits)}*\n"
-       if errors:
-           err_block = "\n".join(f"  • {e}" for e in errors[:20])
-           if len(err_block) > 1500:
-               tickers_only = ", ".join(e.split(":")[0] for e in errors)
-               err_block = f"  {tickers_only}\n_(use_ `/logs` _for details)_"
-           header += f"\n⚠️ *Errors:*\n{err_block}\n"
-       header += "━━━━━━━━━━━━━━━━━━━━━━\n"
+        all_hits.sort(key=_sort_key)
 
-       if not all_hits:
-           return [header + "_No fillable conversions found._"]
-
-       all_hits.sort(key=_sort_key)
-
-       chunks, current = [], header
-       for hit in all_hits:
-           block = ItmScanner.format_hit(hit) + "\n\n"
-           if len(current) + len(block) > 3800:
-               chunks.append(current.rstrip())
-               current = ""
-           current += block
-       if current.strip():
-           chunks.append(current.rstrip())
-       return chunks
+        chunks, current = [], header
+        for hit in all_hits:
+            block = ItmScanner.format_hit(hit) + "\n\n"
+            if len(current) + len(block) > 3800:
+                chunks.append(current.rstrip())
+                current = ""
+            current += block
+        if current.strip():
+            chunks.append(current.rstrip())
+        return chunks

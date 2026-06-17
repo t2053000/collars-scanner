@@ -43,8 +43,8 @@ REVERSE_BORROW_RATE                = 0.20
 # IV skew filter thresholds
 # put/call IV ratio > PUT_SKEW_MIN  → has put skew  (good for /itm r)
 # put/call IV ratio < CALL_SKEW_MAX → has call skew (good for /itm normal)
-PUT_SKEW_MIN  = 1.05   # put IV at least 5% above call IV
-CALL_SKEW_MAX = 0.95   # call IV at least 5% above put IV
+PUT_SKEW_MIN  = 1.00   # put IV at least 5% above call IV
+CALL_SKEW_MAX = 1.00   # call IV at least 5% above put IV
 
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}

@@ -28,6 +28,7 @@ from csp      import CspScanner
 from itm      import ItmScanner
 from ritm     import RitmScanner
 from itm_ibkr import ItmIbkrScanner
+from positions import compute_positions
 import orders
 
 logger = logging.getLogger(__name__)
@@ -140,6 +141,7 @@ async def cmd_start(update, context):
     await update.message.reply_text(
         "👋 *Options Scanner Bot*\n\n"
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm` `/itmib`\n"
+        "`/positions` — P/L for positions expiring this Friday\n"
         "Send `/help` for all commands.",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -149,13 +151,14 @@ async def cmd_help(update, context):
     await update.message.reply_text(
         "*Commands*\n"
         "`/scan` `/spreads` `/deepcall` `/dca` `/csp` `/itm` `/ritm` `/itmib`\n"
-        "`/list` `/add` `/remove` `/logs` `/whoami`\n"
+        "`/positions` `/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
         "*Trading:*\n"
         "· `/itm` — tap Confirm to place order instantly\n"
         "· `/itm r` — reverse ITM scan via Schwab\n"
         "· `/itmib` — reverse ITM scan via IBKR (better data)\n"
         "· `/dca` — tap Confirm to place order instantly\n"
+        "· `/positions` — projected P/L at expiry (this Friday)\n"
         "_Borrow cost (20% APR) deducted from /itm r APY._",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -210,6 +213,26 @@ async def cmd_logs(update, context):
         "*Recent errors:*\n```\n" + body + "\n```",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+# ---------------------------------------------------------------------------
+# Positions command
+# ---------------------------------------------------------------------------
+
+@authorized_only
+async def cmd_positions(update, context):
+    """Show all positions expiring this Friday with projected P/L and APY."""
+    user_id = update.effective_user.id
+    schwab  = _get_schwab_for_user(context, user_id)
+    msg     = await update.message.reply_text("📊 Fetching positions…")
+    loop    = asyncio.get_running_loop()
+    try:
+        raw  = await loop.run_in_executor(None, schwab.get_positions)
+        text = await loop.run_in_executor(None, compute_positions, raw)
+        await _edit_robust(msg, text)
+    except Exception as e:
+        logger.exception("cmd_positions failed")
+        await _edit_robust(msg, f"❌ Error fetching positions: {type(e).__name__}: {str(e)[:300]}")
 
 
 # ---------------------------------------------------------------------------
@@ -692,7 +715,6 @@ async def cb_confirm_trade(update, context):
 
 @authorized_callback
 async def cb_cancel_trade(update, context):
-    """User tapped Cancel on ITM button — discard silently."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -708,7 +730,6 @@ async def cb_cancel_trade(update, context):
 
 @authorized_callback
 async def cb_confirm_dca(update, context):
-    """User tapped Confirm on DCA button — submit order immediately."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -771,7 +792,6 @@ async def cb_confirm_dca(update, context):
 
 @authorized_callback
 async def cb_cancel_dca(update, context):
-    """User tapped Cancel on DCA button — discard silently."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -787,7 +807,6 @@ async def cb_cancel_dca(update, context):
 
 @authorized_callback
 async def cb_confirm_rtrade(update, context):
-    """User tapped Confirm R — submit 2-leg options order, monitor for fill."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -852,7 +871,6 @@ async def cb_confirm_rtrade(update, context):
 
 @authorized_callback
 async def cb_cancel_rtrade(update, context):
-    """User tapped Cancel on reverse ITM button — discard silently."""
     query    = update.callback_query
     user_id  = update.effective_user.id
     trade_id = query.data.split(":", 1)[1]
@@ -935,11 +953,10 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM (auto-short on fill, auto-cancel if not filled)
+# Order monitoring — Reverse ITM
 # ---------------------------------------------------------------------------
 
 async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
-    """Monitor reverse ITM options order. On fill auto-place short. If not filled auto-cancel."""
     logger.info(f"monitor_rtrade_order START: user={user_id} order={order_id}")
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
@@ -1171,7 +1188,11 @@ def build_app(telegram_token,
     app.bot_data["ritm_scanner"]      = ritm_scanner
     app.bot_data["schwab_clients"]    = schwab_clients
     app.bot_data["primary_user_id"]   = primary_user_id
-    app.bot_data["itm_ibkr_scanner"]  = itm_ibkr_scanner  # None if unavailable
+    app.bot_data["itm_ibkr_scanner"]  = itm_ibkr_scanner
+
+    # Also expose primary schwab client directly for positions command
+    primary_schwab = schwab_clients.get(primary_user_id)
+    app.bot_data["schwab_client"] = primary_schwab
 
     app.add_handler(CommandHandler("start",         cmd_start))
     app.add_handler(CommandHandler("help",          cmd_help))
@@ -1188,23 +1209,17 @@ def build_app(telegram_token,
     app.add_handler(CommandHandler("itm",           cmd_itm))
     app.add_handler(CommandHandler("ritm",          cmd_ritm))
     app.add_handler(CommandHandler("itmib",         cmd_itmib))
+    app.add_handler(CommandHandler("positions",     cmd_positions))
     app.add_handler(CommandHandler("logs",          cmd_logs))
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
 
-    # ITM inline confirm/cancel (no typing)
     app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))
-
-    # DCA inline confirm/cancel (no typing)
     app.add_handler(CallbackQueryHandler(cb_confirm_dca,    pattern=r"^confirm_dca:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_dca,     pattern=r"^cancel_dca:"))
-
-    # Reverse ITM inline confirm/cancel (no typing)
     app.add_handler(CallbackQueryHandler(cb_confirm_rtrade, pattern=r"^confirm_rtrade:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_rtrade,  pattern=r"^cancel_rtrade:"))
-
-    # Improve / Cancel active orders
     app.add_handler(CallbackQueryHandler(cb_improve, pattern=r"^improve:"))
     app.add_handler(CallbackQueryHandler(cb_cancel,  pattern=r"^cancel:"))
 
@@ -1216,7 +1231,7 @@ def build_app(telegram_token,
 
 
 # ---------------------------------------------------------------------------
-# Text reply handler (legacy YES TICKER fallback — kept for safety)
+# Text reply handler (legacy YES TICKER fallback)
 # ---------------------------------------------------------------------------
 
 async def handle_yes_reply(update, context):

@@ -43,17 +43,11 @@ class IbkrClient:
         self._connected = False
 
     def connect(self):
-        # Fix for asyncio in threads
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-
         if self._connected:
             return
         try:
             self._ib.connect(self.host, self.port, clientId=self.client_id,
-                             timeout=10, readonly=True)
+                             timeout=10)
             self._connected = True
             logger.info(f"IbkrClient connected to {self.host}:{self.port} "
                         f"clientId={self.client_id}")
@@ -68,6 +62,10 @@ class IbkrClient:
             logger.info("IbkrClient disconnected")
 
     def _ensure_connected(self):
+        try:
+            asyncio.get_event_loop()
+        except RuntimeError:
+            asyncio.set_event_loop(asyncio.new_event_loop())
         if not self._connected or not self._ib.isConnected():
             self.connect()
 
@@ -92,12 +90,6 @@ class IbkrClient:
         Returns dict in same format as Schwab's get_option_chain response
         so scan_ticker_reverse can consume it identically.
         """
-        # Fix for asyncio in threads
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-
         with self._lock:
             self._ensure_connected()
             stock = Stock(ticker, "SMART", "USD")
@@ -186,12 +178,6 @@ class IbkrClient:
         Check if shares are available to short and get borrow rate.
         Returns {"available": bool, "borrow_rate_pct": float}
         """
-        # Fix for asyncio in threads
-        try:
-            asyncio.get_event_loop()
-        except RuntimeError:
-            asyncio.set_event_loop(asyncio.new_event_loop())
-
         with self._lock:
             self._ensure_connected()
             try:

@@ -4,17 +4,20 @@ ITM Conversion scanner — own stock + sell ITM call + buy same-strike put.
 Commission-aware, fillability-filtered, with primary + fallback pricing.
 Includes reverse mode (scan_ticker_reverse) for /itm r.
 
-IV skew filter — uses already-fetched chain data, zero extra API calls:
-  /itm normal:  skip tickers where puts are much more expensive than calls
-                (put/call IV ratio > CALL_SKEW_MAX means calls are cheap → bad for selling calls)
-  /itm r:       skip tickers where puts are NOT more expensive than calls
-                (put/call IV ratio < PUT_SKEW_MIN means no put skew → bad for selling puts)
+Two-stage scanning:
+  Stage 1 (fast pre-filter):
+    Fetch lightweight chain (strike_count=4, narrow date window).
+    /itm normal:  nearest strike BELOW spot — is call mid > put mid?
+    /itm r:       nearest strike ABOVE spot — is put mid > call mid?
+    Skip tickers that fail. ~350 lightweight calls.
+  Stage 2 (full scan):
+    Fetch full chain (strike_count=30, 800d) only for survivors.
+    Run existing APY calculation. ~30-80 full calls.
 
 Sorting: best APY at bottom (shown last = closest to message field on phone).
 Ex-div in window:
  - /itm normal: flagged, deprioritized by div_yield_apy_pts
  - /itm r:      flagged with red warning, deprioritized by 25 APY points
-                (you are SHORT stock so you PAY the dividend)
 Borrow cost:
  - /itm r only: 20% APR applied to spot × dte/365, deducted from locked profit
 """
@@ -27,9 +30,9 @@ logger = logging.getLogger(__name__)
 
 DTE_MIN                            = 1
 DTE_MAX                            = 45
-REVERSE_DTE_MAX                    = 14   # borrow cost kills edge beyond 14d
+REVERSE_DTE_MAX                    = 14
 STRIKES_BELOW_SPOT                 = 4
-STRIKES_ABOVE_SPOT_REVERSE         = 2    # nearest 2 strikes capture most reverse edge
+STRIKES_ABOVE_SPOT_REVERSE         = 2
 MID_ADJUST_FRAC                    = 0.15
 FALLBACK_STEP_FRAC                 = 0.15
 MIN_OI                             = 50
@@ -39,23 +42,6 @@ MIN_LOCKED_AFTER_COMM_PER_CONTRACT = 5.0
 HTB_SHORT_INT_THRESHOLD            = 0.20
 REVERSE_EX_DIV_APY_PENALTY         = 25.0
 REVERSE_BORROW_RATE                = 0.20
-
-# IV skew filter thresholds (applied to already-fetched chain data)
-# put/call IV ratio = put_iv / call_iv
-#
-# /itm normal — we SELL calls, so we want calls to be expensive.
-#   Filter OUT tickers where put IV >> call IV (puts much more expensive than calls).
-#   Keep tickers where ratio <= CALL_SKEW_MAX (calls not too cheap relative to puts).
-#   Typical market: ratio ~1.05-1.15. Set max to 1.20 — only filter extreme put skew.
-#
-# /itm r — we SELL puts, so we want puts to be expensive.
-#   Filter OUT tickers where put IV is not elevated above call IV.
-#   Keep tickers where ratio >= PUT_SKEW_MIN (puts meaningfully more expensive than calls).
-#   Set min to 1.05 — require at least 5% put premium over calls.
-
-CALL_SKEW_MAX = 1.20   # /itm normal:  filter if put IV > 120% of call IV
-PUT_SKEW_MIN  = 1.05   # /itm r:       filter if put IV < 105% of call IV
-
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
 
@@ -72,6 +58,9 @@ def _bid(option):
 
 def _ask(option):
     return float(option.get("ask") or 0.0)
+
+def _mid(option):
+    return (_bid(option) + _ask(option)) / 2.0
 
 def _oi(option):
     return int(option.get("openInterest") or 0)
@@ -93,60 +82,64 @@ def _buy_price(option, extra_frac=0.0):
 
 
 # ---------------------------------------------------------------------------
-# IV skew helpers — operate on already-fetched chain data, zero extra API calls
+# Stage 1 skew pre-filters
 # ---------------------------------------------------------------------------
 
-def _chain_put_call_iv_ratio(call_map, put_map, spot):
+def _check_put_skew(call_map: dict, put_map: dict, spot: float) -> bool:
+    """
+    /itm r pre-filter: at nearest strike ABOVE spot, is put mid > call mid?
+    Checks first expiry with valid data.
+    Returns True (pass through) if skew found or no valid data available.
+    """
     for exp_key in sorted(call_map.keys()):
         calls = call_map[exp_key]
         puts  = put_map.get(exp_key, {})
-        common = set(calls.keys()) & set(puts.keys())
-        if not common:
+        strikes_above = sorted(
+            [float(s) for s in calls if s in puts and float(s) > spot]
+        )
+        if not strikes_above:
             continue
-        atm = min(common, key=lambda s: abs(float(s) - spot))
-        c = (calls.get(atm) or [{}])[0]
-        p = (puts.get(atm)  or [{}])[0]
-        call_bid = float(c.get("bid") or 0)
-        call_ask = float(c.get("ask") or 0)
-        put_bid  = float(p.get("bid") or 0)
-        put_ask  = float(p.get("ask") or 0)
-        if call_bid <= 0 or call_ask <= 0 or put_bid <= 0 or put_ask <= 0:
+        strike_str = next(
+            (s for s in calls if abs(float(s) - strikes_above[0]) < 0.001), None)
+        if not strike_str:
             continue
-        call_mid = (call_bid + call_ask) / 2
-        put_mid  = (put_bid  + put_ask)  / 2
-        if call_mid <= 0:
+        call_opt = (calls.get(strike_str) or [{}])[0]
+        put_opt  = (puts.get(strike_str)  or [{}])[0]
+        call_mid = _mid(call_opt)
+        put_mid  = _mid(put_opt)
+        if call_mid <= 0 or put_mid <= 0:
             continue
-        return put_mid / call_mid
-    return None
+        return put_mid > call_mid
+    return True  # no valid data → pass through
 
 
-
-def _passes_call_skew_filter(call_map: dict, put_map: dict, spot: float) -> bool:
+def _check_call_skew(call_map: dict, put_map: dict, spot: float) -> bool:
     """
-    /itm normal filter: pass tickers where calls are not too cheap vs puts.
-    Returns True if ratio <= CALL_SKEW_MAX, or if data unavailable (pass through).
+    /itm normal pre-filter: at nearest strike BELOW spot, is call mid > put mid?
+    Checks first expiry with valid data.
+    Returns True (pass through) if skew found or no valid data available.
     """
-    ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
-    if ratio is None:
-        return True  # no data → pass through
-    passes = ratio <= CALL_SKEW_MAX
-    if not passes:
-        logger.debug(f"call skew filter: ratio={ratio:.3f} > {CALL_SKEW_MAX} → filtered")
-    return passes
-
-
-def _passes_put_skew_filter(call_map: dict, put_map: dict, spot: float) -> bool:
-    """
-    /itm r filter: pass tickers where puts are meaningfully more expensive than calls.
-    Returns True if ratio >= PUT_SKEW_MIN, or if data unavailable (pass through).
-    """
-    ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
-    if ratio is None:
-        return True  # no data → pass through
-    passes = ratio >= PUT_SKEW_MIN
-    if not passes:
-        logger.debug(f"put skew filter: ratio={ratio:.3f} < {PUT_SKEW_MIN} → filtered")
-    return passes
+    for exp_key in sorted(call_map.keys()):
+        calls = call_map[exp_key]
+        puts  = put_map.get(exp_key, {})
+        strikes_below = sorted(
+            [float(s) for s in calls if s in puts and float(s) < spot],
+            reverse=True
+        )
+        if not strikes_below:
+            continue
+        strike_str = next(
+            (s for s in calls if abs(float(s) - strikes_below[0]) < 0.001), None)
+        if not strike_str:
+            continue
+        call_opt = (calls.get(strike_str) or [{}])[0]
+        put_opt  = (puts.get(strike_str)  or [{}])[0]
+        call_mid = _mid(call_opt)
+        put_mid  = _mid(put_opt)
+        if call_mid <= 0 or put_mid <= 0:
+            continue
+        return call_mid > put_mid
+    return True  # no valid data → pass through
 
 
 # ---------------------------------------------------------------------------
@@ -280,15 +273,28 @@ class ItmScanner:
     def scan_ticker(self, ticker, skip_skew_filter: bool = False):
         """
         /itm normal scan.
-        Fetches chain once, checks call skew from that data, then scans.
-        Filters out tickers where puts are much more expensive than calls
-        (poor environment for selling calls).
+        Stage 1: lightweight chain (45d), check call skew at nearest strike below spot.
+        Stage 2: full chain + APY calculation only if skew found.
         """
         results = []
         debug = Counter()
         ticker = ticker.upper()
         freq = self.ticker_freqs.get(ticker, "Q")
 
+        # Stage 1 — call skew pre-filter
+        if not skip_skew_filter:
+            lite = self.schwab.get_option_chain_lite(ticker, days=DTE_MAX)
+            if lite:
+                spot_lite = lite.get("underlyingPrice") or 0.0
+                if spot_lite > 0:
+                    call_map_lite = lite.get("callExpDateMap", {})
+                    put_map_lite  = lite.get("putExpDateMap",  {})
+                    if call_map_lite and put_map_lite:
+                        if not _check_call_skew(call_map_lite, put_map_lite, spot_lite):
+                            debug["skew_filtered"] += 1
+                            return results, debug
+
+        # Stage 2 — full chain fetch
         try:
             chain = self.schwab.get_option_chain(ticker)
         except Exception as e:
@@ -304,11 +310,6 @@ class ItmScanner:
         put_map  = chain.get("putExpDateMap",  {})
         if not call_map or not put_map:
             debug["empty_chain"] += 1
-            return results, debug
-
-        # Stage 1 — call skew filter (uses already-fetched chain data, zero extra API calls)
-        if not skip_skew_filter and not _passes_call_skew_filter(call_map, put_map, spot):
-            debug["skew_filtered"] += 1
             return results, debug
 
         annual_div, last_ex_div, next_ex_div_date, short_int = \
@@ -424,9 +425,8 @@ class ItmScanner:
     def scan_ticker_reverse(self, ticker, skip_skew_filter: bool = False):
         """
         /itm r: strikes ABOVE spot where put_mid > call_mid.
-        Fetches chain once, checks put skew from that data, then scans.
-        Filters out tickers where puts are NOT more expensive than calls
-        (no put skew = no edge for selling puts).
+        Stage 1: lightweight chain (15d), check put skew at nearest strike above spot.
+        Stage 2: full chain + APY calculation only if skew found.
         Short stock + sell put + buy call.
         Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
         Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
@@ -436,6 +436,20 @@ class ItmScanner:
         ticker  = ticker.upper()
         freq    = self.ticker_freqs.get(ticker, "Q")
 
+        # Stage 1 — put skew pre-filter (15d = REVERSE_DTE_MAX)
+        if not skip_skew_filter:
+            lite = self.schwab.get_option_chain_lite(ticker, days=REVERSE_DTE_MAX)
+            if lite:
+                spot_lite = lite.get("underlyingPrice") or 0.0
+                if spot_lite > 0:
+                    call_map_lite = lite.get("callExpDateMap", {})
+                    put_map_lite  = lite.get("putExpDateMap",  {})
+                    if call_map_lite and put_map_lite:
+                        if not _check_put_skew(call_map_lite, put_map_lite, spot_lite):
+                            debug["skew_filtered"] += 1
+                            return results, debug
+
+        # Stage 2 — full chain fetch
         try:
             chain = self.schwab.get_option_chain(ticker)
         except Exception as e:
@@ -451,11 +465,6 @@ class ItmScanner:
         put_map  = chain.get("putExpDateMap",  {})
         if not call_map or not put_map:
             debug["empty_chain"] += 1
-            return results, debug
-
-        # Stage 1 — put skew filter (uses already-fetched chain data, zero extra API calls)
-        if not skip_skew_filter and not _passes_put_skew_filter(call_map, put_map, spot):
-            debug["skew_filtered"] += 1
             return results, debug
 
         annual_div, last_ex_div, next_ex_div_date, short_int = \

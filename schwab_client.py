@@ -1,6 +1,6 @@
 """
 schwab_client.py
-Schwab API  wrapper with market data + trading.
+Schwab API wrapper with market data + trading.
 Supports multiple instances from different token files (one per user).
 """
 
@@ -30,7 +30,6 @@ class SchwabClient:
 
     @classmethod
     def from_token_path(cls, token_path: str) -> "SchwabClient":
-        """Create a SchwabClient using a specific token file path."""
         instance = cls(token_path=token_path)
         instance.initialize()
         return instance
@@ -108,6 +107,20 @@ class SchwabClient:
             logger.warning(f"[{symbol}] fundamentals fetch failed: {e}")
             return {}
 
+    def get_positions(self) -> list:
+        """
+        Fetch all positions for the primary account.
+        Returns list of position dicts from Schwab API.
+        """
+        account_hash = self.get_account_hash()
+        resp = self._client.get_account(
+            account_hash,
+            fields=[Client.Account.Fields.POSITIONS],
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("securitiesAccount", {}).get("positions", [])
+
     # ------------------------------------------------------------------
     # OAuth helpers
     # ------------------------------------------------------------------
@@ -121,7 +134,6 @@ class SchwabClient:
         )
 
     def exchange_code_for_token(self, code_or_url: str) -> None:
-        """Exchange auth code for token and save to this client's token_path."""
         text = code_or_url.strip().strip("'\"<>")
         code = None
         if text.startswith("http"):
@@ -163,12 +175,10 @@ class SchwabClient:
         with open(self.token_path, "w") as f:
             json.dump(wrapped, f)
         logger.info(f"New token written to {self.token_path}")
-
         self._cached_token_json = json.dumps(wrapped)
         self.reload()
 
     def get_token_json(self) -> str:
-        """Return current token file contents as JSON string."""
         with open(self.token_path) as f:
             return f.read()
 

@@ -5,8 +5,10 @@ Commission-aware, fillability-filtered, with primary + fallback pricing.
 Includes reverse mode (scan_ticker_reverse) for /itm r.
 
 IV skew filter — uses already-fetched chain data, zero extra API calls:
-  /itm normal:  skip tickers without call skew (call IV > put IV)
-  /itm r:       skip tickers without put skew  (put IV > call IV)
+  /itm normal:  skip tickers where puts are much more expensive than calls
+                (put/call IV ratio > CALL_SKEW_MAX means calls are cheap → bad for selling calls)
+  /itm r:       skip tickers where puts are NOT more expensive than calls
+                (put/call IV ratio < PUT_SKEW_MIN means no put skew → bad for selling puts)
 
 Sorting: best APY at bottom (shown last = closest to message field on phone).
 Ex-div in window:
@@ -39,8 +41,20 @@ REVERSE_EX_DIV_APY_PENALTY         = 25.0
 REVERSE_BORROW_RATE                = 0.20
 
 # IV skew filter thresholds (applied to already-fetched chain data)
-PUT_SKEW_MIN  = 1.02   # put IV / call IV must be >= this for /itm r
-CALL_SKEW_MAX = 0.98   # put IV / call IV must be <= this for /itm normal
+# put/call IV ratio = put_iv / call_iv
+#
+# /itm normal — we SELL calls, so we want calls to be expensive.
+#   Filter OUT tickers where put IV >> call IV (puts much more expensive than calls).
+#   Keep tickers where ratio <= CALL_SKEW_MAX (calls not too cheap relative to puts).
+#   Typical market: ratio ~1.05-1.15. Set max to 1.20 — only filter extreme put skew.
+#
+# /itm r — we SELL puts, so we want puts to be expensive.
+#   Filter OUT tickers where put IV is not elevated above call IV.
+#   Keep tickers where ratio >= PUT_SKEW_MIN (puts meaningfully more expensive than calls).
+#   Set min to 1.05 — require at least 5% put premium over calls.
+
+CALL_SKEW_MAX = 1.20   # /itm normal:  filter if put IV > 120% of call IV
+PUT_SKEW_MIN  = 1.05   # /itm r:       filter if put IV < 105% of call IV
 
 
 _FREQ_DAYS = {"M": 30, "Q": 91, "S": 182, "A": 365, "W": 7}
@@ -86,6 +100,8 @@ def _chain_put_call_iv_ratio(call_map: dict, put_map: dict, spot: float):
     """
     Sample ATM put/call IV ratio from the nearest expiry with valid IV data.
     Returns put_iv / call_iv, or None if data unavailable.
+    Skips any IV values that are zero, negative, or the Schwab sentinel -999.0.
+    Tries multiple expiries until valid data found.
     """
     for exp_key in sorted(call_map.keys()):
         calls = call_map[exp_key]
@@ -94,27 +110,44 @@ def _chain_put_call_iv_ratio(call_map: dict, put_map: dict, spot: float):
         if not common:
             continue
         atm = min(common, key=lambda s: abs(float(s) - spot))
-        call_iv = float((calls.get(atm) or [{}])[0].get("volatility") or 0.0)
-        put_iv  = float((puts.get(atm)  or [{}])[0].get("volatility") or 0.0)
-        if call_iv > 0 and put_iv > 0 and call_iv != -999.0 and put_iv != -999.0:
-            return put_iv / call_iv
-    return None
+        raw_call_iv = (calls.get(atm) or [{}])[0].get("volatility")
+        raw_put_iv  = (puts.get(atm)  or [{}])[0].get("volatility")
+        if raw_call_iv is None or raw_put_iv is None:
+            continue
+        call_iv = float(raw_call_iv)
+        put_iv  = float(raw_put_iv)
+        if call_iv <= 0 or put_iv <= 0:
+            continue
+        return put_iv / call_iv
+    return None  # no valid data found — caller should pass through
 
 
-def _has_put_skew(call_map: dict, put_map: dict, spot: float) -> bool:
-    """True if put skew present, or if data unavailable (pass through)."""
+def _passes_call_skew_filter(call_map: dict, put_map: dict, spot: float) -> bool:
+    """
+    /itm normal filter: pass tickers where calls are not too cheap vs puts.
+    Returns True if ratio <= CALL_SKEW_MAX, or if data unavailable (pass through).
+    """
     ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
     if ratio is None:
-        return True
-    return ratio >= PUT_SKEW_MIN
+        return True  # no data → pass through
+    passes = ratio <= CALL_SKEW_MAX
+    if not passes:
+        logger.debug(f"call skew filter: ratio={ratio:.3f} > {CALL_SKEW_MAX} → filtered")
+    return passes
 
 
-def _has_call_skew(call_map: dict, put_map: dict, spot: float) -> bool:
-    """True if call skew present, or if data unavailable (pass through)."""
+def _passes_put_skew_filter(call_map: dict, put_map: dict, spot: float) -> bool:
+    """
+    /itm r filter: pass tickers where puts are meaningfully more expensive than calls.
+    Returns True if ratio >= PUT_SKEW_MIN, or if data unavailable (pass through).
+    """
     ratio = _chain_put_call_iv_ratio(call_map, put_map, spot)
     if ratio is None:
-        return True
-    return ratio <= CALL_SKEW_MAX
+        return True  # no data → pass through
+    passes = ratio >= PUT_SKEW_MIN
+    if not passes:
+        logger.debug(f"put skew filter: ratio={ratio:.3f} < {PUT_SKEW_MIN} → filtered")
+    return passes
 
 
 # ---------------------------------------------------------------------------
@@ -249,6 +282,8 @@ class ItmScanner:
         """
         /itm normal scan.
         Fetches chain once, checks call skew from that data, then scans.
+        Filters out tickers where puts are much more expensive than calls
+        (poor environment for selling calls).
         """
         results = []
         debug = Counter()
@@ -272,8 +307,8 @@ class ItmScanner:
             debug["empty_chain"] += 1
             return results, debug
 
-        # Stage 1 — call skew filter (uses already-fetched chain data)
-        if not skip_skew_filter and not _has_call_skew(call_map, put_map, spot):
+        # Stage 1 — call skew filter (uses already-fetched chain data, zero extra API calls)
+        if not skip_skew_filter and not _passes_call_skew_filter(call_map, put_map, spot):
             debug["skew_filtered"] += 1
             return results, debug
 
@@ -391,6 +426,8 @@ class ItmScanner:
         """
         /itm r: strikes ABOVE spot where put_mid > call_mid.
         Fetches chain once, checks put skew from that data, then scans.
+        Filters out tickers where puts are NOT more expensive than calls
+        (no put skew = no edge for selling puts).
         Short stock + sell put + buy call.
         Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
         Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
@@ -417,8 +454,8 @@ class ItmScanner:
             debug["empty_chain"] += 1
             return results, debug
 
-        # Stage 1 — put skew filter (uses already-fetched chain data)
-        if not skip_skew_filter and not _has_put_skew(call_map, put_map, spot):
+        # Stage 1 — put skew filter (uses already-fetched chain data, zero extra API calls)
+        if not skip_skew_filter and not _passes_put_skew_filter(call_map, put_map, spot):
             debug["skew_filtered"] += 1
             return results, debug
 

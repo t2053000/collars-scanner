@@ -68,6 +68,67 @@ class SchwabClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_atm_iv_ratio(self, symbol: str) -> float | None:
+        """
+        Fetch ATM put/call IV ratio for the nearest expiry.
+        Returns put_iv / call_iv.
+          > 1.0  → put skew  (good for /itm r)
+          < 1.0  → call skew (good for /itm normal)
+          None   → data unavailable, caller should not filter
+        Uses strike_count=4 (2 above + 2 below ATM) for speed.
+        """
+        try:
+            from_date = datetime.now().date()
+            to_date   = (datetime.now() + timedelta(days=60)).date()
+            resp = self._client.get_option_chain(
+                symbol,
+                contract_type=Client.Options.ContractType.ALL,
+                strike_count=4,
+                include_underlying_quote=True,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.debug(f"[{symbol}] get_atm_iv_ratio fetch failed: {e}")
+            return None
+
+        spot = data.get("underlyingPrice") or 0.0
+        if spot <= 0:
+            return None
+
+        call_map = data.get("callExpDateMap", {})
+        put_map  = data.get("putExpDateMap",  {})
+        if not call_map or not put_map:
+            return None
+
+        # Use nearest expiry only
+        nearest_exp = sorted(call_map.keys())[0]
+        if nearest_exp not in put_map:
+            return None
+
+        calls = call_map[nearest_exp]
+        puts  = put_map[nearest_exp]
+
+        # Find ATM strike — closest to spot
+        common_strikes = set(calls.keys()) & set(puts.keys())
+        if not common_strikes:
+            return None
+
+        atm_strike = min(common_strikes, key=lambda s: abs(float(s) - spot))
+
+        call_opt = (calls.get(atm_strike) or [{}])[0]
+        put_opt  = (puts.get(atm_strike)  or [{}])[0]
+
+        call_iv = float(call_opt.get("volatility") or 0.0)
+        put_iv  = float(put_opt.get("volatility")  or 0.0)
+
+        if call_iv <= 0 or put_iv <= 0:
+            return None
+
+        return put_iv / call_iv
+
     def get_fundamentals(self, symbol: str) -> dict:
         try:
             resp = self._client.get_instruments(

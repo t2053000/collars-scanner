@@ -96,13 +96,7 @@ def _buy_price(option, extra_frac=0.0):
 # IV skew helpers — operate on already-fetched chain data, zero extra API calls
 # ---------------------------------------------------------------------------
 
-def _chain_put_call_iv_ratio(call_map: dict, put_map: dict, spot: float):
-    """
-    Sample ATM put/call IV ratio from the nearest expiry with valid IV data.
-    Returns put_iv / call_iv, or None if data unavailable.
-    Skips any IV values that are zero, negative, or the Schwab sentinel -999.0.
-    Tries multiple expiries until valid data found.
-    """
+def _chain_put_call_iv_ratio(call_map, put_map, spot):
     for exp_key in sorted(call_map.keys()):
         calls = call_map[exp_key]
         puts  = put_map.get(exp_key, {})
@@ -110,16 +104,21 @@ def _chain_put_call_iv_ratio(call_map: dict, put_map: dict, spot: float):
         if not common:
             continue
         atm = min(common, key=lambda s: abs(float(s) - spot))
-        raw_call_iv = (calls.get(atm) or [{}])[0].get("volatility")
-        raw_put_iv  = (puts.get(atm)  or [{}])[0].get("volatility")
-        if raw_call_iv is None or raw_put_iv is None:
+        c = (calls.get(atm) or [{}])[0]
+        p = (puts.get(atm)  or [{}])[0]
+        call_bid = float(c.get("bid") or 0)
+        call_ask = float(c.get("ask") or 0)
+        put_bid  = float(p.get("bid") or 0)
+        put_ask  = float(p.get("ask") or 0)
+        if call_bid <= 0 or call_ask <= 0 or put_bid <= 0 or put_ask <= 0:
             continue
-        call_iv = float(raw_call_iv)
-        put_iv  = float(raw_put_iv)
-        if call_iv <= 0 or put_iv <= 0:
+        call_mid = (call_bid + call_ask) / 2
+        put_mid  = (put_bid  + put_ask)  / 2
+        if call_mid <= 0:
             continue
-        return put_iv / call_iv
-    return None  # no valid data found — caller should pass through
+        return put_mid / call_mid
+    return None
+
 
 
 def _passes_call_skew_filter(call_map: dict, put_map: dict, spot: float) -> bool:

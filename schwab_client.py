@@ -1,6 +1,6 @@
 """
 schwab_client.py
-Schwab API wrapper with market data + trading.
+Schwab API  wrapper with market data + trading.
 Supports multiple instances from different token files (one per user).
 """
 

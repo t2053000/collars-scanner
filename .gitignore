@@ -4,3 +4,5 @@ __pycache__/
 token.json
 .venv/
 venv/
+token_*.json
+*.json

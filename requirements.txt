@@ -6,3 +6,4 @@ httpx>=0.26.0
 ib_insync
 apscheduler
 beautifulsoup4
+pandas

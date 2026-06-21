@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 DTE_MIN                            = 1
 DTE_MAX                            = 45
-REVERSE_DTE_MAX                    = 14
+REVERSE_DTE_MAX                    = 45
 STRIKES_BELOW_SPOT                 = 4
 STRIKES_ABOVE_SPOT_REVERSE         = 2
 MID_ADJUST_FRAC                    = 0.15
@@ -436,7 +436,7 @@ class ItmScanner:
         ticker  = ticker.upper()
         freq    = self.ticker_freqs.get(ticker, "Q")
 
-        # Stage 1 — put skew pre-filter (15d = REVERSE_DTE_MAX)
+        # Stage 1 — put skew pre-filter (45d = REVERSE_DTE_MAX)
         if not skip_skew_filter:
             lite = self.schwab.get_option_chain_lite(ticker, days=REVERSE_DTE_MAX)
             if lite:

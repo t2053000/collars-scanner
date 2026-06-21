@@ -256,3 +256,49 @@ def list_schwab_token_user_ids() -> list[int]:
         logger.error(f"Failed to list Schwab token files from GitHub: {e}")
 
     return list(user_ids)
+
+
+# ---------------------------------------------------------------------------
+# Generic file save (used by hiv_fetcher)
+# ---------------------------------------------------------------------------
+
+def save_file(path: str, content: str, commit_msg: str) -> None:
+    """Create or update any file in the GitHub repo."""
+    repo = _repo()
+    try:
+        existing = repo.get_contents(path)
+        repo.update_file(path, commit_msg, content, existing.sha)
+        logger.info(f"Updated {path} in GitHub")
+    except GithubException:
+        repo.create_file(path, commit_msg, content)
+        logger.info(f"Created {path} in GitHub")
+
+
+def get_latest_hiv_tickers() -> list[str]:
+    """
+    Return ticker list from the most recent tickers/tickers_*.csv file in GitHub.
+    Returns empty list if none found.
+    """
+    repo = _repo()
+    try:
+        contents = repo.get_contents("tickers")
+        csv_files = [
+            f for f in contents
+            if f.name.startswith("tickers_") and f.name.endswith(".csv")
+        ]
+        if not csv_files:
+            return []
+        # Sort by filename (YYYYMMDD_HHMM) — latest last
+        latest = sorted(csv_files, key=lambda f: f.name)[-1]
+        raw    = latest.decoded_content.decode("utf-8")
+        lines  = raw.strip().splitlines()
+        tickers = []
+        for line in lines[1:]:  # skip header
+            ticker = line.split(",")[0].strip()
+            if ticker:
+                tickers.append(ticker.upper())
+        logger.info(f"Loaded {len(tickers)} HIV tickers from {latest.name}")
+        return tickers
+    except Exception as e:
+        logger.error(f"get_latest_hiv_tickers failed: {e}")
+        return []

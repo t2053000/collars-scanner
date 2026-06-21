@@ -6,20 +6,21 @@ import os
 import sys
 import logging
 from pathlib import Path
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
-from schwab_client import SchwabClient
-from scanner       import CollarScanner
-from spreads       import SpreadScanner
-from deepcall      import DeepCallScanner
-from dca           import DcaScanner
-from csp           import CspScanner
-from itm           import ItmScanner
-from ritm          import RitmScanner
-from ibkr_client   import IbkrClient
-from itm_ibkr      import ItmIbkrScanner
+from schwab_client  import SchwabClient
+from scanner        import CollarScanner
+from spreads        import SpreadScanner
+from deepcall       import DeepCallScanner
+from dca            import DcaScanner
+from csp            import CspScanner
+from itm            import ItmScanner
+from ritm           import RitmScanner
+from ibkr_client    import IbkrClient
+from itm_ibkr       import ItmIbkrScanner
+from hiv_fetcher    import run_hiv_fetch_job
 import github_store
 import bot as bot_module
 
@@ -72,15 +73,38 @@ def _load_schwab_clients(primary_user_id: int,
 
 def _init_ibkr_scanner(initial_div_freqs: dict,
                         log: logging.Logger) -> "ItmIbkrScanner | None":
-    """Connect to IBKR Gateway via Tailscale. Returns None if unavailable."""
+    """Connect to IBKR Gateway. Returns None if unavailable."""
     try:
-        client = IbkrClient()
+        client  = IbkrClient()
         client.connect()
         scanner = ItmIbkrScanner(client, initial_div_freqs)
         log.info("IBKR scanner connected")
         return scanner
     except Exception as e:
         log.warning(f"IBKR scanner unavailable: {e}")
+        return None
+
+
+def _start_hiv_scheduler(log: logging.Logger):
+    """Start APScheduler to fetch HIV tickers every 15 minutes."""
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(
+            run_hiv_fetch_job,
+            trigger="interval",
+            minutes=15,
+            id="hiv_fetch",
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
+        scheduler.start()
+        log.info("HIV ticker scheduler started (every 15 min)")
+        # Run immediately on startup so we have fresh data right away
+        run_hiv_fetch_job()
+        return scheduler
+    except Exception as e:
+        log.warning(f"HIV scheduler failed to start: {e}")
         return None
 
 
@@ -96,34 +120,37 @@ def main():
     ]
     missing = [k for k in required if not os.getenv(k)]
     if missing:
-        log.error(f"❌ Missing required env vars: {', '.join(missing)}")
+        log.error(f"Missing required env vars: {', '.join(missing)}")
         sys.exit(1)
 
     _bootstrap_schwab_token()
 
-    primary_user_id = int(os.environ["PRIMARY_TELEGRAM_USER_ID"])
-    schwab_clients  = _load_schwab_clients(primary_user_id, log)
+    primary_user_id = int(os.getenv("PRIMARY_TELEGRAM_USER_ID"))
+    telegram_token  = os.getenv("TELEGRAM_BOT_TOKEN")
 
-    log.info(f"Schwab clients loaded for users: {list(schwab_clients.keys())}")
+    schwab_clients = _load_schwab_clients(primary_user_id, log)
+    log.info(f"Schwab clients loaded for users: {sorted(schwab_clients.keys())}")
 
-    primary_schwab    = schwab_clients[primary_user_id]
-    initial_div_freqs = github_store.get_div_tickers()
-    log.info(f"Loaded {len(initial_div_freqs)} dividend tickers from GitHub")
+    div_tickers = github_store.get_div_tickers()
+    log.info(f"Loaded {len(div_tickers)} dividend tickers from GitHub")
 
-    collar_scanner   = CollarScanner(primary_schwab)
-    spread_scanner   = SpreadScanner(primary_schwab)
+    primary_schwab = schwab_clients[primary_user_id]
+
+    collar_scanner  = CollarScanner(primary_schwab)
+    spread_scanner  = SpreadScanner(primary_schwab)
     deepcall_scanner = DeepCallScanner(primary_schwab)
-    dca_scanner      = DcaScanner(primary_schwab, initial_div_freqs)
-    csp_scanner      = CspScanner(primary_schwab, initial_div_freqs)
-    itm_scanner      = ItmScanner(primary_schwab, initial_div_freqs)
-    ritm_scanner     = RitmScanner(primary_schwab, initial_div_freqs)
+    dca_scanner     = DcaScanner(primary_schwab, div_tickers)
+    csp_scanner     = CspScanner(primary_schwab, div_tickers)
+    itm_scanner     = ItmScanner(primary_schwab, div_tickers)
+    ritm_scanner    = RitmScanner(primary_schwab, div_tickers)
 
-    # IBKR scanner — scanning only, execution stays on Schwab
-    # Returns None if gateway unreachable — bot starts normally without it
-    itm_ibkr_scanner = _init_ibkr_scanner(initial_div_freqs, log)
+    itm_ibkr_scanner = _init_ibkr_scanner(div_tickers, log)
+
+    # Start HIV ticker scheduler
+    _start_hiv_scheduler(log)
 
     app = bot_module.build_app(
-        os.environ["TELEGRAM_BOT_TOKEN"],
+        telegram_token,
         collar_scanner,
         spread_scanner,
         deepcall_scanner,
@@ -138,5 +165,7 @@ def main():
 
     log.info("Bot starting – polling Telegram…")
     app.run_polling(allowed_updates=["message", "callback_query"])
+
+
 if __name__ == "__main__":
     main()

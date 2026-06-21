@@ -4,3 +4,5 @@ PyGithub>=2.1.1
 python-dotenv>=1.0.0
 httpx>=0.26.0
 ib_insync
+apscheduler
+beautifulsoup4

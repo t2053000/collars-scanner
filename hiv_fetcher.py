@@ -15,7 +15,6 @@ from datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
-import pandas as pd
 
 import github_store
 
@@ -82,8 +81,8 @@ def _fetch_page(row_start: int) -> list[dict]:
     return results
 
 
-def fetch_hiv_tickers() -> pd.DataFrame:
-    """Fetch up to TARGET tickers from Finviz. Returns DataFrame."""
+def fetch_hiv_tickers() -> list[dict]:
+    """Fetch up to TARGET tickers from Finviz. Returns list of dicts."""
     all_results = []
     page        = 1
     row_start   = 1
@@ -108,11 +107,15 @@ def fetch_hiv_tickers() -> pd.DataFrame:
         page      += 1
         time.sleep(1.5)
 
-    if not all_results:
-        return pd.DataFrame(columns=["ticker", "price", "change", "volume"])
+    # deduplicate by ticker
+    seen = set()
+    deduped = []
+    for r in all_results:
+        if r["ticker"] not in seen:
+            seen.add(r["ticker"])
+            deduped.append(r)
 
-    df = pd.DataFrame(all_results[:TARGET]).drop_duplicates(subset=["ticker"])
-    return df
+    return deduped[:TARGET]
 
 
 def run_hiv_fetch_job():
@@ -122,17 +125,22 @@ def run_hiv_fetch_job():
     """
     logger.info("hiv_fetcher: starting scheduled fetch...")
     try:
-        df = fetch_hiv_tickers()
-        if df.empty:
+        rows = fetch_hiv_tickers()
+        if not rows:
             logger.warning("hiv_fetcher: no tickers fetched — skipping save")
             return
 
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M")
         gh_path   = f"tickers/tickers_{timestamp}.csv"
-        csv_str   = df.to_csv(index=False)
+
+        # Build CSV manually — no pandas needed
+        lines = ["ticker,price,change,volume"]
+        for r in rows:
+            lines.append(f"{r['ticker']},{r['price']},{r['change']},{r['volume']}")
+        csv_str = "\n".join(lines) + "\n"
 
         github_store.save_file(gh_path, csv_str, f"hiv tickers {timestamp}")
-        logger.info(f"hiv_fetcher: saved {len(df)} tickers to {gh_path}")
+        logger.info(f"hiv_fetcher: saved {len(rows)} tickers to {gh_path}")
 
     except Exception as e:
         logger.error(f"hiv_fetcher: job failed: {e}")

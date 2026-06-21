@@ -7,3 +7,4 @@ ib_insync
 apscheduler
 beautifulsoup4
 pandas
+pytz

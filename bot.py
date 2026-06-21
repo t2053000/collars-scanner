@@ -587,8 +587,9 @@ async def cmd_csp(update, context):
 async def cmd_itm(update, context):
     scanner = context.application.bot_data["itm_scanner"]
     div_tickers = github_store.get_div_tickers()
-    watchlist = github_store.get_tickers()
-    combined = sorted(set(watchlist) | set(div_tickers.keys()))
+    hiv_tickers = github_store.get_latest_hiv_tickers()
+    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
+    combined    = sorted(set(watchlist) | set(div_tickers.keys()))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
@@ -613,8 +614,9 @@ async def cmd_itm(update, context):
 async def cmd_ritm(update, context):
     scanner = context.application.bot_data["ritm_scanner"]
     div_tickers = github_store.get_div_tickers()
-    watchlist = github_store.get_tickers()
-    combined = sorted(set(watchlist) | set(div_tickers.keys()))
+    hiv_tickers = github_store.get_latest_hiv_tickers()
+    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
+    combined    = sorted(set(watchlist) | set(div_tickers.keys()))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
@@ -632,7 +634,8 @@ async def cmd_itmib(update, context):
             "IBKR scanner unavailable — check VPS/Tailscale connection.")
         return
     div_tickers = github_store.get_div_tickers()
-    watchlist   = github_store.get_tickers()
+    hiv_tickers = github_store.get_latest_hiv_tickers()
+    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
     combined    = sorted(set(watchlist) | set(div_tickers.keys()))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)

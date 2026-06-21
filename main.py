@@ -20,7 +20,8 @@ from itm            import ItmScanner
 from ritm           import RitmScanner
 from ibkr_client    import IbkrClient
 from itm_ibkr       import ItmIbkrScanner
-from hiv_fetcher    import run_hiv_fetch_job
+from hiv_fetcher      import run_hiv_fetch_job
+from barchart_fetcher import run_barchart_fetch_job
 import github_store
 import bot as bot_module
 
@@ -85,8 +86,11 @@ def _init_ibkr_scanner(initial_div_freqs: dict,
         return None
 
 
-def _start_hiv_scheduler(log: logging.Logger):
-    """Start APScheduler to fetch HIV tickers every 15 minutes."""
+def _start_schedulers(log: logging.Logger):
+    """Start APScheduler jobs:
+    - HIV (Finviz): every 15 min, always
+    - Barchart: every 20 min, market hours only (checked inside job)
+    """
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
@@ -98,13 +102,22 @@ def _start_hiv_scheduler(log: logging.Logger):
             replace_existing=True,
             misfire_grace_time=60,
         )
+        scheduler.add_job(
+            run_barchart_fetch_job,
+            trigger="interval",
+            minutes=20,
+            id="barchart_fetch",
+            replace_existing=True,
+            misfire_grace_time=60,
+        )
         scheduler.start()
-        log.info("HIV ticker scheduler started (every 15 min)")
-        # Run immediately on startup so we have fresh data right away
+        log.info("Schedulers started: HIV (15min), Barchart (20min market hours)")
+        # Run immediately on startup
         run_hiv_fetch_job()
+        run_barchart_fetch_job()
         return scheduler
     except Exception as e:
-        log.warning(f"HIV scheduler failed to start: {e}")
+        log.warning(f"Scheduler failed to start: {e}")
         return None
 
 
@@ -146,8 +159,8 @@ def main():
 
     itm_ibkr_scanner = _init_ibkr_scanner(div_tickers, log)
 
-    # Start HIV ticker scheduler
-    _start_hiv_scheduler(log)
+    # Start schedulers
+    _start_schedulers(log)
 
     app = bot_module.build_app(
         telegram_token,

@@ -302,3 +302,32 @@ def get_latest_hiv_tickers() -> list[str]:
     except Exception as e:
         logger.error(f"get_latest_hiv_tickers failed: {e}")
         return []
+
+
+def get_latest_barchart_tickers() -> list[str]:
+    """
+    Return ticker list from the most recent tickers/bc_*.csv file in GitHub.
+    Returns empty list if none found.
+    """
+    repo = _repo()
+    try:
+        contents = repo.get_contents("tickers")
+        csv_files = [
+            f for f in contents
+            if f.name.startswith("bc_") and f.name.endswith(".csv")
+        ]
+        if not csv_files:
+            return []
+        latest = sorted(csv_files, key=lambda f: f.name)[-1]
+        raw    = latest.decoded_content.decode("utf-8")
+        lines  = raw.strip().splitlines()
+        tickers = []
+        for line in lines[1:]:
+            ticker = line.split(",")[0].strip()
+            if ticker:
+                tickers.append(ticker.upper())
+        logger.info(f"Loaded {len(tickers)} Barchart tickers from {latest.name}")
+        return tickers
+    except Exception as e:
+        logger.error(f"get_latest_barchart_tickers failed: {e}")
+        return []

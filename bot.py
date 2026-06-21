@@ -525,14 +525,28 @@ async def cmd_csp(update, context):
 async def cmd_itm(update, context):
     scanner     = context.application.bot_data["itm_scanner"]
     div_tickers = github_store.get_div_tickers()
-    hiv_tickers = github_store.get_latest_hiv_tickers()
-    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    combined    = sorted(set(watchlist))  # HIV only, no div tickers merged
+
+    args         = [a.lower() for a in (context.args or [])]
+    reverse_mode = "r" in args
+    bc_mode      = "bc" in args
+
+    if bc_mode:
+        tickers = github_store.get_latest_barchart_tickers()
+        if not tickers:
+            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
+            return
+        source = "Barchart"
+    else:
+        hiv_tickers = github_store.get_latest_hiv_tickers()
+        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+        source      = "Finviz"
+
+    combined = sorted(set(tickers))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
     scanner.ticker_freqs = div_tickers
-    reverse_mode = bool(context.args and context.args[0].lower() == "r")
+
     if reverse_mode:
         original_scan_ticker = scanner.scan_ticker
         scanner.scan_ticker  = scanner.scan_ticker_reverse
@@ -548,9 +562,20 @@ async def cmd_itm(update, context):
 async def cmd_ritm(update, context):
     scanner     = context.application.bot_data["ritm_scanner"]
     div_tickers = github_store.get_div_tickers()
-    hiv_tickers = github_store.get_latest_hiv_tickers()
-    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    combined    = sorted(set(watchlist))  # HIV only, no div tickers merged
+
+    args    = [a.lower() for a in (context.args or [])]
+    bc_mode = "bc" in args
+
+    if bc_mode:
+        tickers = github_store.get_latest_barchart_tickers()
+        if not tickers:
+            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
+            return
+    else:
+        hiv_tickers = github_store.get_latest_hiv_tickers()
+        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+
+    combined = sorted(set(tickers))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
@@ -566,9 +591,20 @@ async def cmd_itmib(update, context):
         await update.message.reply_text("IBKR scanner unavailable — check VPS/Tailscale connection.")
         return
     div_tickers = github_store.get_div_tickers()
-    hiv_tickers = github_store.get_latest_hiv_tickers()
-    watchlist   = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    combined    = sorted(set(watchlist))  # HIV only, no div tickers merged
+
+    args    = [a.lower() for a in (context.args or [])]
+    bc_mode = "bc" in args
+
+    if bc_mode:
+        tickers = github_store.get_latest_barchart_tickers()
+        if not tickers:
+            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
+            return
+    else:
+        hiv_tickers = github_store.get_latest_hiv_tickers()
+        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+
+    combined = sorted(set(tickers))
     if not combined:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return

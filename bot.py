@@ -270,23 +270,24 @@ async def _run_scan(update, context, scanner, emoji, format_summary_fn,
 
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    async def _scan_one(ticker):
-        async with sem:
-            try:
-                if scan_kwargs:
-                    hits, debug = await loop.run_in_executor(
-                        None, lambda: scanner.scan_ticker(ticker, **scan_kwargs)
-                    )
-                else:
-                    hits, debug = await loop.run_in_executor(
-                        None, scanner.scan_ticker, ticker
-                    )
-                all_hits.extend(hits)
-                for k, v in debug.items():
-                    debug_totals[k] += v
-            except Exception as e:
-                errors.append(f"{ticker}: {type(e).__name__}: {e}")
-                logger.exception(f"scan failed for {ticker}")
+async def _scan_one(ticker):
+    async with sem:
+        # === MINIMAL DEFENSIVE FIX ===
+        if isinstance(ticker, (list, tuple)):
+            ticker = ticker[0] if ticker else None
+        if not ticker:
+            return
+
+        try:
+            if scan_kwargs:
+                hits, debug = await loop.run_in_executor(
+                    None, lambda: scanner.scan_ticker(ticker, **scan_kwargs)
+                )
+            else:
+                hits, debug = await loop.run_in_executor(
+                    None, scanner.scan_ticker, ticker
+                )
+        
 
     await asyncio.gather(*[_scan_one(t) for t in tickers])
 

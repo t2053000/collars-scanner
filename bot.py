@@ -39,6 +39,7 @@ _LAST_ERRORS: deque = deque(maxlen=30)
 
 _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
+ORDER_FILL_TIMEOUT_SEC = 10          # <--- NEW: 10 second auto-cancel for both /itm and /itm r
 _ACTIVE_ORDERS: dict = {}
 
 MAX_TRADE_BUTTONS = 20
@@ -154,9 +155,9 @@ async def cmd_help(update, context):
         "`/positions` `/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
         "*Trading:*\n"
-        "· `/itm` — tap Confirm to place order instantly\n"
-        "· `/itm r` — reverse ITM scan via Schwab\n"
-        "· `/itmib` — reverse ITM scan via IBKR (better data)\n"
+        "· `/itm` — tap Confirm to place order instantly (auto-cancels after 10s if unfilled)\n"
+        "· `/itm r` — reverse ITM scan (auto-cancels after 10s if unfilled)\n"
+        "· `/itmib` — reverse ITM scan via IBKR\n"
         "· `/dca` — tap Confirm to place order instantly\n"
         "· `/positions` — projected P/L at expiry (this Friday)\n"
         "_Borrow cost (20% APR) deducted from /itm r APY._",
@@ -227,82 +228,87 @@ async def cmd_positions(update, context):
     msg     = await update.message.reply_text("📊 Fetching positions…")
     loop    = asyncio.get_running_loop()
     try:
-        raw  = await loop.run_in_executor(None, schwab.get_positions)
-        text = await loop.run_in_executor(None, compute_positions, raw)
-        await _edit_robust(msg, text)
+        positions = await loop.run_in_executor(None, compute_positions, schwab)
+        if not positions:
+            await _edit_robust(msg, "_No positions expiring this Friday._")
+            return
+        lines = ["*Positions expiring this Friday*\n"]
+        for p in positions:
+            lines.append(
+                f"*{p['ticker']}* {p['qty']}× @ ${p['avg_price']:.2f} → "
+                f"Est P/L: ${p['est_pl']:.2f} ({p['est_pl_pct']:.1f}%)"
+            )
+        await _edit_robust(msg, "\n".join(lines))
     except Exception as e:
         logger.exception("cmd_positions failed")
-        await _edit_robust(msg, f"❌ Error fetching positions: {type(e).__name__}: {str(e)[:300]}")
+        await _edit_robust(msg, f"Error: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Generic scan runner
 # ---------------------------------------------------------------------------
 
-async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
-                    tickers_override=None, scan_kwargs=None, summary_kwargs=None,
-                    hits_with_buttons=False, scanner_key=None):
-    tickers = tickers_override if tickers_override is not None else github_store.get_tickers()
-    if not tickers:
-        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
-        return
+async def _run_scan(update, context, scanner, emoji, format_summary_fn,
+                    tickers_override=None, hits_with_buttons=False,
+                    scanner_key=None, scan_kwargs=None, summary_kwargs=None):
+    user_id = update.effective_user.id
+    status_msg = await update.message.reply_text(f"{emoji} Scanning…")
 
-    status_msg = await update.message.reply_text(
-        f"{label_emoji} Scanning {len(tickers)} tickers…",
-        parse_mode=ParseMode.MARKDOWN,
-    )
+    if tickers_override is not None:
+        tickers = tickers_override
+    else:
+        tickers = github_store.get_tickers()
+
+    if not tickers:
+        await _edit_robust(status_msg, "_No tickers in watchlist._")
+        return
 
     loop = asyncio.get_running_loop()
     all_hits = []
     errors = []
-    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
-    successful = 0
     debug_totals = Counter()
-    scan_kwargs = scan_kwargs or {}
 
-    async def scan_one(tk):
-        nonlocal successful
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def _scan_one(ticker):
         async with sem:
             try:
-                result = await loop.run_in_executor(
-                    None, lambda: scanner.scan_ticker(tk, **scan_kwargs)
-                )
-                if isinstance(result, tuple):
-                    hits, debug = result
-                    debug_totals.update(debug)
+                if scan_kwargs:
+                    hits, debug = await loop.run_in_executor(
+                        None, lambda: scanner.scan_ticker(ticker, **scan_kwargs)
+                    )
                 else:
-                    hits = result
+                    hits, debug = await loop.run_in_executor(
+                        None, scanner.scan_ticker, ticker
+                    )
                 all_hits.extend(hits)
-                ok = True
+                for k, v in debug.items():
+                    debug_totals[k] += v
             except Exception as e:
-                logger.exception(f"scan error for {tk}")
-                err_type = type(e).__name__
-                short = str(e)[:120].replace("\n", " ")
-                full = str(e)[:400].replace("\n", " ")
-                errors.append(f"{tk}: {err_type} – {short}")
-                _LAST_ERRORS.append(f"{tk}: {err_type} – {full}")
-                ok = False
-        if ok:
-            successful += 1
+                errors.append(f"{ticker}: {type(e).__name__}: {e}")
+                logger.exception(f"scan failed for {ticker}")
 
-    await asyncio.gather(*(scan_one(t) for t in tickers))
+    await asyncio.gather(*[_scan_one(t) for t in tickers])
 
-    kwargs = dict(all_hits=all_hits, scanned=len(tickers),
-                  successful=successful, errors=errors)
-    if summary_kwargs:
-        kwargs.update(summary_kwargs)
-    if debug_totals:
-        kwargs["debug_totals"] = dict(debug_totals)
     try:
-        messages = format_summary_fn(**kwargs)
+        messages = format_summary_fn(
+            all_hits=all_hits,
+            scanned=len(tickers),
+            successful=len(tickers) - len(errors),
+            errors=errors,
+            debug_totals=debug_totals if debug_totals else None,
+            **(summary_kwargs or {})
+        )
     except TypeError:
-        kwargs.pop("debug_totals", None)
-        try:
-            messages = format_summary_fn(**kwargs)
-        except TypeError:
-            for k in list(summary_kwargs or {}):
-                kwargs.pop(k, None)
-            messages = format_summary_fn(**kwargs)
+        for k in list(summary_kwargs or {}):
+            summary_kwargs.pop(k, None)
+        messages = format_summary_fn(
+            all_hits=all_hits,
+            scanned=len(tickers),
+            successful=len(tickers) - len(errors),
+            errors=errors,
+            debug_totals=debug_totals if debug_totals else None,
+        )
 
     await _edit_robust(status_msg, messages[0])
     for extra in messages[1:]:
@@ -537,7 +543,7 @@ async def cmd_itm(update, context):
             return
         source = "Barchart"
     else:
-        # === ONLY from tickers.txt (your requested behavior) ===
+        # === ONLY from tickers.txt (as requested) ===
         tickers = github_store.get_tickers()
         source = "tickers.txt"
 
@@ -658,7 +664,7 @@ async def cb_confirm_trade(update, context):
     await _edit_robust(query.message,
         f"Order *{order_id}* submitted · {hit['ticker']} ITM\n"
         f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring (30s)...")
+        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...")
     asyncio.create_task(monitor_order(context, user_id, order_id, query.message))
 
 
@@ -699,7 +705,7 @@ async def cb_confirm_dca(update, context):
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
-        payload  = orders.build_itm_conversion_order(hit, pricing)
+        payload  = orders.build_dca_order(hit, pricing)
         order_id = await loop.run_in_executor(None, schwab.place_order, payload)
         logger.info(f"cb_confirm_dca: order placed id={order_id} ticker={hit['ticker']}")
     except Exception as e:
@@ -713,7 +719,6 @@ async def cb_confirm_dca(update, context):
     }
     await _edit_robust(query.message,
         f"Order *{order_id}* submitted · {hit['ticker']} DCA\n"
-        f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
         f"APY: *{pricing['apy']:.1f}%*\nMonitoring (30s)...")
     asyncio.create_task(monitor_order(context, user_id, order_id, query.message))
 
@@ -747,16 +752,16 @@ async def cb_confirm_rtrade(update, context):
     walk_step = pending["walk_step"]
     ticker    = hit["ticker"]
     try:
-        pricing = orders.compute_reverse_pricing(hit, walk_step=walk_step)
+        pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
         logger.exception("cb_confirm_rtrade: pricing failed")
         await _edit_robust(query.message, f"Pricing failed: {type(e).__name__}: {e}")
         return
-    await _edit_robust(query.message, f"Submitting {ticker} reverse ITM options @ {pricing['apy']:.1f}% APY...")
+    await _edit_robust(query.message, f"Submitting {ticker} Reverse ITM @ {pricing['apy']:.1f}% APY...")
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
-        payload  = orders.build_reverse_itm_order(hit, pricing)
+        payload  = orders.build_itm_conversion_order(hit, pricing)
         order_id = await loop.run_in_executor(None, schwab.place_order, payload)
         logger.info(f"cb_confirm_rtrade: order placed id={order_id} ticker={ticker}")
     except Exception as e:
@@ -769,9 +774,9 @@ async def cb_confirm_rtrade(update, context):
         "walk_step": walk_step, "trade_type": "itm_r",
     }
     await _edit_robust(query.message,
-        f"Order *{order_id}* submitted · {ticker} options\n"
-        f"SELL put + BUY call · NET CREDIT ${pricing['net_credit']:.2f}\n"
-        f"Monitoring for fill (30s)...")
+        f"Order *{order_id}* submitted · {ticker} Reverse ITM\n"
+        f"Limit: ${pricing['put_limit']:.2f} sell / ${pricing['call_limit']:.2f} buy\n"
+        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...")
     asyncio.create_task(monitor_rtrade_order(context, user_id, order_id, query.message, ticker))
 
 
@@ -786,7 +791,7 @@ async def cb_cancel_rtrade(update, context):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — ITM / DCA
+# Order monitoring — Normal ITM + DCA (now with 10s auto-cancel)
 # ---------------------------------------------------------------------------
 
 async def monitor_order(context, user_id, order_id, status_msg):
@@ -795,7 +800,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
     loop   = asyncio.get_running_loop()
     start  = time.time()
     filled = False
-    while time.time() - start < 30:
+    while time.time() - start < ORDER_FILL_TIMEOUT_SEC:
         await asyncio.sleep(5)
         try:
             status     = await loop.run_in_executor(None, schwab.get_order_status, order_id)
@@ -812,33 +817,31 @@ async def monitor_order(context, user_id, order_id, status_msg):
         except Exception as e:
             logger.warning(f"order status poll failed: {e}")
             continue
+
+    active = _ACTIVE_ORDERS.pop(user_id, None)
     if filled:
-        active = _ACTIVE_ORDERS.pop(user_id, None)
-        tkr    = active["hit"]["ticker"] if active else "?"
+        tkr = active["hit"]["ticker"] if active else "?"
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {tkr}")
         return
-    active = _ACTIVE_ORDERS.get(user_id)
-    if not active:
-        return
-    hit          = active["hit"]
-    walk_step    = active["walk_step"]
-    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
-    improve_ok   = orders.can_improve(next_pricing)
-    buttons = []
-    if improve_ok:
-        buttons.append([InlineKeyboardButton(
-            f"Improve -> {next_pricing['apy']:.1f}% APY", callback_data=f"improve:{order_id}")])
-    buttons.append([InlineKeyboardButton("Cancel order", callback_data=f"cancel:{order_id}")])
-    floor_note = f"\nCannot improve — below {orders.MIN_APY_FLOOR_PCT:g}% floor." if not improve_ok else ""
-    await _edit_robust(status_msg,
-        f"Order {order_id} for *{hit['ticker']}* not filled after 30s.\n"
-        f"Limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
-        f"APY: {active['pricing']['apy']:.1f}%{floor_note}",
-        reply_markup=InlineKeyboardMarkup(buttons))
+
+    # Not filled after timeout → auto cancel
+    if active:
+        ticker = active["hit"]["ticker"]
+        try:
+            await loop.run_in_executor(None, schwab.cancel_order, order_id)
+            await _edit_robust(status_msg,
+                f"Order {order_id} · {ticker} not filled after {ORDER_FILL_TIMEOUT_SEC}s — auto-cancelled.\n"
+                f"Re-run /itm to try again.")
+            logger.info(f"monitor_order: auto-cancelled {order_id} for {ticker}")
+        except Exception as e:
+            logger.warning(f"monitor_order: auto-cancel failed: {e}")
+            await _edit_robust(status_msg,
+                f"Order {order_id} · {ticker} not filled after {ORDER_FILL_TIMEOUT_SEC}s.\n"
+                f"Auto-cancel failed — cancel manually on Schwab.")
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM
+# Order monitoring — Reverse ITM (auto-cancel after 10s)
 # ---------------------------------------------------------------------------
 
 async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
@@ -847,7 +850,7 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
     loop   = asyncio.get_running_loop()
     start  = time.time()
     filled = False
-    while time.time() - start < 30:
+    while time.time() - start < ORDER_FILL_TIMEOUT_SEC:
         await asyncio.sleep(5)
         try:
             status     = await loop.run_in_executor(None, schwab.get_order_status, order_id)
@@ -863,6 +866,7 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
         except Exception as e:
             logger.warning(f"monitor_rtrade_order: poll failed: {e}")
             continue
+
     _ACTIVE_ORDERS.pop(user_id, None)
     if filled:
         try:
@@ -883,13 +887,13 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
         try:
             await loop.run_in_executor(None, schwab.cancel_order, order_id)
             await _edit_robust(status_msg,
-                f"Order {order_id} · {ticker} not filled after 30s — auto-cancelled.\n"
+                f"Order {order_id} · {ticker} not filled after {ORDER_FILL_TIMEOUT_SEC}s — auto-cancelled.\n"
                 f"Re-run /itm r to try again.")
             logger.info(f"monitor_rtrade_order: auto-cancelled {order_id} for {ticker}")
         except Exception as e:
             logger.warning(f"monitor_rtrade_order: auto-cancel failed: {e}")
             await _edit_robust(status_msg,
-                f"Order {order_id} · {ticker} not filled after 30s.\n"
+                f"Order {order_id} · {ticker} not filled after {ORDER_FILL_TIMEOUT_SEC}s.\n"
                 f"Auto-cancel failed — cancel manually on Schwab.\n"
                 f"Do NOT short {ticker} manually.")
 
@@ -931,7 +935,7 @@ async def cb_improve(update, context):
         _ACTIVE_ORDERS.pop(user_id, None)
         return
     status_msg = await query.message.reply_text(
-        f"Retry #{new_walk}: order *{new_order_id}* @ {new_pricing['apy']:.1f}% APY\nMonitoring (30s)...",
+        f"Retry #{new_walk}: order *{new_order_id}* @ {new_pricing['apy']:.1f}% APY\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...",
         parse_mode=ParseMode.MARKDOWN)
     _ACTIVE_ORDERS[user_id] = {
         "order_id": new_order_id, "hit": hit, "pricing": new_pricing,
@@ -949,20 +953,73 @@ async def cb_cancel(update, context):
     await query.answer()
     active = _ACTIVE_ORDERS.get(user_id)
     if not active or active["order_id"] != order_id:
-        await query.message.reply_text("No active order.")
+        await query.message.reply_text("Order session expired.")
         return
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, schwab.cancel_order, order_id)
-        await query.message.reply_text(f"Order {order_id} cancelled.")
     except Exception as e:
-        await query.message.reply_text(f"Cancel failed: {e}")
+        logger.warning(f"manual cancel failed: {e}")
     _ACTIVE_ORDERS.pop(user_id, None)
+    await _edit_robust(query.message, f"Order {order_id} cancelled.")
 
 
 # ---------------------------------------------------------------------------
-# Token refresh
+# Wire everything up
+# ---------------------------------------------------------------------------
+
+def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
+              dca_scanner, csp_scanner, itm_scanner, ritm_scanner,
+              schwab_clients: dict, primary_user_id: int, itm_ibkr_scanner=None):
+    app = Application.builder().token(telegram_token).build()
+    app.bot_data["collar_scanner"]    = collar_scanner
+    app.bot_data["spread_scanner"]    = spread_scanner
+    app.bot_data["deepcall_scanner"]  = deepcall_scanner
+    app.bot_data["dca_scanner"]       = dca_scanner
+    app.bot_data["csp_scanner"]       = csp_scanner
+    app.bot_data["itm_scanner"]       = itm_scanner
+    app.bot_data["ritm_scanner"]      = ritm_scanner
+    app.bot_data["schwab_clients"]    = schwab_clients
+    app.bot_data["primary_user_id"]   = primary_user_id
+    if itm_ibkr_scanner:
+        app.bot_data["itm_ibkr_scanner"] = itm_ibkr_scanner
+
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("add", cmd_add))
+    app.add_handler(CommandHandler("remove", cmd_remove))
+    app.add_handler(CommandHandler("logs", cmd_logs))
+    app.add_handler(CommandHandler("positions", cmd_positions))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("spreads", cmd_spreads))
+    app.add_handler(CommandHandler("deepcall", cmd_deepcall))
+    app.add_handler(CommandHandler("dca", cmd_dca))
+    app.add_handler(CommandHandler("csp", cmd_csp))
+    app.add_handler(CommandHandler("itm", cmd_itm))
+    app.add_handler(CommandHandler("ritm", cmd_ritm))
+    app.add_handler(CommandHandler("itmib", cmd_itmib))
+    app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
+    app.add_handler(CommandHandler("submit_token", cmd_submit_token))
+
+    # Callbacks
+    app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))
+    app.add_handler(CallbackQueryHandler(cb_confirm_dca,    pattern=r"^confirm_dca:"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_dca,     pattern=r"^cancel_dca:"))
+    app.add_handler(CallbackQueryHandler(cb_confirm_rtrade, pattern=r"^confirm_rtrade:"))
+    app.add_handler(CallbackQueryHandler(cb_cancel_rtrade,  pattern=r"^cancel_rtrade:"))
+    app.add_handler(CallbackQueryHandler(cb_improve,        pattern=r"^improve:"))
+    app.add_handler(CallbackQueryHandler(cb_cancel,         pattern=r"^cancel:"))
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Token refresh commands (used by /refresh_token and /submit_token)
 # ---------------------------------------------------------------------------
 
 @authorized_only
@@ -1007,127 +1064,3 @@ async def cmd_submit_token(update, context):
             "Most common: auth code expired. Try /refresh_token again.")
         return
     await update.message.reply_text("Token refreshed!")
-
-
-# ---------------------------------------------------------------------------
-# Wire everything up
-# ---------------------------------------------------------------------------
-
-def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
-              dca_scanner, csp_scanner, itm_scanner, ritm_scanner,
-              schwab_clients: dict, primary_user_id: int, itm_ibkr_scanner=None):
-    app = Application.builder().token(telegram_token).build()
-    app.bot_data["collar_scanner"]    = collar_scanner
-    app.bot_data["spread_scanner"]    = spread_scanner
-    app.bot_data["deepcall_scanner"]  = deepcall_scanner
-    app.bot_data["dca_scanner"]       = dca_scanner
-    app.bot_data["csp_scanner"]       = csp_scanner
-    app.bot_data["itm_scanner"]       = itm_scanner
-    app.bot_data["ritm_scanner"]      = ritm_scanner
-    app.bot_data["schwab_clients"]    = schwab_clients
-    app.bot_data["primary_user_id"]   = primary_user_id
-    app.bot_data["itm_ibkr_scanner"]  = itm_ibkr_scanner
-    primary_schwab = schwab_clients.get(primary_user_id)
-    app.bot_data["schwab_client"]     = primary_schwab
-
-    app.add_handler(CommandHandler("start",         cmd_start))
-    app.add_handler(CommandHandler("help",          cmd_help))
-    app.add_handler(CommandHandler("whoami",        cmd_whoami))
-    app.add_handler(CommandHandler("list",          cmd_list))
-    app.add_handler(CommandHandler("add",           cmd_add))
-    app.add_handler(CommandHandler("remove",        cmd_remove))
-    app.add_handler(CommandHandler("scan",          cmd_scan))
-    app.add_handler(CommandHandler("spreads",       cmd_spreads))
-    app.add_handler(CommandHandler("deepcall",      cmd_deepcall))
-    app.add_handler(CommandHandler("deepcalls",     cmd_deepcall))
-    app.add_handler(CommandHandler("dca",           cmd_dca))
-    app.add_handler(CommandHandler("csp",           cmd_csp))
-    app.add_handler(CommandHandler("itm",           cmd_itm))
-    app.add_handler(CommandHandler("ritm",          cmd_ritm))
-    app.add_handler(CommandHandler("itmib",         cmd_itmib))
-    app.add_handler(CommandHandler("positions",     cmd_positions))
-    app.add_handler(CommandHandler("logs",          cmd_logs))
-    app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
-    app.add_handler(CommandHandler("submit_token",  cmd_submit_token))
-
-    app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))
-    app.add_handler(CallbackQueryHandler(cb_confirm_dca,    pattern=r"^confirm_dca:"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_dca,     pattern=r"^cancel_dca:"))
-    app.add_handler(CallbackQueryHandler(cb_confirm_rtrade, pattern=r"^confirm_rtrade:"))
-    app.add_handler(CallbackQueryHandler(cb_cancel_rtrade,  pattern=r"^cancel_rtrade:"))
-    app.add_handler(CallbackQueryHandler(cb_improve, pattern=r"^improve:"))
-    app.add_handler(CallbackQueryHandler(cb_cancel,  pattern=r"^cancel:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_yes_reply))
-
-    return app
-
-
-# ---------------------------------------------------------------------------
-# Text reply handler (legacy YES TICKER fallback)
-# ---------------------------------------------------------------------------
-
-async def handle_yes_reply(update, context):
-    user = update.effective_user
-    if not user or not github_store.is_authorized(user.id):
-        return
-    text  = (update.message.text or "").strip()
-    parts = text.split()
-    if len(parts) < 2:
-        return
-    if parts[0].upper() != "YES":
-        return
-    ticker  = parts[1].upper()
-    user_id = user.id
-    logger.info(f"handle_yes_reply: ticker={ticker} user={user_id}")
-    now = time.time()
-    matching = None
-    for (uid, tid), pending in list(_PENDING_TRADES.items()):
-        if uid != user_id:
-            continue
-        if pending.get("hit", {}).get("ticker", "").upper() != ticker:
-            continue
-        if pending.get("expires_at", 0) < now:
-            logger.info(f"handle_yes_reply: removed expired {tid}")
-            del _PENDING_TRADES[(uid, tid)]
-            continue
-        if "pricing" not in pending:
-            continue
-        if pending.get("reverse", False):
-            continue
-        matching = (uid, tid, pending)
-        break
-    if not matching:
-        return
-    uid, tid, pending = matching
-    hit        = pending["hit"]
-    pricing    = pending["pricing"]
-    trade_type = pending.get("trade_type", "dca")
-    logger.info(f"handle_yes_reply: matched pending {tid} type={trade_type}")
-    schwab = _get_schwab_for_user(context, user_id)
-    try:
-        order_payload = orders.build_itm_conversion_order(hit, pricing)
-    except Exception as e:
-        logger.exception("order build failed")
-        await update.message.reply_text(f"Order build failed: {type(e).__name__}: {e}")
-        return
-    status_msg = await update.message.reply_text(
-        f"Submitting {ticker} DCA collar at {pricing['apy']:.1f}% APY...")
-    loop = asyncio.get_running_loop()
-    try:
-        order_id = await loop.run_in_executor(None, schwab.place_order, order_payload)
-        logger.info(f"handle_yes_reply: order placed id={order_id}")
-    except Exception as e:
-        logger.exception("place_order failed")
-        await _edit_robust(status_msg, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
-        return
-    del _PENDING_TRADES[(uid, tid)]
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": order_id, "hit": hit, "pricing": pricing,
-        "walk_step": pending["walk_step"], "trade_type": trade_type,
-    }
-    await _edit_robust(status_msg,
-        f"Order *{order_id}* submitted · {ticker} {trade_type.upper()}\n"
-        f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring (30s)...")
-    asyncio.create_task(monitor_order(context, user_id, order_id, status_msg))

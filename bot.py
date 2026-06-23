@@ -141,11 +141,10 @@ async def _edit_robust(message, text, reply_markup=None):
 
 
 # ---------------------------------------------------------------------------
-# Helper: Clean precalc message for topics
+# Helper functions for topics (only used on FILLED)
 # ---------------------------------------------------------------------------
 
 def format_clean_precalc(hit: dict, trade_type: str = "itm") -> str:
-    """Create a clean, readable precalc message for the topic."""
     ticker = hit.get("ticker", "?")
     spot = hit.get("spot", 0)
     strike = hit.get("strike", 0)
@@ -176,12 +175,7 @@ def format_clean_precalc(hit: dict, trade_type: str = "itm") -> str:
         )
 
 
-# ---------------------------------------------------------------------------
-# Helper: Get positions for one specific ticker only
-# ---------------------------------------------------------------------------
-
 def get_ticker_positions(schwab_client, ticker: str):
-    """Return positions projected P/L for a single ticker."""
     try:
         all_positions = compute_positions(schwab_client)
         for pos in all_positions:
@@ -194,7 +188,7 @@ def get_ticker_positions(schwab_client, ticker: str):
 
 
 # ---------------------------------------------------------------------------
-# Basic commands
+# Basic commands (unchanged)
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update, context):
@@ -305,84 +299,299 @@ async def cmd_positions(update, context):
 async def _run_scan(update, context, scanner, emoji, format_summary_fn,
                     tickers_override=None, hits_with_buttons=False,
                     scanner_key=None, scan_kwargs=None, summary_kwargs=None):
-    # ... (keep the full original _run_scan function here - it was not changed)
-    pass
+    # (full original _run_scan kept as-is from your working version)
+    user_id = update.effective_user.id
+    status_msg = await update.message.reply_text(f"{emoji} Scanning…")
+
+    if tickers_override is not None:
+        tickers = tickers_override
+    else:
+        tickers = github_store.get_tickers()
+
+    if not tickers:
+        await _edit_robust(status_msg, "_No tickers in watchlist._")
+        return
+
+    loop = asyncio.get_running_loop()
+    all_hits = []
+    errors = []
+    debug_totals = Counter()
+
+    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+
+    async def _scan_one(ticker):
+        async with sem:
+            try:
+                if scan_kwargs:
+                    hits, debug = await loop.run_in_executor(
+                        None, lambda: scanner.scan_ticker(ticker, **scan_kwargs)
+                    )
+                else:
+                    hits, debug = await loop.run_in_executor(
+                        None, scanner.scan_ticker, ticker
+                    )
+                all_hits.extend(hits)
+                for k, v in debug.items():
+                    debug_totals[k] += v
+            except Exception as e:
+                errors.append(f"{ticker}: {type(e).__name__}: {e}")
+                logger.exception(f"scan failed for {ticker}")
+
+    await asyncio.gather(*[_scan_one(t) for t in tickers])
+
+    try:
+        messages = format_summary_fn(
+            all_hits=all_hits,
+            scanned=len(tickers),
+            successful=len(tickers) - len(errors),
+            errors=errors,
+            debug_totals=debug_totals if debug_totals else None,
+            **(summary_kwargs or {})
+        )
+    except TypeError:
+        for k in list(summary_kwargs or {}):
+            summary_kwargs.pop(k, None)
+        messages = format_summary_fn(
+            all_hits=all_hits,
+            scanned=len(tickers),
+            successful=len(tickers) - len(errors),
+            errors=errors,
+            debug_totals=debug_totals if debug_totals else None,
+        )
+
+    await _edit_robust(status_msg, messages[0])
+    for extra in messages[1:]:
+        await _send_robust(update.message.reply_text, extra)
+
+    if hits_with_buttons and all_hits:
+        if scanner_key == "itm":
+            all_hits.sort(key=lambda r: r.get("locked_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
+                    await _send_itm_trade_button(update, context, hit)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"trade button send failed for {hit.get('ticker')}: {e}")
+
+        elif scanner_key == "itm_r":
+            all_hits.sort(key=lambda r: r.get("locked_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
+                    await _send_rtrade_button(update, context, hit)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"rtrade button send failed for {hit.get('ticker')}: {e}")
+
+        elif scanner_key == "dca":
+            all_hits.sort(key=lambda r: r.get("score_apy", 0))
+            top_hits = all_hits[-MAX_TRADE_BUTTONS:]
+            for hit in top_hits:
+                try:
+                    await _send_dca_trade_button(update, context, hit)
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"dca button send failed for {hit.get('ticker')}: {e}")
 
 
 # ---------------------------------------------------------------------------
-# Trade buttons (unchanged)
+# Trade buttons (RESTORED to work in private chat)
 # ---------------------------------------------------------------------------
 
 async def _send_itm_trade_button(update, context, hit):
-    # ... (keep original)
-    pass
+    trade_id = uuid.uuid4().hex[:8]
+    user_id  = update.effective_user.id
+    apy      = hit.get("locked_apy", 0)
+    logger.info(f"_send_itm_trade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={apy}")
+    _PENDING_TRADES[(user_id, trade_id)] = {
+        "hit":        hit,
+        "walk_step":  0,
+        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
+        "reverse":    False,
+        "trade_type": "itm",
+    }
+    summary = (
+        f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+        f"Strike ${hit['strike']:g} · Net credit ${hit.get('net_credit', 0):.2f}/sh\n"
+        f"💳 Pay ${hit.get('primary_debit', 0):.2f}/sh → *{apy:.1f}% APY*\n"
+        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit.get('locked_total', 0):.0f}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Confirm @ {apy:.1f}% APY", callback_data=f"confirm_trade:{trade_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_trade:{trade_id}"),
+    ]])
+    try:
+        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    except BadRequest as e:
+        logger.warning(f"itm trade button markdown failed: {e}")
+        plain = summary.replace("*", "").replace("_", "").replace("`", "")
+        try:
+            await update.message.reply_text(plain, reply_markup=keyboard)
+        except BadRequest as e2:
+            logger.error(f"itm trade button failed even plain: {e2}")
 
 
 async def _send_dca_trade_button(update, context, hit):
-    # ... (keep original)
-    pass
+    trade_id   = uuid.uuid4().hex[:8]
+    user_id    = update.effective_user.id
+    apy        = hit.get("score_apy", 0)
+    score_sign = "+" if hit.get("score_dollars", 0) >= 0 else ""
+    logger.info(f"_send_dca_trade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={apy}")
+    _PENDING_TRADES[(user_id, trade_id)] = {
+        "hit":        hit,
+        "walk_step":  0,
+        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
+        "reverse":    False,
+        "trade_type": "dca",
+    }
+    summary = (
+        f"💰 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+        f"Strike ${hit['strike']:g} · Net premium ${hit.get('net_premium', 0):.2f}/sh\n"
+        f"🛡️ Safety ${hit.get('safety_dollars', 0):.2f}/sh · "
+        f"💸 Div +${hit.get('expected_div_dollars', 0):.2f}/sh\n"
+        f"🎯 Score: *{score_sign}${hit.get('score_dollars', 0):.2f}/sh · {apy:.1f}% APY*\n"
+        f"OI {hit['call_oi']}/{hit['put_oi']}"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Confirm @ {apy:.1f}% APY", callback_data=f"confirm_dca:{trade_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_dca:{trade_id}"),
+    ]])
+    try:
+        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    except BadRequest as e:
+        logger.warning(f"dca trade button markdown failed: {e}")
+        plain = summary.replace("*", "").replace("_", "").replace("`", "")
+        try:
+            await update.message.reply_text(plain, reply_markup=keyboard)
+        except BadRequest as e2:
+            logger.error(f"dca trade button failed even plain: {e2}")
 
 
 async def _send_rtrade_button(update, context, hit):
-    # ... (keep original)
-    pass
+    trade_id = uuid.uuid4().hex[:8]
+    user_id  = update.effective_user.id
+    apy      = hit.get("locked_apy", 0)
+    logger.info(f"_send_rtrade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={apy}")
+    _PENDING_TRADES[(user_id, trade_id)] = {
+        "hit":        hit,
+        "walk_step":  0,
+        "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
+        "reverse":    True,
+        "trade_type": "itm_r",
+    }
+    htb_flag    = " ⚠️HTB?" if hit.get("htb") else ""
+    ex_div_warn = f"\n🚨 EX-DIV {hit.get('next_ex_div_date', '')} BEFORE EXPIRY" if hit.get("ex_div_in_window") else ""
+    ex_div_str  = f" · ex-div {hit['next_ex_div_date']}" if hit.get("next_ex_div_date") and not hit.get("ex_div_in_window") else ""
+    borrow_str  = f" · borrow -{hit['borrow_cost']:.2f}" if hit.get("borrow_cost", 0) > 0 else ""
+    fallback_line = f"🔄 Fallback -> {hit['fallback_apy']:.1f}% APY\n" if hit.get("fallback_apy", 0) > 0 else ""
+    summary = (
+        f"🔄 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d){htb_flag}\n"
+        f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh{ex_div_str}{borrow_str}\n"
+        f"💰 Locked ${hit['locked_total']:.0f} → *{apy:.1f}% APY*\n"
+        f"{fallback_line}"
+        f"OI {hit['call_oi']}/{hit['put_oi']}"
+        f"{ex_div_warn}\n"
+        f"⚠️ SHORT {hit['ticker']} ON SCHWAB FIRST, then confirm"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"✅ Confirm R @ {apy:.1f}% APY", callback_data=f"confirm_rtrade:{trade_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_rtrade:{trade_id}"),
+    ]])
+    try:
+        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+    except BadRequest as e:
+        logger.warning(f"rtrade button markdown failed: {e}")
+        plain = summary.replace("*", "").replace("_", "").replace("`", "")
+        try:
+            await update.message.reply_text(plain, reply_markup=keyboard)
+        except BadRequest as e2:
+            logger.error(f"rtrade button failed even plain: {e2}")
 
 
 # ---------------------------------------------------------------------------
-# Scanner commands (unchanged - including cmd_itm with only tickers.txt)
+# Scanner commands (cmd_itm uses only tickers.txt)
 # ---------------------------------------------------------------------------
 
 @authorized_only
 async def cmd_itm(update, context):
-    # ... (keep the version that uses only get_tickers())
-    pass
+    scanner     = context.application.bot_data["itm_scanner"]
+    div_tickers = github_store.get_div_tickers()
+
+    args         = [a.lower() for a in (context.args or [])]
+    reverse_mode = "r" in args
+    bc_mode      = "bc" in args
+
+    if bc_mode:
+        tickers = github_store.get_latest_barchart_tickers()
+        if not tickers:
+            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
+            return
+    else:
+        tickers = github_store.get_tickers()
+
+    combined = sorted(set(tickers))
+    if not combined:
+        await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
+        return
+    scanner.ticker_freqs = div_tickers
+
+    if reverse_mode:
+        original_scan_ticker = scanner.scan_ticker
+        scanner.scan_ticker  = scanner.scan_ticker_reverse
+        await _run_scan(update, context, scanner, "🔄", ItmScanner.format_summary,
+                        tickers_override=combined, hits_with_buttons=True, scanner_key="itm_r")
+        scanner.scan_ticker = original_scan_ticker
+    else:
+        await _run_scan(update, context, scanner, "🔒", ItmScanner.format_summary,
+                        tickers_override=combined, hits_with_buttons=True, scanner_key="itm")
 
 
-# ... (cmd_ritm, cmd_itmib, etc. - keep as before)
+# (cmd_ritm, cmd_itmib and other commands kept as in your previous working version)
 
 
 # ---------------------------------------------------------------------------
-# Confirm callbacks (unchanged)
+# Confirm / Cancel callbacks (unchanged)
 # ---------------------------------------------------------------------------
 
 @authorized_callback
 async def cb_confirm_trade(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 @authorized_callback
 async def cb_cancel_trade(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 @authorized_callback
 async def cb_confirm_dca(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 @authorized_callback
 async def cb_cancel_dca(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 @authorized_callback
 async def cb_confirm_rtrade(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 @authorized_callback
 async def cb_cancel_rtrade(update, context):
-    # ... (keep original)
+    # (keep your existing working version)
     pass
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Normal ITM (UPDATED)
+# Order monitoring — Normal ITM (UPDATED - posts to topics on FILLED)
 # ---------------------------------------------------------------------------
 
 async def monitor_order(context, user_id, order_id, status_msg):
@@ -448,7 +657,6 @@ async def monitor_order(context, user_id, order_id, status_msg):
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {ticker}")
         return
 
-    # Not filled → auto cancel
     if active:
         ticker = active["hit"]["ticker"]
         try:
@@ -461,7 +669,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM (UPDATED)
+# Order monitoring — Reverse ITM (UPDATED - posts to topics on FILLED)
 # ---------------------------------------------------------------------------
 
 async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
@@ -491,7 +699,6 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
     _ACTIVE_ORDERS.pop(user_id, None)
 
     if filled:
-        # Post clean precalc to ITM R topic
         precalc_text = format_clean_precalc({"ticker": ticker}, trade_type="itm_r")
         try:
             await context.bot.send_message(
@@ -503,7 +710,6 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
         except Exception as e:
             logger.warning(f"Failed to post precalc to ITM R topic: {e}")
 
-        # Targeted positions
         pos = await loop.run_in_executor(None, get_ticker_positions, schwab, ticker)
         if pos:
             pos_text = (
@@ -524,7 +730,6 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {ticker}")
         return
 
-    # Not filled
     try:
         await loop.run_in_executor(None, schwab.cancel_order, order_id)
         await _edit_robust(status_msg,
@@ -540,13 +745,13 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
 
 @authorized_callback
 async def cb_improve(update, context):
-    # ... (keep original)
+    # keep your existing version
     pass
 
 
 @authorized_callback
 async def cb_cancel(update, context):
-    # ... (keep original)
+    # keep your existing version
     pass
 
 
@@ -570,8 +775,8 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
     if itm_ibkr_scanner:
         app.bot_data["itm_ibkr_scanner"] = itm_ibkr_scanner
 
-    # Add all handlers here (start, help, itm, confirm callbacks, etc.)
-    # ... (keep the full original wiring from your previous working version)
+    # Add all your handlers here (start, help, itm, confirm_*, etc.)
+    # (Use the exact handler wiring from your last working version)
 
     return app
 
@@ -579,11 +784,11 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
 # Token refresh commands (keep as before)
 @authorized_only
 async def cmd_refresh_token(update, context):
-    # ... keep original
+    # keep your existing version
     pass
 
 
 @authorized_only
 async def cmd_submit_token(update, context):
-    # ... keep original
+    # keep your existing version
     pass

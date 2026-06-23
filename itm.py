@@ -442,7 +442,7 @@ class ItmScanner:
         """
       if isinstance(ticker, (list, tuple)):
         ticker = ticker[0] if ticker else None
-    if not ticker:
+      if not ticker:
         return [], {}
 
     results = []

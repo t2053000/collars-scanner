@@ -276,6 +276,15 @@ class ItmScanner:
         Stage 1: lightweight chain (45d), check call skew at nearest strike below spot.
         Stage 2: full chain + APY calculation only if skew found.
         """
+      # === MINIMAL DEFENSIVE FIX ===
+    if isinstance(ticker, (list, tuple)):
+        ticker = ticker[0] if ticker else None
+    if not ticker:
+        return [], {}
+
+    results = []
+    debug = Counter()
+    ticker = ticker.upper()
         results = []
         debug = Counter()
         ticker = ticker.upper()

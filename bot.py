@@ -537,9 +537,9 @@ async def cmd_itm(update, context):
             return
         source = "Barchart"
     else:
-        hiv_tickers = github_store.get_latest_hiv_tickers()
-        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
-        source      = "Finviz"
+        # === ONLY from tickers.txt (your requested behavior) ===
+        tickers = github_store.get_tickers()
+        source = "tickers.txt"
 
     combined = sorted(set(tickers))
     if not combined:

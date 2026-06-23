@@ -440,6 +440,14 @@ class ItmScanner:
         Borrow cost: 20% APR × spot × dte/365 deducted from locked profit.
         Ex-div in window: flagged + 25 APY point sort penalty (you PAY dividend).
         """
+      if isinstance(ticker, (list, tuple)):
+        ticker = ticker[0] if ticker else None
+    if not ticker:
+        return [], {}
+
+    results = []
+    debug   = Counter()
+    ticker  = ticker.upper()
         results = []
         debug   = Counter()
         ticker  = ticker.upper()

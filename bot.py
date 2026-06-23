@@ -39,7 +39,7 @@ _LAST_ERRORS: deque = deque(maxlen=30)
 
 _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
-ORDER_FILL_TIMEOUT_SEC = 10          # <--- NEW: 10 second auto-cancel for both /itm and /itm r
+ORDER_FILL_TIMEOUT_SEC = 10          # Auto-cancel after 10s for both /itm and /itm r
 _ACTIVE_ORDERS: dict = {}
 
 MAX_TRADE_BUTTONS = 20
@@ -155,9 +155,9 @@ async def cmd_help(update, context):
         "`/positions` `/list` `/add` `/remove` `/logs` `/whoami`\n"
         "`/refresh_token` `/submit_token`\n\n"
         "*Trading:*\n"
-        "· `/itm` — tap Confirm to place order instantly (auto-cancels after 10s if unfilled)\n"
-        "· `/itm r` — reverse ITM scan (auto-cancels after 10s if unfilled)\n"
-        "· `/itmib` — reverse ITM scan via IBKR\n"
+        "· `/itm` — Confirm places order (original planned APY stays visible)\n"
+        "· `/itm r` — Reverse ITM (auto-cancels after 10s if unfilled)\n"
+        "· `/itmib` — Reverse ITM via IBKR\n"
         "· `/dca` — tap Confirm to place order instantly\n"
         "· `/positions` — projected P/L at expiry (this Friday)\n"
         "_Borrow cost (20% APR) deducted from /itm r APY._",
@@ -222,7 +222,6 @@ async def cmd_logs(update, context):
 
 @authorized_only
 async def cmd_positions(update, context):
-    """Show all positions expiring this Friday with projected P/L and APY."""
     user_id = update.effective_user.id
     schwab  = _get_schwab_for_user(context, user_id)
     msg     = await update.message.reply_text("📊 Fetching positions…")
@@ -543,7 +542,7 @@ async def cmd_itm(update, context):
             return
         source = "Barchart"
     else:
-        # === ONLY from tickers.txt (as requested) ===
+        # Only from tickers.txt
         tickers = github_store.get_tickers()
         source = "tickers.txt"
 
@@ -623,7 +622,7 @@ async def cmd_itmib(update, context):
 
 
 # ---------------------------------------------------------------------------
-# ITM confirm / cancel callbacks
+# ITM confirm callbacks (now reply instead of edit so original planned APY stays visible)
 # ---------------------------------------------------------------------------
 
 @authorized_callback
@@ -635,7 +634,7 @@ async def cb_confirm_trade(update, context):
     await query.answer()
     pending = _PENDING_TRADES.get((user_id, trade_id))
     if not pending or time.time() > pending.get("expires_at", 0):
-        await _edit_robust(query.message, "Trade expired. Re-run /itm.")
+        await query.message.reply_text("Trade expired. Re-run /itm.")
         return
     hit       = pending["hit"]
     walk_step = pending["walk_step"]
@@ -643,9 +642,15 @@ async def cb_confirm_trade(update, context):
         pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
         logger.exception("cb_confirm_trade: pricing failed")
-        await _edit_robust(query.message, f"Pricing failed: {type(e).__name__}: {e}")
+        await query.message.reply_text(f"Pricing failed: {type(e).__name__}: {e}")
         return
-    await _edit_robust(query.message, f"Submitting {hit['ticker']} ITM @ {pricing['apy']:.1f}% APY...")
+
+    # Reply instead of edit → original planned APY message stays visible
+    await query.message.reply_text(
+        f"Submitting {hit['ticker']} ITM @ {pricing['apy']:.1f}% APY...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
@@ -654,17 +659,20 @@ async def cb_confirm_trade(update, context):
         logger.info(f"cb_confirm_trade: order placed id={order_id} ticker={hit['ticker']}")
     except Exception as e:
         logger.exception("cb_confirm_trade: place_order failed")
-        await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        await query.message.reply_text(f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
+
     del _PENDING_TRADES[(user_id, trade_id)]
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "itm",
     }
-    await _edit_robust(query.message,
+    await query.message.reply_text(
         f"Order *{order_id}* submitted · {hit['ticker']} ITM\n"
         f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...")
+        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...",
+        parse_mode=ParseMode.MARKDOWN
+    )
     asyncio.create_task(monitor_order(context, user_id, order_id, query.message))
 
 
@@ -675,7 +683,7 @@ async def cb_cancel_trade(update, context):
     trade_id = query.data.split(":", 1)[1]
     await query.answer("Cancelled.")
     _PENDING_TRADES.pop((user_id, trade_id), None)
-    await _edit_robust(query.message, "Trade cancelled.")
+    await query.message.reply_text("Trade cancelled.")
 
 
 # ---------------------------------------------------------------------------
@@ -691,7 +699,7 @@ async def cb_confirm_dca(update, context):
     await query.answer()
     pending = _PENDING_TRADES.get((user_id, trade_id))
     if not pending or time.time() > pending.get("expires_at", 0):
-        await _edit_robust(query.message, "Trade expired. Re-run /dca.")
+        await query.message.reply_text("Trade expired. Re-run /dca.")
         return
     hit       = pending["hit"]
     walk_step = pending["walk_step"]
@@ -699,9 +707,9 @@ async def cb_confirm_dca(update, context):
         pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
         logger.exception("cb_confirm_dca: pricing failed")
-        await _edit_robust(query.message, f"Pricing failed: {type(e).__name__}: {e}")
+        await query.message.reply_text(f"Pricing failed: {type(e).__name__}: {e}")
         return
-    await _edit_robust(query.message, f"Submitting {hit['ticker']} DCA @ {pricing['apy']:.1f}% APY...")
+    await query.message.reply_text(f"Submitting {hit['ticker']} DCA @ {pricing['apy']:.1f}% APY...")
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
@@ -710,16 +718,18 @@ async def cb_confirm_dca(update, context):
         logger.info(f"cb_confirm_dca: order placed id={order_id} ticker={hit['ticker']}")
     except Exception as e:
         logger.exception("cb_confirm_dca: place_order failed")
-        await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        await query.message.reply_text(f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
     del _PENDING_TRADES[(user_id, trade_id)]
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "dca",
     }
-    await _edit_robust(query.message,
+    await query.message.reply_text(
         f"Order *{order_id}* submitted · {hit['ticker']} DCA\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring (30s)...")
+        f"APY: *{pricing['apy']:.1f}%*\nMonitoring (30s)...",
+        parse_mode=ParseMode.MARKDOWN
+    )
     asyncio.create_task(monitor_order(context, user_id, order_id, query.message))
 
 
@@ -730,11 +740,11 @@ async def cb_cancel_dca(update, context):
     trade_id = query.data.split(":", 1)[1]
     await query.answer("Cancelled.")
     _PENDING_TRADES.pop((user_id, trade_id), None)
-    await _edit_robust(query.message, "Trade cancelled.")
+    await query.message.reply_text("Trade cancelled.")
 
 
 # ---------------------------------------------------------------------------
-# Reverse ITM confirm / cancel callbacks
+# Reverse ITM confirm callbacks (reply instead of edit)
 # ---------------------------------------------------------------------------
 
 @authorized_callback
@@ -746,7 +756,7 @@ async def cb_confirm_rtrade(update, context):
     await query.answer()
     pending = _PENDING_TRADES.get((user_id, trade_id))
     if not pending or time.time() > pending.get("expires_at", 0):
-        await _edit_robust(query.message, "Trade expired. Re-run /itm r.")
+        await query.message.reply_text("Trade expired. Re-run /itm r.")
         return
     hit       = pending["hit"]
     walk_step = pending["walk_step"]
@@ -755,9 +765,15 @@ async def cb_confirm_rtrade(update, context):
         pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
         logger.exception("cb_confirm_rtrade: pricing failed")
-        await _edit_robust(query.message, f"Pricing failed: {type(e).__name__}: {e}")
+        await query.message.reply_text(f"Pricing failed: {type(e).__name__}: {e}")
         return
-    await _edit_robust(query.message, f"Submitting {ticker} Reverse ITM @ {pricing['apy']:.1f}% APY...")
+
+    # Reply instead of edit → original planned APY stays visible
+    await query.message.reply_text(
+        f"Submitting {ticker} Reverse ITM @ {pricing['apy']:.1f}% APY...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
@@ -766,17 +782,20 @@ async def cb_confirm_rtrade(update, context):
         logger.info(f"cb_confirm_rtrade: order placed id={order_id} ticker={ticker}")
     except Exception as e:
         logger.exception("cb_confirm_rtrade: place_order failed")
-        await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        await query.message.reply_text(f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
+
     del _PENDING_TRADES[(user_id, trade_id)]
     _ACTIVE_ORDERS[user_id] = {
         "order_id": order_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "itm_r",
     }
-    await _edit_robust(query.message,
+    await query.message.reply_text(
         f"Order *{order_id}* submitted · {ticker} Reverse ITM\n"
         f"Limit: ${pricing['put_limit']:.2f} sell / ${pricing['call_limit']:.2f} buy\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...")
+        f"APY: *{pricing['apy']:.1f}%*\nMonitoring ({ORDER_FILL_TIMEOUT_SEC}s)...",
+        parse_mode=ParseMode.MARKDOWN
+    )
     asyncio.create_task(monitor_rtrade_order(context, user_id, order_id, query.message, ticker))
 
 
@@ -787,11 +806,11 @@ async def cb_cancel_rtrade(update, context):
     trade_id = query.data.split(":", 1)[1]
     await query.answer("Cancelled.")
     _PENDING_TRADES.pop((user_id, trade_id), None)
-    await _edit_robust(query.message, "Trade cancelled.")
+    await query.message.reply_text("Trade cancelled.")
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Normal ITM + DCA (now with 10s auto-cancel)
+# Order monitoring — Normal ITM + DCA (10s auto-cancel)
 # ---------------------------------------------------------------------------
 
 async def monitor_order(context, user_id, order_id, status_msg):
@@ -824,7 +843,6 @@ async def monitor_order(context, user_id, order_id, status_msg):
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {tkr}")
         return
 
-    # Not filled after timeout → auto cancel
     if active:
         ticker = active["hit"]["ticker"]
         try:
@@ -841,7 +859,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
 
 
 # ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM (auto-cancel after 10s)
+# Order monitoring — Reverse ITM (10s auto-cancel)
 # ---------------------------------------------------------------------------
 
 async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
@@ -962,7 +980,7 @@ async def cb_cancel(update, context):
     except Exception as e:
         logger.warning(f"manual cancel failed: {e}")
     _ACTIVE_ORDERS.pop(user_id, None)
-    await _edit_robust(query.message, f"Order {order_id} cancelled.")
+    await query.message.reply_text(f"Order {order_id} cancelled.")
 
 
 # ---------------------------------------------------------------------------
@@ -985,7 +1003,6 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
     if itm_ibkr_scanner:
         app.bot_data["itm_ibkr_scanner"] = itm_ibkr_scanner
 
-    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -1005,7 +1022,6 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
     app.add_handler(CommandHandler("refresh_token", cmd_refresh_token))
     app.add_handler(CommandHandler("submit_token", cmd_submit_token))
 
-    # Callbacks
     app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))
     app.add_handler(CallbackQueryHandler(cb_confirm_dca,    pattern=r"^confirm_dca:"))
@@ -1017,10 +1033,6 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
 
     return app
 
-
-# ---------------------------------------------------------------------------
-# Token refresh commands (used by /refresh_token and /submit_token)
-# ---------------------------------------------------------------------------
 
 @authorized_only
 async def cmd_refresh_token(update, context):

@@ -70,7 +70,24 @@ def _write_lines(path: str, lines: list[str], msg: str):
 
 def get_tickers() -> list[str]:
     try:
-        return sorted({t.upper() for t in _read_lines(_TICKERS_PATH)})
+        raw_lines = _read_lines(_TICKERS_PATH)
+        if not raw_lines:
+            return []
+
+        # Join in case someone puts the whole list on one line (or multi-line list)
+        content = " ".join(raw_lines).strip()
+
+        # Support Python list literal format: ['BRR', 'UPXI', 'VYGR', ...]
+        if content.startswith("[") and content.endswith("]"):
+            inner = content.strip("[]")
+            for q in ("'", '"'):
+                inner = inner.replace(q, "")
+            parts = [p.strip() for p in inner.split(",") if p.strip()]
+            tickers = [p.upper() for p in parts if p]
+            return sorted(set(tickers))
+
+        # Normal case: one ticker per line (current behavior)
+        return sorted({t.upper() for t in raw_lines if t})
     except Exception as e:
         logger.error(f"Failed to read tickers: {e}")
         return []

@@ -1,350 +1,114 @@
 """
-github_store.py
-Read/write plain-text files in a GitHub data repo.
-
-Files managed:
-  tickers.txt               one ticker per line
-  div_tickers.txt           TICKER:FREQUENCY per line
-  whitelist.txt             one Telegram user ID per line
-
-Schwab tokens — loaded from env vars first, GitHub as fallback:
-  Primary token:  SCHWAB_TOKEN_JSON env var (existing)
-  Per-user tokens: SCHWAB_TOKEN_JSON_{user_id} env var
-                   Falls back to schwab_token_{uid}.json in GitHub repo
-
-On token refresh (save_schwab_token):
-  Always writes to GitHub so token persists across redeploys.
-
-Env vars:
-  GITHUB_TOKEN
-  GITHUB_REPO
-  GITHUB_TICKERS_PATH       default "tickers.txt"
-  GITHUB_DIV_TICKERS_PATH   default "div_tickers.txt"
-  GITHUB_WHITELIST_PATH     default "whitelist.txt"
-  SCHWAB_TOKEN_JSON_{uid}   per-user Schwab token JSON (optional, overrides GitHub)
+schwab_client.py
+Schwab API client wrapper with defensive input normalization.
 """
 
-import os
-import json
 import logging
-from pathlib import Path
-from github import Github, GithubException
+from datetime import datetime, timedelta
+
+from schwab import auth, client
+from schwab.client import Client
 
 logger = logging.getLogger(__name__)
 
-_TOKEN            = os.getenv("GITHUB_TOKEN", "")
-_REPO             = os.getenv("GITHUB_REPO", "")
-_TICKERS_PATH     = os.getenv("GITHUB_TICKERS_PATH",     "tickers.txt")
-_DIV_TICKERS_PATH = os.getenv("GITHUB_DIV_TICKERS_PATH", "div_tickers.txt")
-_WHITELIST_PATH   = os.getenv("GITHUB_WHITELIST_PATH",   "whitelist.txt")
 
-
-def _repo():
-    return Github(_TOKEN).get_repo(_REPO)
-
-
-def _get_or_create_file(path: str, initial_body: str = ""):
-    repo = _repo()
-    try:
-        return repo, repo.get_contents(path)
-    except GithubException:
-        repo.create_file(path, f"init {path}", initial_body)
-        return repo, repo.get_contents(path)
-
-
-def _read_lines(path: str) -> list[str]:
-    _, f = _get_or_create_file(path)
-    raw  = f.decoded_content.decode("utf-8")
-    return [ln.strip() for ln in raw.splitlines() if ln.strip()]
-
-
-def _write_lines(path: str, lines: list[str], msg: str):
-    repo, f = _get_or_create_file(path)
-    body    = "\n".join(lines) + "\n"
-    repo.update_file(f.path, msg, body, f.sha)
-
-
-# ---------------------------------------------------------------------------
-# Tickers
-# ---------------------------------------------------------------------------
-
-def get_tickers() -> list[str]:
-    try:
-        raw_lines = _read_lines(_TICKERS_PATH)
-        if not raw_lines:
-            return []
-
-        # Join in case someone puts the whole list on one line (or multi-line list)
-        content = " ".join(raw_lines).strip()
-
-        # Support Python list literal format: ['BRR', 'UPXI', 'VYGR', ...]
-        if content.startswith("[") and content.endswith("]"):
-            inner = content.strip("[]")
-            for q in ("'", '"'):
-                inner = inner.replace(q, "")
-            parts = [p.strip() for p in inner.split(",") if p.strip()]
-            tickers = [p.upper() for p in parts if p]
-            return sorted(set(tickers))
-
-        # Normal case: one ticker per line (current behavior)
-        return sorted({t.upper() for t in raw_lines if t})
-    except Exception as e:
-        logger.error(f"Failed to read tickers: {e}")
-        return []
-
-
-def add_ticker(ticker: str) -> tuple[bool, str]:
-    ticker = ticker.upper().strip()
-    if not ticker.isalpha() or len(ticker) > 6:
-        return False, f"❌ '{ticker}' doesn't look like a valid ticker."
-    current = get_tickers()
-    if ticker in current:
-        return False, f"ℹ️ {ticker} is already in the watchlist."
-    current.append(ticker)
-    _write_lines(_TICKERS_PATH, sorted(set(current)), f"add {ticker}")
-    return True, f"✅ {ticker} added."
-
-
-def remove_ticker(ticker: str) -> tuple[bool, str]:
-    ticker = ticker.upper().strip()
-    current = get_tickers()
-    if ticker not in current:
-        return False, f"ℹ️ {ticker} is not in the watchlist."
-    current.remove(ticker)
-    _write_lines(_TICKERS_PATH, current, f"remove {ticker}")
-    return True, f"🗑 {ticker} removed."
-
-
-# ---------------------------------------------------------------------------
-# Div tickers
-# ---------------------------------------------------------------------------
-
-def get_div_tickers() -> dict[str, str]:
-    try:
-        out = {}
-        for line in _read_lines(_DIV_TICKERS_PATH):
-            if line.startswith("#"):
-                continue
-            line = line.split("#", 1)[0].strip()
-            if not line:
-                continue
-            if ":" in line:
-                tk, freq = line.split(":", 1)
-                tk   = tk.strip().upper()
-                freq = freq.strip().upper()[:1]
-                if tk and freq in {"M", "Q", "S", "A", "W"}:
-                    out[tk] = freq
-        return out
-    except Exception as e:
-        logger.error(f"Failed to read div tickers: {e}")
-        return {}
-
-
-# ---------------------------------------------------------------------------
-# Whitelist
-# ---------------------------------------------------------------------------
-
-def get_whitelist() -> set[int]:
-    try:
-        ids = set()
-        for line in _read_lines(_WHITELIST_PATH):
-            if line.startswith("#"):
-                continue
-            try:
-                ids.add(int(line))
-            except ValueError:
-                pass
-        return ids
-    except Exception as e:
-        logger.error(f"Failed to read whitelist: {e}")
-        return set()
-
-
-def is_authorized(user_id: int) -> bool:
-    return user_id in get_whitelist()
-
-
-# ---------------------------------------------------------------------------
-# Per-user Schwab tokens
-# ---------------------------------------------------------------------------
-
-def _schwab_token_path_github(user_id: int) -> str:
-    return f"schwab_token_{user_id}.json"
-
-
-def _schwab_token_path_local(user_id: int) -> str:
-    return f"token_{user_id}.json"
-
-
-def _env_var_for_user(user_id: int) -> str:
-    return f"SCHWAB_TOKEN_JSON_{user_id}"
-
-
-def save_schwab_token(user_id: int, token_json: str) -> None:
-    """
-    Persist a user's Schwab token JSON to GitHub.
-    Always writes to GitHub so token survives redeploys.
-    (env var copy is read-only at runtime — Railway vars require manual update)
-    """
-    gh_path = _schwab_token_path_github(user_id)
-    repo    = _repo()
-    try:
-        existing = repo.get_contents(gh_path)
-        repo.update_file(
-            gh_path,
-            f"update schwab token for user {user_id}",
-            token_json,
-            existing.sha,
+class SchwabClient:
+    def __init__(self, token_path: str):
+        self._client = auth.easy_client(
+            api_key="your_api_key",           # keep your real values
+            app_secret="your_app_secret",
+            callback_url="your_callback_url",
+            token_path=token_path,
         )
-        logger.info(f"Updated Schwab token for user {user_id} in GitHub")
-    except GithubException:
-        repo.create_file(
-            gh_path,
-            f"create schwab token for user {user_id}",
-            token_json,
+
+    # =====================================================================
+    # Defensive normalization added to protect against list/tuple input
+    # =====================================================================
+
+    def get_option_chain(self, symbol: str, strike_count: int = 30) -> dict:
+        # === DEFENSIVE NORMALIZATION ===
+        if isinstance(symbol, (list, tuple)):
+            if symbol:
+                logger.warning(
+                    f"[schwab_client] get_option_chain received list/tuple, "
+                    f"using first element: {symbol[0]}"
+                )
+                symbol = symbol[0]
+            else:
+                logger.error("[schwab_client] get_option_chain received empty list/tuple")
+                return {}
+        if not symbol or not isinstance(symbol, str):
+            logger.error(f"[schwab_client] get_option_chain received invalid symbol: {symbol}")
+            return {}
+
+        from_date = datetime.now().date()
+        to_date = (datetime.now() + timedelta(days=800)).date()
+
+        resp = self._client.get_option_chain(
+            symbol,
+            contract_type=Client.Options.ContractType.ALL,
+            strike_count=strike_count,
+            include_underlying_quote=True,
+            from_date=from_date,
+            to_date=to_date,
         )
-        logger.info(f"Created Schwab token for user {user_id} in GitHub")
+        resp.raise_for_status()
+        return resp.json()
 
+    def get_option_chain_lite(self, symbol: str, days: int = 15) -> dict:
+        # === DEFENSIVE NORMALIZATION ===
+        if isinstance(symbol, (list, tuple)):
+            if symbol:
+                logger.warning(
+                    f"[schwab_client] get_option_chain_lite received list/tuple, "
+                    f"using first element: {symbol[0]}"
+                )
+                symbol = symbol[0]
+            else:
+                logger.error("[schwab_client] get_option_chain_lite received empty list/tuple")
+                return {}
+        if not symbol or not isinstance(symbol, str):
+            logger.error(f"[schwab_client] get_option_chain_lite received invalid symbol: {symbol}")
+            return {}
 
-def load_schwab_token(user_id: int) -> str | None:
-    """
-    Load a user's Schwab token and write it to a local file.
-    Priority:
-      1. SCHWAB_TOKEN_JSON_{user_id} env var (Railway variable)
-      2. schwab_token_{user_id}.json file in GitHub repo
-    Returns local file path, or None if no token found.
-    """
-    local_path = _schwab_token_path_local(user_id)
+        try:
+            from_date = datetime.now().date()
+            to_date = (datetime.now() + timedelta(days=days)).date()
 
-    # 1. Try env var first
-    env_key    = _env_var_for_user(user_id)
-    token_json = os.getenv(env_key)
-    if token_json and token_json.strip():
-        Path(local_path).write_text(token_json)
-        logger.info(f"Loaded Schwab token for user {user_id} from env var {env_key}")
-        return local_path
+            resp = self._client.get_option_chain(
+                symbol,
+                contract_type=Client.Options.ContractType.ALL,
+                strike_count=4,
+                include_underlying_quote=True,
+                from_date=from_date,
+                to_date=to_date,
+            )
+            if resp.status_code != 200:
+                return {}
+            return resp.json()
+        except Exception as e:
+            logger.debug(f"[{symbol}] get_option_chain_lite failed: {e}")
+            return {}
 
-    # 2. Fall back to GitHub
-    gh_path = _schwab_token_path_github(user_id)
-    repo    = _repo()
-    try:
-        f          = repo.get_contents(gh_path)
-        token_json = f.decoded_content.decode("utf-8")
-        Path(local_path).write_text(token_json)
-        logger.info(f"Loaded Schwab token for user {user_id} from GitHub to {local_path}")
-        return local_path
-    except GithubException:
-        logger.info(f"No Schwab token found for user {user_id} (env or GitHub)")
-        return None
+    # =====================================================================
+    # Other methods (unchanged)
+    # =====================================================================
 
+    def get_fundamentals(self, symbol: str):
+        try:
+            resp = self._client.get_fundamental(symbol)
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get("fundamental", {})
+        except Exception as e:
+            logger.warning(f"get_fundamentals failed for {symbol}: {e}")
+            return {}
 
-def list_schwab_token_user_ids() -> list[int]:
-    """
-    Return all Telegram user IDs that have a stored Schwab token.
-    Checks env vars (SCHWAB_TOKEN_JSON_{uid}) first, then GitHub files.
-    Deduplicates — if user has both env var and GitHub file, counted once.
-    """
-    user_ids = set()
-
-    # 1. Scan env vars for SCHWAB_TOKEN_JSON_{uid}
-    for key in os.environ:
-        if key.startswith("SCHWAB_TOKEN_JSON_"):
-            suffix = key[len("SCHWAB_TOKEN_JSON_"):]
-            try:
-                uid = int(suffix)
-                if os.environ[key].strip():  # non-empty value
-                    user_ids.add(uid)
-            except ValueError:
-                pass
-
-    # 2. Scan GitHub repo for schwab_token_{uid}.json
-    try:
-        repo     = _repo()
-        contents = repo.get_contents("")
-        for item in contents:
-            name = item.name
-            if name.startswith("schwab_token_") and name.endswith(".json"):
-                try:
-                    uid = int(name[len("schwab_token_"):-len(".json")])
-                    user_ids.add(uid)
-                except ValueError:
-                    pass
-    except Exception as e:
-        logger.error(f"Failed to list Schwab token files from GitHub: {e}")
-
-    return list(user_ids)
-
-
-# ---------------------------------------------------------------------------
-# Generic file save (used by hiv_fetcher)
-# ---------------------------------------------------------------------------
-
-def save_file(path: str, content: str, commit_msg: str) -> None:
-    """Create or update any file in the GitHub repo."""
-    repo = _repo()
-    try:
-        existing = repo.get_contents(path)
-        repo.update_file(path, commit_msg, content, existing.sha)
-        logger.info(f"Updated {path} in GitHub")
-    except GithubException:
-        repo.create_file(path, commit_msg, content)
-        logger.info(f"Created {path} in GitHub")
-
-
-def get_latest_hiv_tickers() -> list[str]:
-    """
-    Return ticker list from the most recent tickers/tickers_*.csv file in GitHub.
-    Returns empty list if none found.
-    """
-    repo = _repo()
-    try:
-        contents = repo.get_contents("tickers")
-        csv_files = [
-            f for f in contents
-            if f.name.startswith("tickers_") and f.name.endswith(".csv")
-        ]
-        if not csv_files:
-            return []
-        # Sort by filename (YYYYMMDD_HHMM) — latest last
-        latest = sorted(csv_files, key=lambda f: f.name)[-1]
-        raw    = latest.decoded_content.decode("utf-8")
-        lines  = raw.strip().splitlines()
-        tickers = []
-        for line in lines[1:]:  # skip header
-            ticker = line.split(",")[0].strip()
-            if ticker:
-                tickers.append(ticker.upper())
-        logger.info(f"Loaded {len(tickers)} HIV tickers from {latest.name}")
-        return tickers
-    except Exception as e:
-        logger.error(f"get_latest_hiv_tickers failed: {e}")
-        return []
-
-
-def get_latest_barchart_tickers() -> list[str]:
-    """
-    Return ticker list from the most recent tickers/bc_*.csv file in GitHub.
-    Returns empty list if none found.
-    """
-    repo = _repo()
-    try:
-        contents = repo.get_contents("tickers")
-        csv_files = [
-            f for f in contents
-            if f.name.startswith("bc_") and f.name.endswith(".csv")
-        ]
-        if not csv_files:
-            return []
-        latest = sorted(csv_files, key=lambda f: f.name)[-1]
-        raw    = latest.decoded_content.decode("utf-8")
-        lines  = raw.strip().splitlines()
-        tickers = []
-        for line in lines[1:]:
-            ticker = line.split(",")[0].strip()
-            if ticker:
-                tickers.append(ticker.upper())
-        logger.info(f"Loaded {len(tickers)} Barchart tickers from {latest.name}")
-        return tickers
-    except Exception as e:
-        logger.error(f"get_latest_barchart_tickers failed: {e}")
-        return []
+    def get_quote(self, symbol: str):
+        try:
+            resp = self._client.get_quote(symbol)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.warning(f"get_quote failed for {symbol}: {e}")
+            return {}

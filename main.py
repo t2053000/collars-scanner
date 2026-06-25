@@ -94,22 +94,22 @@ def _start_schedulers(log: logging.Logger):
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler()
-        scheduler.add_job(
-            run_hiv_fetch_job,
-            trigger="interval",
-            minutes=15,
-            id="hiv_fetch",
-            replace_existing=True,
-            misfire_grace_time=60,
-        )
-        scheduler.add_job(
-            run_barchart_fetch_job,
-            trigger="interval",
-            minutes=20,
-            id="barchart_fetch",
-            replace_existing=True,
-            misfire_grace_time=60,
-        )
+     #   scheduler.add_job(
+     #       run_hiv_fetch_job,
+     #       trigger="interval",
+     #       minutes=15,
+     #       id="hiv_fetch",
+     #       replace_existing=True,
+     #       misfire_grace_time=60,
+     #   )
+     #   scheduler.add_job(
+     #       run_barchart_fetch_job,
+     #       trigger="interval",
+     #       minutes=20,
+     #       id="barchart_fetch",
+     #       replace_existing=True,
+     #       misfire_grace_time=60,
+     #   )
         scheduler.start()
         log.info("Schedulers started: HIV (15min), Barchart (20min market hours)")
         # Run immediately on startup

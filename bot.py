@@ -601,8 +601,8 @@ async def cmd_itmib(update, context):
             await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
             return
     else:
-        hiv_tickers = github_store.get_latest_hiv_tickers()
-        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+        tickers = github_store.get_tickers()
+        
 
     combined = sorted(set(tickers))
     if not combined:

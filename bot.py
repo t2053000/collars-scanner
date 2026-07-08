@@ -40,6 +40,7 @@ _LAST_ERRORS: deque = deque(maxlen=30)
 _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
 _ACTIVE_ORDERS: dict = {}
+_ITMT_STOP: set = set()
 
 MAX_TRADE_BUTTONS = 20
 
@@ -1058,13 +1059,14 @@ async def cmd_itmt(update, context):
         parse_mode=ParseMode.MARKDOWN)
 
     loop      = asyncio.get_running_loop()
+    _ITMT_STOP.discard(user_id)
     remaining = budget
     deadline  = time.time() + (timeout_min * 60)
     cycle     = 0
     fills     = []
     sem       = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    while time.time() < deadline and remaining > 0:
+    while time.time() < deadline and remaining > 0 and user_id not in _ITMT_STOP:
         cycle += 1
         elapsed = time.time() - (deadline - timeout_min * 60)
 
@@ -1202,6 +1204,13 @@ async def cmd_itmt(update, context):
 
 
 @authorized_only
+
+
+@authorized_only
+async def cmd_stop(update, context):
+    user_id = update.effective_user.id
+    _ITMT_STOP.add(user_id)
+    await update.message.reply_text("Stopping ITMT after current cycle.")
 async def cmd_cancel_all(update, context):
     user_id = update.effective_user.id
     schwab = _get_schwab_for_user(context, user_id)
@@ -1275,6 +1284,8 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
     app.add_handler(CommandHandler("itmm",           cmd_itmt))
     app.add_handler(CommandHandler("r",              cmd_refresh_token))
     app.add_handler(CommandHandler("s",              cmd_submit_token))
+    app.add_handler(CommandHandler("stop",           cmd_stop))
+    app.add_handler(CommandHandler("x",              cmd_stop))
 
     app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))

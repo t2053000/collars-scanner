@@ -53,9 +53,9 @@ class SchwabClient:
         data = resp.json()
         return float(data[symbol]["quote"]["lastPrice"])
 
-    def get_option_chain(self, symbol: str, strike_count: int = 30) -> dict:
+    def get_option_chain(self, symbol: str, strike_count: int = 30, days: int = 800) -> dict:
         from_date = datetime.now().date()
-        to_date   = (datetime.now() + timedelta(days=800)).date()
+        to_date   = (datetime.now() + timedelta(days=days)).date()
         resp = self._client.get_option_chain(
             symbol,
             contract_type=Client.Options.ContractType.ALL,
@@ -229,3 +229,18 @@ class SchwabClient:
                 f"Cancel failed: HTTP {resp.status_code} – {resp.text[:300]}"
             )
         logger.info(f"Order {order_id} cancelled successfully.")
+
+    def get_working_orders(self) -> list[dict]:
+        """Return all cancellable orders (WORKING, QUEUED, ACCEPTED)."""
+        from datetime import datetime, timedelta
+        account_hash = self.get_account_hash()
+        resp = self._client.get_orders_for_account(
+            account_hash,
+            from_entered_datetime=datetime.utcnow() - timedelta(days=1),
+            status=self._client.Order.Status.WORKING,
+        )
+        resp.raise_for_status()
+        orders = resp.json()
+        return [o for o in orders if o.get("status") in
+                ("WORKING", "QUEUED", "ACCEPTED", "PENDING_ACTIVATION",
+                 "AWAITING_CONDITION", "NEW")]

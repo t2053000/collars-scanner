@@ -348,3 +348,43 @@ def get_latest_barchart_tickers() -> list[str]:
     except Exception as e:
         logger.error(f"get_latest_barchart_tickers failed: {e}")
         return []
+
+
+# ---------------------------------------------------------------------------
+# Fill log
+# ---------------------------------------------------------------------------
+
+def save_fill(fill: dict) -> None:
+    """Append a fill record to fills.json in the GitHub repo."""
+    import json
+    from datetime import datetime
+    fill["timestamp"] = datetime.utcnow().isoformat()
+    path = "fills.json"
+    try:
+        repo = _repo()
+        try:
+            f = repo.get_contents(path)
+            existing = json.loads(f.decoded_content.decode("utf-8"))
+            existing.append(fill)
+            repo.update_file(path, f"fill: {fill.get('ticker','?')}", json.dumps(existing, indent=2), f.sha)
+        except Exception:
+            repo.create_file(path, f"fill: {fill.get('ticker','?')}", json.dumps([fill], indent=2))
+        logger.info(f"Saved fill: {fill.get('ticker')} to GitHub")
+    except Exception as e:
+        logger.error(f"save_fill failed: {e}")
+
+
+def get_fills(days: int = 30) -> list[dict]:
+    """Read fill log from GitHub, optionally filtered to last N days."""
+    import json
+    from datetime import datetime, timedelta
+    try:
+        repo = _repo()
+        f = repo.get_contents("fills.json")
+        fills = json.loads(f.decoded_content.decode("utf-8"))
+        if days:
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            fills = [fl for fl in fills if fl.get("timestamp", "") >= cutoff]
+        return fills
+    except Exception:
+        return []

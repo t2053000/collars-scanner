@@ -41,6 +41,7 @@ _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
 _ACTIVE_ORDERS: dict = {}
 _ITMT_STOP: set = set()
+_ITMT_STOP: set = set()
 
 MAX_TRADE_BUTTONS = 20
 
@@ -363,10 +364,22 @@ async def _send_itm_trade_button(update, context, hit):
         f"💳 Pay ${hit.get('primary_debit', 0):.2f}/sh → *{apy:.1f}% APY*\n"
         f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit.get('locked_total', 0):.0f}"
     )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Confirm @ {apy:.1f}% APY", callback_data=f"confirm_trade:{trade_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_trade:{trade_id}"),
-    ]])
+    # Build multi-tier APY buttons
+    buttons = []
+    for ws in range(3):
+        try:
+            p = orders.compute_legs_pricing(hit, walk_step=ws)
+            if p["apy"] >= orders.MIN_APY_FLOOR_PCT:
+                buttons.append(InlineKeyboardButton(
+                    f"{'📈' if ws == 0 else '📊' if ws == 1 else '📉'} {p['apy']:.0f}%",
+                    callback_data=f"confirm_trade:{trade_id}:{ws}"))
+        except Exception:
+            pass
+    if not buttons:
+        buttons.append(InlineKeyboardButton(
+            f"✅ Confirm @ {apy:.1f}%", callback_data=f"confirm_trade:{trade_id}:0"))
+    buttons.append(InlineKeyboardButton("❌", callback_data=f"cancel_trade:{trade_id}"))
+    keyboard = InlineKeyboardMarkup([buttons])
     try:
         await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     except BadRequest as e:
@@ -625,15 +638,17 @@ async def cmd_itmib(update, context):
 async def cb_confirm_trade(update, context):
     query    = update.callback_query
     user_id  = update.effective_user.id
-    trade_id = query.data.split(":", 1)[1]
-    logger.info(f"cb_confirm_trade FIRED user={user_id} trade_id={trade_id}")
+    parts    = query.data.split(":")
+    trade_id = parts[1]
+    walk_step_override = int(parts[2]) if len(parts) > 2 else None
+    logger.info(f"cb_confirm_trade FIRED user={user_id} trade_id={trade_id} ws={walk_step_override}")
     await query.answer()
     pending = _PENDING_TRADES.get((user_id, trade_id))
     if not pending or time.time() > pending.get("expires_at", 0):
         await _edit_robust(query.message, "Trade expired. Re-run /itm.")
         return
     hit       = pending["hit"]
-    walk_step = pending["walk_step"]
+    walk_step = walk_step_override if walk_step_override is not None else pending["walk_step"]
     try:
         pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
@@ -652,8 +667,8 @@ async def cb_confirm_trade(update, context):
         await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
     del _PENDING_TRADES[(user_id, trade_id)]
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": order_id, "hit": hit, "pricing": pricing,
+    _ACTIVE_ORDERS[order_id] = {
+        "order_id": order_id, "user_id": user_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "itm",
     }
     await _edit_robust(query.message,
@@ -708,8 +723,8 @@ async def cb_confirm_dca(update, context):
         await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
     del _PENDING_TRADES[(user_id, trade_id)]
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": order_id, "hit": hit, "pricing": pricing,
+    _ACTIVE_ORDERS[order_id] = {
+        "order_id": order_id, "user_id": user_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "dca",
     }
     await _edit_robust(query.message,
@@ -765,8 +780,8 @@ async def cb_confirm_rtrade(update, context):
         await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
     del _PENDING_TRADES[(user_id, trade_id)]
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": order_id, "hit": hit, "pricing": pricing,
+    _ACTIVE_ORDERS[order_id] = {
+        "order_id": order_id, "user_id": user_id, "hit": hit, "pricing": pricing,
         "walk_step": walk_step, "trade_type": "itm_r",
     }
     await _edit_robust(query.message,
@@ -806,7 +821,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
                 filled = True
                 break
             if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
-                active = _ACTIVE_ORDERS.pop(user_id, None)
+                active = _ACTIVE_ORDERS.pop(order_id, None)
                 tkr    = active["hit"]["ticker"] if active else "?"
                 await _edit_robust(status_msg, f"Order {order_id} for {tkr} ended: {status_str}")
                 return
@@ -814,11 +829,21 @@ async def monitor_order(context, user_id, order_id, status_msg):
             logger.warning(f"order status poll failed: {e}")
             continue
     if filled:
-        active = _ACTIVE_ORDERS.pop(user_id, None)
+        active = _ACTIVE_ORDERS.pop(order_id, None)
         tkr    = active["hit"]["ticker"] if active else "?"
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {tkr}")
+        if active:
+            github_store.save_fill({
+                "ticker": active["hit"]["ticker"],
+                "strike": active["hit"].get("strike"),
+                "exp": active["hit"].get("exp_date"),
+                "dte": active["hit"].get("dte"),
+                "apy": active["pricing"].get("apy"),
+                "cost": active["hit"].get("spot", 0) * 100,
+                "order_id": order_id, "source": "manual",
+            })
         return
-    active = _ACTIVE_ORDERS.get(user_id)
+    active = _ACTIVE_ORDERS.get(order_id)
     if not active:
         return
     hit          = active["hit"]
@@ -858,13 +883,13 @@ async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
                 filled = True
                 break
             if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
-                _ACTIVE_ORDERS.pop(user_id, None)
+                _ACTIVE_ORDERS.pop(order_id, None)
                 await _edit_robust(status_msg, f"Order {order_id} for {ticker} ended: {status_str}")
                 return
         except Exception as e:
             logger.warning(f"monitor_rtrade_order: poll failed: {e}")
             continue
-    _ACTIVE_ORDERS.pop(user_id, None)
+    _ACTIVE_ORDERS.pop(order_id, None)
     if filled:
         try:
             short_payload  = orders.build_short_stock_order(ticker)
@@ -906,8 +931,8 @@ async def cb_improve(update, context):
     order_id = query.data.split(":", 1)[1]
     logger.info(f"cb_improve FIRED user={user_id} order={order_id}")
     await query.answer()
-    active = _ACTIVE_ORDERS.get(user_id)
-    if not active or active["order_id"] != order_id:
+    active = _ACTIVE_ORDERS.get(order_id)
+    if not active:
         await query.message.reply_text("Order session expired.")
         return
     schwab = _get_schwab_for_user(context, user_id)
@@ -921,7 +946,7 @@ async def cb_improve(update, context):
     new_pricing = orders.compute_legs_pricing(hit, walk_step=new_walk)
     if not orders.can_improve(new_pricing):
         await query.message.reply_text(f"Improvement would drop below {orders.MIN_APY_FLOOR_PCT:g}% floor. Aborted.")
-        _ACTIVE_ORDERS.pop(user_id, None)
+        _ACTIVE_ORDERS.pop(order_id, None)
         return
     try:
         payload      = orders.build_itm_conversion_order(hit, new_pricing)
@@ -929,13 +954,14 @@ async def cb_improve(update, context):
     except Exception as e:
         logger.exception("improve resubmit failed")
         await query.message.reply_text(f"Resubmit failed: {type(e).__name__}: {e}")
-        _ACTIVE_ORDERS.pop(user_id, None)
+        _ACTIVE_ORDERS.pop(order_id, None)
         return
     status_msg = await query.message.reply_text(
         f"Retry #{new_walk}: order *{new_order_id}* @ {new_pricing['apy']:.1f}% APY\nMonitoring (8s)...",
         parse_mode=ParseMode.MARKDOWN)
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": new_order_id, "hit": hit, "pricing": new_pricing,
+    _ACTIVE_ORDERS.pop(order_id, None)
+    _ACTIVE_ORDERS[new_order_id] = {
+        "order_id": new_order_id, "user_id": user_id, "hit": hit, "pricing": new_pricing,
         "walk_step": new_walk, "trade_type": active.get("trade_type", "itm"),
     }
     asyncio.create_task(monitor_order(context, user_id, new_order_id, status_msg))
@@ -948,8 +974,8 @@ async def cb_cancel(update, context):
     order_id = query.data.split(":", 1)[1]
     logger.info(f"cb_cancel FIRED user={user_id} order={order_id}")
     await query.answer()
-    active = _ACTIVE_ORDERS.get(user_id)
-    if not active or active["order_id"] != order_id:
+    active = _ACTIVE_ORDERS.get(order_id)
+    if not active:
         await query.message.reply_text("No active order.")
         return
     schwab = _get_schwab_for_user(context, user_id)
@@ -959,7 +985,7 @@ async def cb_cancel(update, context):
         await query.message.reply_text(f"Order {order_id} cancelled.")
     except Exception as e:
         await query.message.reply_text(f"Cancel failed: {e}")
-    _ACTIVE_ORDERS.pop(user_id, None)
+    _ACTIVE_ORDERS.pop(order_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1181,6 +1207,12 @@ async def cmd_itmt(update, context):
                 "exp": hit["exp_date"], "apy": pricing["apy"],
                 "cost": cost, "order_id": oid,
             })
+            github_store.save_fill({
+                "ticker": hit["ticker"], "strike": hit["strike"],
+                "exp": hit["exp_date"], "dte": hit["dte"],
+                "apy": pricing["apy"], "cost": cost,
+                "order_id": oid, "source": "itmt",
+            })
             await _send_robust(update.message.reply_text,
                 f"✅ *FILLED* — {hit['ticker']} · order {oid}\n"
                 f"Strike ${hit['strike']:g} · {hit['exp_date']} "
@@ -1204,6 +1236,23 @@ async def cmd_itmt(update, context):
 
 
 @authorized_only
+async def cmd_fills(update, context):
+    """Show fill history and stats."""
+    args = context.args or []
+    days = int(args[0]) if args else 30
+    fills = github_store.get_fills(days=days)
+    if not fills:
+        await update.message.reply_text(f"No fills in the last {days} days.")
+        return
+    total_cost = sum(f.get("cost", 0) for f in fills)
+    apys = [f["apy"] for f in fills if f.get("apy")]
+    avg_apy = sum(apys) / len(apys) if apys else 0
+    lines = [f"📊 *{len(fills)} fills* last {days}d — ${total_cost:,.0f} deployed — avg APY {avg_apy:.1f}%\n"]
+    for fl in fills[-15:]:
+        src = "🤖" if fl.get("source") == "itmt" else "👆"
+        lines.append(f"{src} {fl.get('ticker', '?'):>5} ${fl.get('strike', 0):g} "
+                     f"{fl.get('exp', '?')} {fl.get('apy', 0):.1f}% ${fl.get('cost', 0):,.0f}")
+    await _send_robust(update.message.reply_text, "\n".join(lines))
 
 
 @authorized_only
@@ -1211,6 +1260,9 @@ async def cmd_stop(update, context):
     user_id = update.effective_user.id
     _ITMT_STOP.add(user_id)
     await update.message.reply_text("Stopping ITMT after current cycle.")
+
+
+@authorized_only
 async def cmd_cancel_all(update, context):
     user_id = update.effective_user.id
     schwab = _get_schwab_for_user(context, user_id)
@@ -1234,7 +1286,8 @@ async def cmd_cancel_all(update, context):
             cancelled += 1
         except Exception:
             failed += 1
-    _ACTIVE_ORDERS.pop(user_id, None)
+    for oid in [k for k, v in _ACTIVE_ORDERS.items() if v.get("user_id") == user_id]:
+        _ACTIVE_ORDERS.pop(oid, None)
     msg = f"Cancelled {cancelled} order(s)."
     if failed:
         msg += f" {failed} failed."
@@ -1286,6 +1339,8 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
     app.add_handler(CommandHandler("s",              cmd_submit_token))
     app.add_handler(CommandHandler("stop",           cmd_stop))
     app.add_handler(CommandHandler("x",              cmd_stop))
+    app.add_handler(CommandHandler("fills",          cmd_fills))
+    app.add_handler(CommandHandler("f",              cmd_fills))
 
     app.add_handler(CallbackQueryHandler(cb_confirm_trade,  pattern=r"^confirm_trade:"))
     app.add_handler(CallbackQueryHandler(cb_cancel_trade,   pattern=r"^cancel_trade:"))
@@ -1359,8 +1414,8 @@ async def handle_yes_reply(update, context):
         await _edit_robust(status_msg, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
         return
     del _PENDING_TRADES[(uid, tid)]
-    _ACTIVE_ORDERS[user_id] = {
-        "order_id": order_id, "hit": hit, "pricing": pricing,
+    _ACTIVE_ORDERS[order_id] = {
+        "order_id": order_id, "user_id": user_id, "hit": hit, "pricing": pricing,
         "walk_step": pending["walk_step"], "trade_type": trade_type,
     }
     await _edit_robust(status_msg,

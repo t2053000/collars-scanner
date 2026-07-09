@@ -296,7 +296,7 @@ class ItmScanner:
 
         # Stage 2 — full chain fetch
         try:
-            chain = self.schwab.get_option_chain(ticker)
+            chain = self.schwab.get_option_chain(ticker, days=DTE_MAX)
         except Exception as e:
             logger.error(f"[{ticker}] option chain fetch failed: {e}")
             raise
@@ -451,7 +451,7 @@ class ItmScanner:
 
         # Stage 2 — full chain fetch
         try:
-            chain = self.schwab.get_option_chain(ticker)
+            chain = self.schwab.get_option_chain(ticker, days=REVERSE_DTE_MAX)
         except Exception as e:
             logger.error(f"[{ticker}] reverse scan chain fetch failed: {e}")
             raise

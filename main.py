@@ -35,8 +35,20 @@ def _configure_logging():
 
 def _bootstrap_schwab_token():
     log        = logging.getLogger("main")
-    token_json = os.getenv("SCHWAB_TOKEN_JSON")
     token_path = Path(os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
+    primary_uid = int(os.getenv("PRIMARY_TELEGRAM_USER_ID", "0"))
+
+    # 1. Try GitHub first — has the most recently refreshed token
+    if primary_uid:
+        gh_token_path = github_store.load_schwab_token(primary_uid)
+        if gh_token_path:
+            import shutil
+            shutil.copy(gh_token_path, str(token_path))
+            log.info(f"Loaded primary Schwab token from GitHub for user {primary_uid}")
+            return
+
+    # 2. Fall back to env var (initial setup only)
+    token_json = os.getenv("SCHWAB_TOKEN_JSON")
     if token_json and not token_path.exists():
         token_path.write_text(token_json)
         log.info(f"Wrote primary Schwab token from env to {token_path}")
@@ -148,6 +160,15 @@ def main():
     log.info(f"Loaded {len(div_tickers)} dividend tickers from GitHub")
 
     primary_schwab = schwab_clients[primary_user_id]
+
+    # Save primary token to GitHub so it survives next redeploy
+    try:
+        token_path = Path(os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
+        if token_path.exists():
+            github_store.save_schwab_token(primary_user_id, token_path.read_text())
+            log.info("Saved primary Schwab token to GitHub")
+    except Exception as e:
+        log.warning(f"Could not save primary token to GitHub: {e}")
 
     collar_scanner  = CollarScanner(primary_schwab)
     spread_scanner  = SpreadScanner(primary_schwab)

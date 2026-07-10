@@ -1077,6 +1077,7 @@ async def cmd_itmt(update, context):
     hiv_tickers = github_store.get_latest_hiv_tickers()
     tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
     tickers = sorted(set(tickers))
+    logger.info(f"ITMT: {len(tickers)} tickers loaded, budget=${budget}, min_apy={min_apy}")
 
     status_msg = await update.message.reply_text(
         f"🤖 *ITMT started*\n"
@@ -1118,7 +1119,10 @@ async def cmd_itmt(update, context):
                     if errors <= 3:
                         logger.error(f"ITMT scan error {tk}: {e}")
 
+        scan_start = time.time()
         await asyncio.gather(*(scan_one(t) for t in tickers))
+        scan_dur = time.time() - scan_start
+        logger.info(f"ITMT cycle {cycle}: scan done in {scan_dur:.1f}s — {len(all_hits)} hits, {errors} errors")
 
         # ── filter & rank ───────────────────────────────
         candidates = []
@@ -1129,6 +1133,10 @@ async def cmd_itmt(update, context):
             if p["apy"] >= min_apy:
                 candidates.append((h, p))
         candidates.sort(key=lambda x: x[1]["apy"], reverse=True)
+        logger.info(f"ITMT cycle {cycle}: {len(candidates)} qualified (budget ${remaining:,.0f}, min_apy {min_apy}%)")
+        if candidates:
+            for i, (h, p) in enumerate(candidates[:5]):
+                logger.info(f"  #{i+1} {h['ticker']} spot=${h['spot']:.2f} strike=${h['strike']:g} APY={p['apy']:.1f}% cost=${h['spot']*100:.0f}")
 
         await _edit_robust(status_msg,
             f"🤖 *ITMT cycle {cycle}*\n"
@@ -1136,6 +1144,7 @@ async def cmd_itmt(update, context):
             f"Hits: {len(all_hits)} · Qualified: {len(candidates)} · Errors: {errors}")
 
         if not candidates:
+            logger.info(f"ITMT cycle {cycle}: no candidates — sleeping 5s")
             await asyncio.sleep(5)
             continue
 
@@ -1154,7 +1163,9 @@ async def cmd_itmt(update, context):
             except Exception as e:
                 logger.warning(f"ITMT place failed {hit['ticker']}: {e}")
 
+        logger.info(f"ITMT cycle {cycle}: {len(placed)} orders placed")
         if not placed:
+            logger.info(f"ITMT cycle {cycle}: all placements failed — sleeping 3s")
             await asyncio.sleep(3)
             continue
 
@@ -1187,6 +1198,8 @@ async def cmd_itmt(update, context):
             if winner:
                 break
             live = still_live
+
+        logger.info(f"ITMT cycle {cycle}: poll done — winner={'yes' if winner else 'no'}, {len(live)} still live")
 
         # ── cancel non-winners ──────────────────────────
         winner_oid = winner[0] if winner else None

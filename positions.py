@@ -51,15 +51,11 @@ def _parse_option_symbol(symbol: str) -> Optional[dict]:
 
 def compute_positions(raw_positions: list) -> str:
     """
-    Given raw Schwab positions list, compute projected P/L for all
-    tickers with at least one option expiring today through this Friday.
-    Returns formatted message string.
+    Given raw Schwab positions list, compute projected P/L grouped
+    by expiration date, then by ticker within each expiration.
+    Shows expected profit and capital freed per expiration.
     """
-    today  = date.today()
-    friday = _this_friday()
-    max_dte = (friday - today).days
-    # dte for APY — use days until friday, min 1 to avoid div/0
-    dte = max(max_dte, 1)
+    today = date.today()
 
     # Separate stock and option positions
     stocks  = {}   # ticker → {qty, avg_price, mark}
@@ -88,7 +84,6 @@ def compute_positions(raw_positions: list) -> str:
             if parsed is None:
                 logger.debug(f"Could not parse option symbol: {symbol}")
                 continue
-            # mark per share (Schwab marketValue is for the whole position)
             contracts = abs(qty)
             mark_per_share = mkt_value / (contracts * 100) if contracts > 0 else 0.0
             options.append({
@@ -102,110 +97,108 @@ def compute_positions(raw_positions: list) -> str:
                 "mark":      mark_per_share,
             })
 
-    # Filter options expiring today through this Friday (inclusive)
-    window_options = [
-        o for o in options
-        if today <= o["expiry"] <= friday
-    ]
+    # Filter to options expiring today or later
+    future_options = [o for o in options if o["expiry"] >= today]
+    if not future_options:
+        return "📭 No open option positions."
 
-    # Get tickers with at least one option in window
-    window_tickers = set(o["ticker"] for o in window_options)
-    if not window_tickers:
-        return (
-            f"📭 No positions expiring between today "
-            f"({today.strftime('%b %d')}) and "
-            f"Friday ({friday.strftime('%b %d')})."
-        )
+    # Get all expiration dates, sorted
+    expirations = sorted(set(o["expiry"] for o in future_options))
 
     lines = []
-    lines.append(
-        f"📊 *Positions expiring by {friday.strftime('%a %b %d')}*\n"
-        f"{'─' * 32}"
-    )
+    lines.append(f"📊 *Open positions — {len(future_options)} legs*\n{'─' * 32}")
 
-    total_pl = 0.0
+    grand_total_pl = 0.0
+    grand_total_capital = 0.0
 
-    for ticker in sorted(window_tickers):
-        ticker_opts = [o for o in window_options if o["ticker"] == ticker]
-        stock       = stocks.get(ticker)
+    for exp in expirations:
+        exp_options = [o for o in future_options if o["expiry"] == exp]
+        exp_tickers = sorted(set(o["ticker"] for o in exp_options))
+        dte = max((exp - today).days, 1)
 
-        # Get spot from stock mark
-        spot = stock["mark"] if stock and stock["mark"] > 0 else None
-        if spot is None or spot <= 0:
-            # Fall back to nearest strike as rough proxy
-            spot = ticker_opts[0]["strike"] if ticker_opts else 0.0
-        if spot <= 0:
-            continue
+        exp_pl = 0.0
+        exp_capital = 0.0
 
-        # ---------------------------------------------------------------
-        # Projected P/L at expiration (spot stays flat)
-        # Long  call: max(spot - strike, 0) - avg_price  per share × 100 × contracts
-        # Short call: avg_price - max(spot - strike, 0)
-        # Long  put:  max(strike - spot, 0) - avg_price
-        # Short put:  avg_price - max(strike - spot, 0)
-        # Stock:      (spot - avg_price) × qty
-        # ---------------------------------------------------------------
+        ticker_lines = []
 
-        stock_pl   = 0.0
-        stock_cost = 0.0
-        if stock:
-            stock_pl   = (spot - stock["avg_price"]) * stock["qty"]
-            stock_cost = stock["avg_price"] * abs(stock["qty"])
+        for ticker in exp_tickers:
+            ticker_opts = [o for o in exp_options if o["ticker"] == ticker]
+            stock = stocks.get(ticker)
 
-        options_pl   = 0.0
-        options_cost = 0.0
-        leg_strs     = []
+            # Get spot from stock mark
+            spot = stock["mark"] if stock and stock["mark"] > 0 else None
+            if spot is None or spot <= 0:
+                spot = ticker_opts[0]["strike"] if ticker_opts else 0.0
+            if spot <= 0:
+                continue
 
-        for o in sorted(ticker_opts, key=lambda x: (x["expiry"], x["strike"], x["right"])):
-            contracts = abs(o["qty"])
-            if o["right"] == "C":
-                intrinsic = max(spot - o["strike"], 0)
+            # Compute P/L per leg
+            stock_pl = 0.0
+            stock_cost = 0.0
+            if stock:
+                stock_pl = (spot - stock["avg_price"]) * stock["qty"]
+                stock_cost = stock["avg_price"] * abs(stock["qty"])
+
+            options_pl = 0.0
+            options_cost = 0.0
+            leg_parts = []
+
+            for o in sorted(ticker_opts, key=lambda x: (x["strike"], x["right"])):
+                contracts = abs(o["qty"])
+                if o["right"] == "C":
+                    intrinsic = max(spot - o["strike"], 0)
+                else:
+                    intrinsic = max(o["strike"] - spot, 0)
+
+                if o["qty"] > 0:
+                    leg_pl = (intrinsic - o["avg_price"]) * contracts * 100
+                else:
+                    leg_pl = (o["avg_price"] - intrinsic) * contracts * 100
+
+                leg_pl -= COMMISSION_PER_CONTRACT * contracts
+                options_pl += leg_pl
+                options_cost += o["avg_price"] * contracts * 100
+
+                d = "S" if o["qty"] < 0 else "L"
+                leg_parts.append(f"{d}{contracts:.0f}{o['right']}${o['strike']:g}")
+
+            total_ticker_pl = stock_pl + options_pl
+            # Capital freed = stock value returned at expiry (for covered positions)
+            capital_freed = stock_cost if stock and stock["qty"] > 0 else options_cost
+
+            cost_basis = stock_cost if stock_cost > 0 else options_cost
+            if cost_basis > 0 and dte > 0:
+                apy = (total_ticker_pl / cost_basis) * (365.0 / dte) * 100.0
             else:
-                intrinsic = max(o["strike"] - spot, 0)
+                apy = 0.0
 
-            if o["qty"] > 0:   # long
-                leg_pl = (intrinsic - o["avg_price"]) * contracts * 100
-            else:              # short
-                leg_pl = (o["avg_price"] - intrinsic) * contracts * 100
+            exp_pl += total_ticker_pl
+            exp_capital += capital_freed
 
-            leg_pl      -= COMMISSION_PER_CONTRACT * contracts
-            options_pl  += leg_pl
-            options_cost += o["avg_price"] * contracts * 100
+            pl_sign = "+" if total_ticker_pl >= 0 else ""
+            legs_str = " ".join(leg_parts)
+            qty_str = f"{abs(stock['qty']):.0f}sh+" if stock else ""
+            ticker_lines.append(
+                f"  {ticker} {qty_str}{legs_str}"
+                f" → ${pl_sign}{total_ticker_pl:.0f} ({apy:+.0f}%)")
 
-            direction = "long" if o["qty"] > 0 else "short"
-            exp_str   = o["expiry"].strftime("%m/%d")
-            leg_strs.append(
-                f"{direction} {contracts:.0f}x "
-                f"{o['right']}${o['strike']:g} {exp_str} "
-                f"@ ${o['avg_price']:.2f}"
-            )
+        grand_total_pl += exp_pl
+        grand_total_capital += exp_capital
 
-        total_ticker_pl = stock_pl + options_pl
-        total_pl       += total_ticker_pl
-
-        cost_basis = stock_cost if stock_cost > 0 else options_cost
-        if cost_basis > 0 and dte > 0:
-            apy = (total_ticker_pl / cost_basis) * (365.0 / dte) * 100.0
-        else:
-            apy = 0.0
-
-        # Stock leg string
-        if stock:
-            direction = "long" if stock["qty"] > 0 else "short"
-            stock_str = f"{direction} {abs(stock['qty']):.0f}sh @ ${stock['avg_price']:.2f}"
-            leg_strs.insert(0, stock_str)
-
-        pl_emoji = "✅" if total_ticker_pl >= 0 else "🔴"
-        apy_str  = f"{apy:+.1f}%" if cost_basis > 0 else "n/a"
-
+        # Expiration header
+        day_name = exp.strftime("%a")
+        exp_str = exp.strftime("%b %d")
+        pl_emoji = "✅" if exp_pl >= 0 else "🔴"
         lines.append(
-            f"\n*{ticker}* @ ${spot:.2f}\n"
-            + "\n".join(f"  {l}" for l in leg_strs) + "\n"
-            f"  {pl_emoji} P/L: *${total_ticker_pl:+.0f}* · APY: *{apy_str}*"
-        )
+            f"\n*{day_name} {exp_str}* ({dte}d)"
+            f" — {pl_emoji} ${exp_pl:+,.0f}"
+            f" · 💰 ${exp_capital:,.0f} freed")
+        lines.extend(ticker_lines)
 
     lines.append(f"\n{'─' * 32}")
-    total_emoji = "✅" if total_pl >= 0 else "🔴"
-    lines.append(f"{total_emoji} *Total P/L: ${total_pl:+.0f}*")
+    t_emoji = "✅" if grand_total_pl >= 0 else "🔴"
+    lines.append(
+        f"{t_emoji} *Total: ${grand_total_pl:+,.0f} profit*"
+        f" · *${grand_total_capital:,.0f} capital freed*")
 
     return "\n".join(lines)

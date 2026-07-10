@@ -168,6 +168,36 @@ def is_authorized(user_id: int) -> bool:
 # Per-user Schwab tokens
 # ---------------------------------------------------------------------------
 
+def _get_token_key():
+    """Return Fernet key from env, or None if not set."""
+    key = os.getenv("TOKEN_ENCRYPT_KEY")
+    if not key:
+        return None
+    from cryptography.fernet import Fernet
+    return Fernet(key.encode() if isinstance(key, str) else key)
+
+
+def _encrypt_token(token_json: str) -> str:
+    """Encrypt token JSON. Returns encrypted string, or original if no key."""
+    f = _get_token_key()
+    if not f:
+        return token_json
+    return f.encrypt(token_json.encode()).decode()
+
+
+def _decrypt_token(data: str) -> str:
+    """Decrypt token. Handles both encrypted and plain JSON gracefully."""
+    if data.strip().startswith("{"):
+        return data  # already plain JSON
+    f = _get_token_key()
+    if not f:
+        return data  # no key, return as-is
+    try:
+        return f.decrypt(data.encode()).decode()
+    except Exception:
+        return data  # decryption failed, assume plain text
+
+
 def _schwab_token_path_github(user_id: int) -> str:
     return f"schwab_token_{user_id}.json"
 
@@ -189,11 +219,12 @@ def save_schwab_token(user_id: int, token_json: str) -> None:
     gh_path = _schwab_token_path_github(user_id)
     repo    = _repo()
     try:
+        encrypted = _encrypt_token(token_json)
         existing = repo.get_contents(gh_path)
         repo.update_file(
             gh_path,
             f"update schwab token for user {user_id}",
-            token_json,
+            encrypted,
             existing.sha,
         )
         logger.info(f"Updated Schwab token for user {user_id} in GitHub")
@@ -201,7 +232,7 @@ def save_schwab_token(user_id: int, token_json: str) -> None:
         repo.create_file(
             gh_path,
             f"create schwab token for user {user_id}",
-            token_json,
+            _encrypt_token(token_json),
         )
         logger.info(f"Created Schwab token for user {user_id} in GitHub")
 
@@ -229,7 +260,8 @@ def load_schwab_token(user_id: int) -> str | None:
     repo    = _repo()
     try:
         f          = repo.get_contents(gh_path)
-        token_json = f.decoded_content.decode("utf-8")
+        raw = f.decoded_content.decode("utf-8")
+        token_json = _decrypt_token(raw)
         Path(local_path).write_text(token_json)
         logger.info(f"Loaded Schwab token for user {user_id} from GitHub to {local_path}")
         return local_path

@@ -1144,8 +1144,13 @@ async def cmd_itmt(update, context):
             f"Hits: {len(all_hits)} · Qualified: {len(candidates)} · Errors: {errors}")
 
         if not candidates:
-            logger.info(f"ITMT cycle {cycle}: no candidates — sleeping 5s")
-            await asyncio.sleep(5)
+            if errors > len(tickers) * 0.5:
+                wait = 30
+                logger.info(f"ITMT cycle {cycle}: {errors} errors — backing off {wait}s")
+            else:
+                wait = 10
+                logger.info(f"ITMT cycle {cycle}: no candidates — sleeping {wait}s")
+            await asyncio.sleep(wait)
             continue
 
         top = candidates[:ITMT_TOP_N]
@@ -1165,8 +1170,8 @@ async def cmd_itmt(update, context):
 
         logger.info(f"ITMT cycle {cycle}: {len(placed)} orders placed")
         if not placed:
-            logger.info(f"ITMT cycle {cycle}: all placements failed — sleeping 3s")
-            await asyncio.sleep(3)
+            logger.info(f"ITMT cycle {cycle}: all placements failed — sleeping 10s")
+            await asyncio.sleep(10)
             continue
 
         summary = " / ".join(f"{h['ticker']} {p['apy']:.0f}%"

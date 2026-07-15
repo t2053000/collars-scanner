@@ -49,16 +49,23 @@ def _parse_option_symbol(symbol: str) -> Optional[dict]:
         return None
 
 
-def compute_positions(raw_positions: list) -> str:
+def compute_positions(raw_positions: list, fills: list = None) -> str:
     """
-    Given raw Schwab positions list, compute projected P/L grouped
-    by expiration date, then by ticker within each expiration.
-    Shows expected profit and capital freed per expiration.
+    Given raw Schwab positions list, compute P/L grouped by expiration
+    then by ticker. Uses fills.json for entry cost (accurate) instead of
+    Schwab's avg_price (inflated by wash sale adjustments).
     """
     today = date.today()
+    fills = fills or []
+
+    # Build fills lookup: (ticker, strike, exp) -> total entry cost
+    fills_cost = {}
+    for f in fills:
+        key = (f.get("ticker"), f.get("strike"), f.get("exp"))
+        fills_cost[key] = fills_cost.get(key, 0) + f.get("cost", 0)
 
     # Separate stock and option positions
-    stocks  = {}   # ticker → {qty, avg_price, mark}
+    stocks  = {}   # ticker -> {qty, mkt_value, mark}
     options = []   # list of option position dicts
 
     for pos in raw_positions:
@@ -68,46 +75,36 @@ def compute_positions(raw_positions: list) -> str:
         long_qty   = float(pos.get("longQuantity",  0))
         short_qty  = float(pos.get("shortQuantity", 0))
         qty        = long_qty - short_qty
-        avg_price  = float(pos.get("averagePrice", 0))
         mkt_value  = float(pos.get("marketValue",  0))
-
-        # Debug: log raw data for troubleshooting
-        if symbol.startswith("TE") or "TE " in symbol or (asset_type == "OPTION" and symbol.strip()[:2] == "TE"):
-            logger.info(f"RAW POS: symbol={symbol!r} type={asset_type} qty={qty} avg_price={avg_price} mkt_value={mkt_value} long={long_qty} short={short_qty}")
 
         if asset_type == "EQUITY":
             mark = mkt_value / qty if qty != 0 else 0.0
             stocks[symbol] = {
                 "qty":       qty,
-                "avg_price": avg_price,
+                "mkt_value": mkt_value,
                 "mark":      mark,
             }
 
         elif asset_type == "OPTION":
             parsed = _parse_option_symbol(symbol)
             if parsed is None:
-                logger.debug(f"Could not parse option symbol: {symbol}")
                 continue
             contracts = abs(qty)
-            mark_per_share = mkt_value / (contracts * 100) if contracts > 0 else 0.0
+            avg_price = abs(float(pos.get("averagePrice", 0)))
             options.append({
-                "symbol":    symbol,
                 "ticker":    parsed["ticker"],
                 "expiry":    parsed["expiry"],
                 "right":     parsed["right"],
                 "strike":    parsed["strike"],
                 "qty":       qty,
-                "avg_price": abs(avg_price),
-
-                "mark":      mark_per_share,
+                "avg_price": avg_price,
+                "mkt_value": mkt_value,
             })
 
-    # Filter to options expiring today or later
     future_options = [o for o in options if o["expiry"] >= today]
     if not future_options:
         return "📭 No open option positions."
 
-    # Get all expiration dates, sorted
     expirations = sorted(set(o["expiry"] for o in future_options))
 
     lines = []
@@ -123,76 +120,87 @@ def compute_positions(raw_positions: list) -> str:
 
         exp_pl = 0.0
         exp_capital = 0.0
-
         ticker_lines = []
 
         for ticker in exp_tickers:
             ticker_opts = [o for o in exp_options if o["ticker"] == ticker]
             stock = stocks.get(ticker)
 
-            # Get spot from stock mark
             spot = stock["mark"] if stock and stock["mark"] > 0 else None
             if spot is None or spot <= 0:
                 spot = ticker_opts[0]["strike"] if ticker_opts else 0.0
             if spot <= 0:
                 continue
 
-            # Compute P/L per leg
-            stock_pl = 0.0
-            stock_cost = 0.0
-            if stock:
-                stock_pl = (spot - stock["avg_price"]) * stock["qty"]
-                stock_cost = stock["avg_price"] * abs(stock["qty"])
-
-            options_pl = 0.0
-            options_cost = 0.0
+            # ── Compute net option credit received (per share) ──
+            net_credit_per_share = 0.0
+            shares_covered = 0
             leg_parts = []
 
             for o in sorted(ticker_opts, key=lambda x: (x["strike"], x["right"])):
                 contracts = abs(o["qty"])
-                if o["right"] == "C":
-                    intrinsic = max(spot - o["strike"], 0)
-                else:
-                    intrinsic = max(o["strike"] - spot, 0)
-
-                if o["qty"] > 0:
-                    leg_pl = (intrinsic - o["avg_price"]) * contracts * 100
-                else:
-                    leg_pl = (o["avg_price"] - intrinsic) * contracts * 100
-
-                leg_pl -= COMMISSION_PER_CONTRACT * contracts
-                options_pl += leg_pl
-                options_cost += o["avg_price"] * contracts * 100
-
                 d = "S" if o["qty"] < 0 else "L"
                 leg_parts.append(f"{d}{contracts:.0f}{o['right']}${o['strike']:g}")
 
-            total_ticker_pl = stock_pl + options_pl
-            if ticker == "TE":
-                logger.info(f"TE P/L: stock_pl={stock_pl:.2f} options_pl={options_pl:.2f} total={total_ticker_pl:.2f} spot={spot} stock_avg={stock['avg_price'] if stock else 'N/A'}")
-            # Capital freed = stock value returned at expiry (for covered positions)
-            capital_freed = stock_cost if stock and stock["qty"] > 0 else options_cost
+                if o["qty"] < 0:  # sold option — received premium
+                    net_credit_per_share += o["avg_price"]
+                else:             # bought option — paid premium
+                    net_credit_per_share -= o["avg_price"]
 
-            cost_basis = stock_cost if stock_cost > 0 else options_cost
+                # Track how many shares are covered by calls
+                if o["right"] == "C" and o["qty"] < 0:
+                    shares_covered += contracts * 100
+
+            # ── Projected P/L at expiry (spot stays flat) ──
+            if stock and stock["qty"] > 0 and shares_covered > 0:
+                call_strikes = [o["strike"] for o in ticker_opts
+                                if o["right"] == "C" and o["qty"] < 0]
+                primary_strike = call_strikes[0] if call_strikes else spot
+                shares = min(abs(stock["qty"]), shares_covered)
+                exp_str_lookup = exp.strftime("%Y-%m-%d")
+
+                # Try fills.json for accurate entry cost
+                fills_key = (ticker, primary_strike, exp_str_lookup)
+                entry_cost = fills_cost.get(fills_key)
+
+                if entry_cost and entry_cost > 0:
+                    # Profit = what we get at expiry - what we paid + net credit
+                    exit_value = primary_strike * shares
+                    net_credit_total = net_credit_per_share * shares
+                    total_pl = exit_value + net_credit_total - entry_cost
+                else:
+                    # Fallback: use current spot for gap (less accurate)
+                    gap = spot - primary_strike
+                    pl_per_share = net_credit_per_share - gap
+                    total_pl = pl_per_share * shares
+
+                total_pl -= COMMISSION_PER_CONTRACT * len(ticker_opts)
+                capital_freed = primary_strike * shares
+            else:
+                # Options-only position: use mark-to-market
+                total_pl = sum(o["mkt_value"] for o in ticker_opts)
+                total_pl -= COMMISSION_PER_CONTRACT * len(ticker_opts)
+                capital_freed = abs(sum(o["mkt_value"] for o in ticker_opts))
+
+            cost_basis = spot * min(abs(stock["qty"]), shares_covered) if stock else abs(sum(o["mkt_value"] for o in ticker_opts))
             if cost_basis > 0 and dte > 0:
-                apy = (total_ticker_pl / cost_basis) * (365.0 / dte) * 100.0
+                apy = (total_pl / cost_basis) * (365.0 / dte) * 100.0
             else:
                 apy = 0.0
 
-            exp_pl += total_ticker_pl
+            exp_pl += total_pl
             exp_capital += capital_freed
 
-            pl_sign = "+" if total_ticker_pl >= 0 else ""
+            pl_sign = "+" if total_pl >= 0 else ""
             legs_str = " ".join(leg_parts)
             qty_str = f"{abs(stock['qty']):.0f}sh+" if stock else ""
             ticker_lines.append(
                 f"  {ticker} {qty_str}{legs_str}"
-                f" → ${pl_sign}{total_ticker_pl:.0f} ({apy:+.0f}%)")
+                f" → ${pl_sign}{total_pl:.0f} ({apy:+.0f}%)")
 
         grand_total_pl += exp_pl
         grand_total_capital += exp_capital
 
-        # Expiration header
         day_name = exp.strftime("%a")
         exp_str = exp.strftime("%b %d")
         pl_emoji = "✅" if exp_pl >= 0 else "🔴"

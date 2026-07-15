@@ -5,6 +5,7 @@ Heavy logging on trade flow for debugging.
 """
 
 import asyncio
+from pathlib import Path
 import logging
 import time
 import uuid
@@ -41,9 +42,26 @@ _PENDING_TRADES: dict = {}
 PENDING_TIMEOUT_SEC = 60
 _ACTIVE_ORDERS: dict = {}
 _ITMT_STOP: set = set()
-_ITMT_STOP: set = set()
+_ITMT_RUNNING: set = set()
+_LAST_TOKEN_SAVE: float = 0.0
+TOKEN_SAVE_INTERVAL = 3600
 
 MAX_TRADE_BUTTONS = 20
+
+
+def _maybe_save_token(primary_uid: int):
+    """Save primary token to GitHub if >1 hour since last save."""
+    global _LAST_TOKEN_SAVE
+    if time.time() - _LAST_TOKEN_SAVE < TOKEN_SAVE_INTERVAL:
+        return
+    try:
+        token_path = Path(os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
+        if token_path.exists():
+            github_store.save_schwab_token(primary_uid, token_path.read_text())
+            _LAST_TOKEN_SAVE = time.time()
+            logger.info("Periodic token save to GitHub")
+    except Exception as e:
+        logger.debug(f"Token save skipped: {e}")
 
 
 def _get_schwab_for_user(context, user_id: int):
@@ -310,6 +328,9 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
     await _edit_robust(status_msg, messages[0])
     for extra in messages[1:]:
         await _send_robust(update.message.reply_text, extra)
+
+    primary_uid = context.application.bot_data.get("primary_user_id", 0)
+    _maybe_save_token(primary_uid)
 
     if hits_with_buttons and all_hits:
         if scanner_key == "itm":
@@ -1066,11 +1087,14 @@ async def cmd_itmt(update, context):
             parse_mode=ParseMode.MARKDOWN)
         return
 
+    user_id = update.effective_user.id
+    if user_id in _ITMT_RUNNING:
+        await update.message.reply_text("⚠️ ITMT already running. Send /stop first.")
+        return
+
     budget      = float(args[0])
     min_apy     = float(args[1]) if len(args) > 1 else ITMT_DEFAULT_APY
     timeout_min = float(args[2]) if len(args) > 2 else ITMT_DEFAULT_MIN
-
-    user_id = update.effective_user.id
     schwab  = _get_schwab_for_user(context, user_id)
     scanner = context.application.bot_data["itm_scanner"]
     scanner.ticker_freqs = github_store.get_div_tickers()
@@ -1088,13 +1112,15 @@ async def cmd_itmt(update, context):
 
     loop      = asyncio.get_running_loop()
     _ITMT_STOP.discard(user_id)
+    _ITMT_RUNNING.add(user_id)
     remaining = budget
     deadline  = time.time() + (timeout_min * 60)
     cycle     = 0
     fills     = []
     sem       = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    while time.time() < deadline and remaining > 0 and user_id not in _ITMT_STOP:
+    try:
+      while time.time() < deadline and remaining > 0 and user_id not in _ITMT_STOP:
         cycle += 1
         elapsed = time.time() - (deadline - timeout_min * 60)
 
@@ -1239,6 +1265,9 @@ async def cmd_itmt(update, context):
                 f"APY: *{pricing['apy']:.1f}%* · Cost: ${cost:,.0f}\n"
                 f"Remaining: ${remaining:,.0f}")
 
+    finally:
+        _ITMT_RUNNING.discard(user_id)
+
     # ── final summary ───────────────────────────────────
     if fills:
         lines = [f"🤖 *ITMT COMPLETE* — {len(fills)} fill(s), "
@@ -1278,6 +1307,7 @@ async def cmd_fills(update, context):
 async def cmd_stop(update, context):
     user_id = update.effective_user.id
     _ITMT_STOP.add(user_id)
+    _ITMT_RUNNING.discard(user_id)
     await update.message.reply_text("Stopping ITMT after current cycle.")
 
 

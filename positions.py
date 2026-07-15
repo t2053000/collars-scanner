@@ -93,7 +93,8 @@ def compute_positions(raw_positions: list) -> str:
                 "right":     parsed["right"],
                 "strike":    parsed["strike"],
                 "qty":       qty,
-                "avg_price": avg_price,
+                "avg_price": abs(avg_price),
+
                 "mark":      mark_per_share,
             })
 

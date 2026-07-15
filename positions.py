@@ -71,6 +71,10 @@ def compute_positions(raw_positions: list) -> str:
         avg_price  = float(pos.get("averagePrice", 0))
         mkt_value  = float(pos.get("marketValue",  0))
 
+        # Debug: log raw data for troubleshooting
+        if symbol.startswith("TE") or "TE " in symbol or (asset_type == "OPTION" and symbol.strip()[:2] == "TE"):
+            logger.info(f"RAW POS: symbol={symbol!r} type={asset_type} qty={qty} avg_price={avg_price} mkt_value={mkt_value} long={long_qty} short={short_qty}")
+
         if asset_type == "EQUITY":
             mark = mkt_value / qty if qty != 0 else 0.0
             stocks[symbol] = {
@@ -164,6 +168,8 @@ def compute_positions(raw_positions: list) -> str:
                 leg_parts.append(f"{d}{contracts:.0f}{o['right']}${o['strike']:g}")
 
             total_ticker_pl = stock_pl + options_pl
+            if ticker == "TE":
+                logger.info(f"TE P/L: stock_pl={stock_pl:.2f} options_pl={options_pl:.2f} total={total_ticker_pl:.2f} spot={spot} stock_avg={stock['avg_price'] if stock else 'N/A'}")
             # Capital freed = stock value returned at expiry (for covered positions)
             capital_freed = stock_cost if stock and stock["qty"] > 0 else options_cost
 

@@ -229,8 +229,9 @@ async def cmd_positions(update, context):
     msg     = await update.message.reply_text("📊 Fetching positions…")
     loop    = asyncio.get_running_loop()
     try:
-        raw  = await loop.run_in_executor(None, schwab.get_positions)
-        text = await loop.run_in_executor(None, compute_positions, raw)
+        raw   = await loop.run_in_executor(None, schwab.get_positions)
+        fills = await loop.run_in_executor(None, github_store.get_fills, 90)
+        text  = await loop.run_in_executor(None, compute_positions, raw, fills)
         await _edit_robust(msg, text)
     except Exception as e:
         logger.exception("cmd_positions failed")

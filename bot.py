@@ -564,18 +564,9 @@ async def cmd_itm(update, context):
 
     args         = [a.lower() for a in (context.args or [])]
     reverse_mode = "r" in args
-    bc_mode      = "bc" in args
-
-    if bc_mode:
-        tickers = github_store.get_latest_barchart_tickers()
-        if not tickers:
-            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
-            return
-        source = "Barchart"
-    else:
-        hiv_tickers = github_store.get_latest_hiv_tickers()
-        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
-        source      = "Finviz"
+    hiv_tickers = github_store.get_latest_hiv_tickers()
+    tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+    source      = "Finviz"
 
     combined = sorted(set(tickers))
     if not combined:
@@ -600,16 +591,8 @@ async def cmd_ritm(update, context):
     div_tickers = github_store.get_div_tickers()
 
     args    = [a.lower() for a in (context.args or [])]
-    bc_mode = "bc" in args
-
-    if bc_mode:
-        tickers = github_store.get_latest_barchart_tickers()
-        if not tickers:
-            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
-            return
-    else:
-        hiv_tickers = github_store.get_latest_hiv_tickers()
-        tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
+    hiv_tickers = github_store.get_latest_hiv_tickers()
+    tickers     = hiv_tickers if hiv_tickers else github_store.get_tickers()
 
     combined = sorted(set(tickers))
     if not combined:
@@ -629,15 +612,7 @@ async def cmd_itmib(update, context):
     div_tickers = github_store.get_div_tickers()
 
     args    = [a.lower() for a in (context.args or [])]
-    bc_mode = "bc" in args
-
-    if bc_mode:
-        tickers = github_store.get_latest_barchart_tickers()
-        if not tickers:
-            await update.message.reply_text("⚠️ No Barchart tickers available yet — try again during market hours.")
-            return
-    else:
-        tickers = github_store.get_tickers()
+    tickers = github_store.get_tickers()
         
 
     combined = sorted(set(tickers))

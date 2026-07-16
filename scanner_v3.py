@@ -194,6 +194,21 @@ def main():
         with open("/home/ibgateway/tickers.txt", "w") as f:
             f.write(str(final_list))
 
+        # Write metadata for source tracking
+        import json
+        meta = []
+        for sym in final_list:
+            row = df[df["symbol"] == sym].iloc[0] if sym in df["symbol"].values else None
+            meta.append({
+                "symbol": sym,
+                "scan_code": row["scan_code"] if row is not None else "FORCED",
+                "skew_type": str(row.get("skew_type", "")) if row is not None else "",
+                "straddle_pct": float(row["straddle_pct"]) if row is not None and pd.notna(row.get("straddle_pct")) else None,
+            })
+        with open("/home/ibgateway/tickers_meta.json", "w") as f:
+            json.dump(meta, f)
+        logger.info(f"Wrote {len(meta)} entries to tickers_meta.json")
+
         print("\n=== FINAL INTERESTING SYMBOLS ===")
         print(final_list)
         logger.info(f"Wrote {len(final_list)} symbols to tickers.txt")

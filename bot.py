@@ -1048,7 +1048,7 @@ ITMT_TOP_N         = 3
 ITMT_FILL_WAIT_SEC = 4
 ITMT_POLL_SEC      = 1
 ITMT_DEFAULT_APY   = 35.0
-ITMT_DEFAULT_MIN   = 60      # minutes
+ITMT_DEFAULT_MIN   = 180     # minutes (3 hours)
 
 
 @authorized_only
@@ -1068,8 +1068,10 @@ async def cmd_itmt(update, context):
 
     user_id = update.effective_user.id
     if user_id in _ITMT_RUNNING:
-        await update.message.reply_text("⚠️ ITMT already running. Send /stop first.")
-        return
+        _ITMT_STOP.add(user_id)
+        await update.message.reply_text("⏹ Stopping previous ITMT... restarting.")
+        await asyncio.sleep(15)
+        _ITMT_STOP.discard(user_id)
 
     budget      = float(args[0])
     min_apy     = float(args[1]) if len(args) > 1 else ITMT_DEFAULT_APY

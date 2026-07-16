@@ -211,5 +211,17 @@
     "source": "itmt",
     "scan_source": "unknown",
     "timestamp": "2026-07-16T17:02:52.405996"
+  },
+  {
+    "ticker": "OTLK",
+    "strike": 1.0,
+    "exp": "2026-08-21",
+    "dte": 35,
+    "apy": 52.1,
+    "cost": 147.0,
+    "order_id": "1007213044253",
+    "source": "itmt",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-16T17:04:09.982933"
   }
 ]

@@ -35,6 +35,7 @@ import orders
 logger = logging.getLogger(__name__)
 
 SCAN_CONCURRENCY = 12
+TICKER_BLACKLIST = {"VIVO"}
 TG_MAX_LEN = 4000
 _LAST_ERRORS: deque = deque(maxlen=30)
 
@@ -264,6 +265,7 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
                     tickers_override=None, scan_kwargs=None, summary_kwargs=None,
                     hits_with_buttons=False, scanner_key=None):
     tickers = tickers_override if tickers_override is not None else github_store.get_tickers()
+    tickers = [t for t in tickers if t not in TICKER_BLACKLIST]
     if not tickers:
         await update.message.reply_text("_No tickers._", parse_mode=ParseMode.MARKDOWN)
         return
@@ -1078,7 +1080,7 @@ async def cmd_itmt(update, context):
 
     hiv_tickers = github_store.get_latest_hiv_tickers()
     tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    tickers = sorted(set(tickers))
+    tickers = sorted(set(tickers) - TICKER_BLACKLIST)
     ticker_sources = github_store.get_ticker_sources()
     logger.info(f"ITMT: {len(tickers)} tickers loaded, budget=${budget}, min_apy={min_apy}")
 

@@ -830,6 +830,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
         tkr    = active["hit"]["ticker"] if active else "?"
         await _edit_robust(status_msg, f"FILLED — order {order_id} for {tkr}")
         if active:
+            sources = github_store.get_ticker_sources()
             github_store.save_fill({
                 "ticker": active["hit"]["ticker"],
                 "strike": active["hit"].get("strike"),
@@ -838,6 +839,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
                 "apy": active["pricing"].get("apy"),
                 "cost": active["hit"].get("spot", 0) * 100,
                 "order_id": order_id, "source": "manual",
+                "scan_source": sources.get(active["hit"]["ticker"], "unknown"),
             })
         return
     active = _ACTIVE_ORDERS.get(order_id)
@@ -1077,6 +1079,7 @@ async def cmd_itmt(update, context):
     hiv_tickers = github_store.get_latest_hiv_tickers()
     tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
     tickers = sorted(set(tickers))
+    ticker_sources = github_store.get_ticker_sources()
     logger.info(f"ITMT: {len(tickers)} tickers loaded, budget=${budget}, min_apy={min_apy}")
 
     status_msg = await update.message.reply_text(
@@ -1232,6 +1235,7 @@ async def cmd_itmt(update, context):
                 "exp": hit["exp_date"], "dte": hit["dte"],
                 "apy": pricing["apy"], "cost": cost,
                 "order_id": oid, "source": "itmt",
+                "scan_source": ticker_sources.get(hit["ticker"], "unknown"),
             })
             await _send_robust(update.message.reply_text,
                 f"✅ *FILLED* — {hit['ticker']} · order {oid}\n"
@@ -1260,7 +1264,7 @@ async def cmd_itmt(update, context):
 
 @authorized_only
 async def cmd_fills(update, context):
-    """Show fill history and stats."""
+    """Show fill history, stats, and breakdown by scan source."""
     args = context.args or []
     days = int(args[0]) if args else 30
     fills = github_store.get_fills(days=days)
@@ -1268,13 +1272,35 @@ async def cmd_fills(update, context):
         await update.message.reply_text(f"No fills in the last {days} days.")
         return
     total_cost = sum(f.get("cost", 0) for f in fills)
-    apys = [f["apy"] for f in fills if f.get("apy")]
-    avg_apy = sum(apys) / len(apys) if apys else 0
-    lines = [f"📊 *{len(fills)} fills* last {days}d — ${total_cost:,.0f} deployed — avg APY {avg_apy:.1f}%\n"]
-    for fl in fills[-15:]:
-        src = "🤖" if fl.get("source") == "itmt" else "👆"
-        lines.append(f"{src} {fl.get('ticker', '?'):>5} ${fl.get('strike', 0):g} "
-                     f"{fl.get('exp', '?')} {fl.get('apy', 0):.1f}% ${fl.get('cost', 0):,.0f}")
+    weighted_apy = sum(f.get("apy", 0) * f.get("cost", 0) for f in fills)
+    avg_apy = weighted_apy / total_cost if total_cost > 0 else 0
+
+    lines = [f"📊 *{len(fills)} fills* last {days}d — ${total_cost:,.0f} deployed — wAPY {avg_apy:.1f}%"]
+
+    # Breakdown by scan source
+    from collections import defaultdict
+    by_source = defaultdict(lambda: {"count": 0, "cost": 0, "weighted_apy": 0})
+    for fl in fills:
+        src = fl.get("scan_source", "unknown")
+        by_source[src]["count"] += 1
+        by_source[src]["cost"] += fl.get("cost", 0)
+        by_source[src]["weighted_apy"] += fl.get("apy", 0) * fl.get("cost", 0)
+
+    if any(s != "unknown" for s in by_source):
+        lines.append("")
+        lines.append("*By scan source:*")
+        for src, data in sorted(by_source.items(), key=lambda x: -x[1]["cost"]):
+            src_apy = data["weighted_apy"] / data["cost"] if data["cost"] > 0 else 0
+            lines.append(f"  {src}: {data['count']} fills · ${data['cost']:,.0f} · wAPY {src_apy:.1f}%")
+
+    lines.append("")
+    lines.append("*Recent:*")
+    for fl in fills[-10:]:
+        mode = "🤖" if fl.get("source") == "itmt" else "👆"
+        scan = fl.get("scan_source", "")
+        scan_tag = f" [{scan[:8]}]" if scan and scan != "unknown" else ""
+        lines.append(f"{mode} {fl.get('ticker', '?'):>5} ${fl.get('strike', 0):g} "
+                     f"{fl.get('exp', '?')} {fl.get('apy', 0):.1f}%{scan_tag}")
     await _send_robust(update.message.reply_text, "\n".join(lines))
 
 

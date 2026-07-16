@@ -223,5 +223,17 @@
     "source": "itmt",
     "scan_source": "unknown",
     "timestamp": "2026-07-16T17:04:09.982933"
+  },
+  {
+    "ticker": "CLSK",
+    "strike": 13.0,
+    "exp": "2026-07-24",
+    "dte": 7,
+    "apy": 27.0,
+    "cost": 1304.0,
+    "order_id": "1007218432484",
+    "source": "itmt",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-16T19:17:15.586823"
   }
 ]

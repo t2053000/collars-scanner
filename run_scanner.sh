@@ -1,20 +1,30 @@
 #!/bin/bash
-set -e
+# Continuous IB scanner loop — runs during market hours, 5s pause between cycles
 
-echo "=== Running scanner ==="
-docker exec ib-gateway python3 /home/ibgateway/scanner_v3.py
+while true; do
+    HOUR=$(TZ=America/New_York date +%H%M)
+    if [ "$HOUR" -ge "0930" ] && [ "$HOUR" -le "1600" ]; then
+        echo "=== Scanner cycle starting at $(date) ==="
 
-echo "=== Syncing repo ==="
-cd ~/collars-scanner
-git checkout -- .
-git pull origin main --rebase
+        docker exec ib-gateway python3 /home/ibgateway/scanner_v3.py
 
-echo "=== Copying tickers.txt ==="
-docker cp ib-gateway:/home/ibgateway/tickers.txt ~/collars-scanner/tickers.txt
+        echo "=== Syncing repo ==="
+        cd ~/collars-scanner
+        git checkout -- .
+        git pull origin main --rebase
 
-echo "=== Pushing tickers.txt ==="
-git add tickers.txt
-git commit -m "Update tickers - $(date '+%Y-%m-%d %H:%M')" || echo "No changes"
-git push origin main
+        echo "=== Copying output files ==="
+        docker cp ib-gateway:/home/ibgateway/tickers.txt ~/collars-scanner/tickers.txt
+        docker cp ib-gateway:/home/ibgateway/tickers_meta.json ~/collars-scanner/tickers_meta.json 2>/dev/null
 
-echo "=== Done ==="
+        echo "=== Pushing ==="
+        git add tickers.txt tickers_meta.json
+        git commit -m "Update tickers - $(date '+%Y-%m-%d %H:%M')" || echo "No changes"
+        git push origin main
+
+        echo "=== Done — sleeping 5s ==="
+        sleep 5
+    else
+        sleep 60
+    fi
+done

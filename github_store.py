@@ -353,6 +353,19 @@ def get_latest_hiv_tickers() -> list[str]:
         return []
 
 
+def get_ticker_sources() -> dict:
+    """Read tickers_meta.json from GitHub. Returns {symbol: scan_code}."""
+    import json
+    try:
+        repo = _repo()
+        f = repo.get_contents("tickers_meta.json")
+        meta = json.loads(f.decoded_content.decode("utf-8"))
+        return {m["symbol"]: m.get("scan_code", "UNKNOWN") for m in meta}
+    except Exception as e:
+        logger.debug(f"get_ticker_sources failed: {e}")
+        return {}
+
+
 def save_fill(fill: dict) -> None:
     """Append a fill record to fills.json in the GitHub repo."""
     import json

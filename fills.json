@@ -319,5 +319,17 @@
     "source": "itmt",
     "scan_source": "unknown",
     "timestamp": "2026-07-17T19:19:24.399975"
+  },
+  {
+    "ticker": "DJT",
+    "strike": 8.0,
+    "exp": "2026-07-24",
+    "dte": 6,
+    "apy": 67.0,
+    "cost": 946.0000000000001,
+    "order_id": "1007237963865",
+    "source": "itmt",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-17T19:31:46.985037"
   }
 ]

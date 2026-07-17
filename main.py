@@ -39,12 +39,15 @@ def _bootstrap_schwab_token():
 
     # 1. Try GitHub first — has the most recently refreshed token
     if primary_uid:
-        gh_token_path = github_store.load_schwab_token(primary_uid)
-        if gh_token_path:
-            import shutil
-            shutil.copy(gh_token_path, str(token_path))
-            log.info(f"Loaded primary Schwab token from GitHub for user {primary_uid}")
-            return
+        try:
+            gh_token_path = github_store.load_schwab_token(primary_uid)
+            if gh_token_path:
+                import shutil
+                shutil.copy(gh_token_path, str(token_path))
+                log.info(f"Loaded primary Schwab token from GitHub for user {primary_uid}")
+                return
+        except Exception as e:
+            log.warning(f"GitHub token load failed, falling back to env var: {e}")
 
     # 2. Fall back to env var (initial setup only)
     token_json = os.getenv("SCHWAB_TOKEN_JSON")

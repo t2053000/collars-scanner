@@ -283,5 +283,17 @@
     "source": "itmt",
     "scan_source": "unknown",
     "timestamp": "2026-07-17T17:48:28.267636"
+  },
+  {
+    "ticker": "EOSE",
+    "strike": 3.0,
+    "exp": "2026-08-21",
+    "dte": 34,
+    "apy": 20.9,
+    "cost": 428.0,
+    "order_id": "1007235072270",
+    "source": "itmt",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-17T17:50:05.893621"
   }
 ]

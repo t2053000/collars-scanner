@@ -1250,6 +1250,11 @@ async def cmd_itmt(update, context):
 
     finally:
         _ITMT_RUNNING.discard(user_id)
+        global _LAST_TOKEN_SAVE
+        _LAST_TOKEN_SAVE = 0  # force save, bypass 1hr throttle
+        primary_uid = context.application.bot_data.get("primary_user_id", 0)
+        _maybe_save_token(primary_uid)
+        logger.info("ITMT exited — token saved")
 
     # ── final summary ───────────────────────────────────
     if fills:

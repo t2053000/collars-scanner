@@ -307,5 +307,17 @@
     "source": "itmt",
     "scan_source": "unknown",
     "timestamp": "2026-07-17T17:55:16.021582"
+  },
+  {
+    "ticker": "NUAI",
+    "strike": 3.5,
+    "exp": "2026-08-21",
+    "dte": 34,
+    "apy": 21.0,
+    "cost": 400.0,
+    "order_id": "1007237962727",
+    "source": "itmt",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-17T19:19:24.399975"
   }
 ]

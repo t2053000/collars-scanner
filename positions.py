@@ -75,9 +75,9 @@ def compute_positions(raw_positions: list, fills: list = None) -> str:
         long_qty   = float(pos.get("longQuantity",  0))
         short_qty  = float(pos.get("shortQuantity", 0))
         qty        = long_qty - short_qty
-        mkt_value  = float(pos.get("marketValue",  0))
+        mkt_value  = float(pos.get("marketValue",          
+        if asset_type in ("EQUITY", "COLLECTIVE_INVESTMENT", "ETF"):
 
-        if asset_type == "EQUITY":
             mark = mkt_value / qty if qty != 0 else 0.0
             stocks[symbol] = {
                 "qty":       qty,

@@ -1080,16 +1080,13 @@ async def cmd_itmt(update, context):
     scanner = context.application.bot_data["itm_scanner"]
     scanner.ticker_freqs = github_store.get_div_tickers()
 
-    hiv_tickers = github_store.get_latest_hiv_tickers()
-    tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    tickers = sorted(set(tickers) - TICKER_BLACKLIST)
-    ticker_sources = github_store.get_ticker_sources()
-    logger.info(f"ITMT: {len(tickers)} tickers loaded, budget=${budget}, min_apy={min_apy}")
+    tickers = []
+    ticker_sources = {}
+    logger.info(f"ITMT: budget=${budget}, min_apy={min_apy}")
 
     status_msg = await update.message.reply_text(
         f"🤖 *ITMT started*\n"
-        f"Budget: ${budget:,.0f} · APY ≥ {min_apy}% · Timeout: {timeout_min:.0f}min\n"
-        f"Scanning {len(tickers)} tickers...",
+        f"Budget: ${budget:,.0f} · APY ≥ {min_apy}% · Timeout: {timeout_min:.0f}min",
         parse_mode=ParseMode.MARKDOWN)
 
     loop      = asyncio.get_running_loop()
@@ -1105,6 +1102,14 @@ async def cmd_itmt(update, context):
       while time.time() < deadline and remaining > 0 and user_id not in _ITMT_STOP:
         cycle += 1
         elapsed = time.time() - (deadline - timeout_min * 60)
+
+        # Reload tickers every 10 cycles to pick up new ones
+        if cycle == 1 or cycle % 10 == 0:
+            hiv_tickers = github_store.get_latest_hiv_tickers()
+            tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
+            tickers = sorted(set(tickers) - TICKER_BLACKLIST)
+            ticker_sources = github_store.get_ticker_sources()
+            logger.info(f"ITMT: reloaded {len(tickers)} tickers")
 
         # ── scan ────────────────────────────────────────
         all_hits = []

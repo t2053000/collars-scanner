@@ -841,7 +841,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
                 "apy": active["pricing"].get("apy"),
                 "cost": active["hit"].get("spot", 0) * 100,
                 "order_id": order_id, "source": "manual",
-                "scan_source": sources.get(active["hit"]["ticker"], "unknown"),
+                "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
             })
         return
     active = _ACTIVE_ORDERS.get(order_id)
@@ -1109,7 +1109,10 @@ async def cmd_itmt(update, context):
             tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
             tickers = sorted(set(tickers) - TICKER_BLACKLIST)
             ticker_sources = github_store.get_ticker_sources()
-            logger.info(f"ITMT: reloaded {len(tickers)} tickers")
+            # Sort by priority: 1 first, 2 second, unknown last
+            tickers = sorted(tickers, key=lambda t: ticker_sources.get(t, {}).get("priority", 3))
+            p1 = sum(1 for t in tickers if ticker_sources.get(t, {}).get("priority") == 1)
+            logger.info(f"ITMT: reloaded {len(tickers)} tickers ({p1} priority 1)")
 
         # ── scan ────────────────────────────────────────
         all_hits = []
@@ -1244,7 +1247,7 @@ async def cmd_itmt(update, context):
                 "exp": hit["exp_date"], "dte": hit["dte"],
                 "apy": pricing["apy"], "cost": cost,
                 "order_id": oid, "source": "itmt",
-                "scan_source": ticker_sources.get(hit["ticker"], "unknown"),
+                "scan_source": ticker_sources.get(hit["ticker"], {}).get("scan_code", "unknown"),
             })
             await _send_robust(update.message.reply_text,
                 f"✅ *FILLED* — {hit['ticker']} · order {oid}\n"

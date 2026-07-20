@@ -22,6 +22,8 @@ SCAN_CODES = [
     ("HOT_BY_OPT_VOLUME", "Hot by Option Volume (vs 10-day avg)"),
     ("HIGH_OPT_IMP_VOLAT", "Highest Option Imp Vol"),
     ("HIGH_OPT_IMP_VOLAT_OVER_HIST", "High IV vs Historical"),
+    ("LOW_OPT_VOLUME_PUT_CALL_RATIO", "Low Put/Call Ratio (calls heavy)"),
+    ("HIGH_OPT_VOLUME_PUT_CALL_RATIO", "High Put/Call Ratio (puts heavy)"),
 ]
 
 ALWAYS_INCLUDE = ["SOXS", "UVXY", "LABD", "SQQQ", "SPXS", "TECS", "DUST", "JDST", "TZA", "YANG",

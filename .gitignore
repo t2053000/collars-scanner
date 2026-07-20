@@ -5,4 +5,4 @@ token.json
 .venv/
 venv/
 token_*.json
-*.json
+schwab_token_*.json

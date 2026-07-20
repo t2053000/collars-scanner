@@ -35,7 +35,7 @@ import orders
 logger = logging.getLogger(__name__)
 
 SCAN_CONCURRENCY = 12
-TICKER_BLACKLIST = {"VIVO"}
+TICKER_BLACKLIST = {"VIVO", "GRRR"}
 TG_MAX_LEN = 4000
 _LAST_ERRORS: deque = deque(maxlen=30)
 

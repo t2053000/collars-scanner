@@ -190,12 +190,19 @@ def main():
         for _, row in top_straddle.iterrows():
             print(f"{row['symbol']}: {row['straddle_pct']}% | {row['skew_type']}")
 
-        final_list = list(dict.fromkeys(puts_expensive + calls_expensive + df["symbol"].head(40).tolist()))
+        # Use ALL tickers from Stage 1, prioritized by Stage 2 analysis
+        # Priority 1: clear skew (analyzed in Stage 2)
+        # Priority 2: everything else
+        p1_syms = list(dict.fromkeys(puts_expensive + calls_expensive))
+        p2_syms = [s for s in df["symbol"].tolist() if s not in set(p1_syms)]
+        final_list = p1_syms + p2_syms
+
         with open("/home/ibgateway/tickers.txt", "w") as f:
             f.write(str(final_list))
 
-        # Write metadata for source tracking
+        # Write metadata with priority for source tracking
         import json
+        p1_set = set(p1_syms)
         meta = []
         for sym in final_list:
             row = df[df["symbol"] == sym].iloc[0] if sym in df["symbol"].values else None
@@ -204,10 +211,11 @@ def main():
                 "scan_code": row["scan_code"] if row is not None else "FORCED",
                 "skew_type": str(row.get("skew_type", "")) if row is not None else "",
                 "straddle_pct": float(row["straddle_pct"]) if row is not None and pd.notna(row.get("straddle_pct")) else None,
+                "priority": 1 if sym in p1_set else 2,
             })
         with open("/home/ibgateway/tickers_meta.json", "w") as f:
             json.dump(meta, f)
-        logger.info(f"Wrote {len(meta)} entries to tickers_meta.json")
+        logger.info(f"Wrote {len(meta)} entries to tickers_meta.json ({len(p1_syms)} priority 1, {len(p2_syms)} priority 2)")
 
         print("\n=== FINAL INTERESTING SYMBOLS ===")
         print(final_list)

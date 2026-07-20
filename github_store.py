@@ -354,13 +354,16 @@ def get_latest_hiv_tickers() -> list[str]:
 
 
 def get_ticker_sources() -> dict:
-    """Read tickers_meta.json from GitHub. Returns {symbol: scan_code}."""
+    """Read tickers_meta.json from GitHub. Returns {symbol: {scan_code, priority}}."""
     import json
     try:
         repo = _repo()
         f = repo.get_contents("tickers_meta.json")
         meta = json.loads(f.decoded_content.decode("utf-8"))
-        return {m["symbol"]: m.get("scan_code", "UNKNOWN") for m in meta}
+        return {m["symbol"]: {
+            "scan_code": m.get("scan_code", "UNKNOWN"),
+            "priority": m.get("priority", 2),
+        } for m in meta}
     except Exception as e:
         logger.debug(f"get_ticker_sources failed: {e}")
         return {}

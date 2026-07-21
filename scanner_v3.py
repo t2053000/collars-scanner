@@ -125,6 +125,19 @@ def main():
         logger.info("✅ Connected to IBKR Gateway\n")
 
         all_candidates = []
+        _pushed_symbols = set()
+
+        def _write_incremental(candidates):
+            """Write tickers.txt with current candidates so run_scanner.sh can push immediately."""
+            syms = list(dict.fromkeys(c["symbol"] for c in candidates))
+            syms += [s for s in ALWAYS_INCLUDE if s not in syms]
+            with open("/home/ibgateway/tickers.txt", "w") as f:
+                f.write(str(syms))
+            new_syms = set(syms) - _pushed_symbols
+            if new_syms:
+                logger.info(f"  📤 Wrote {len(syms)} tickers ({len(new_syms)} new)")
+                _pushed_symbols.update(syms)
+
         for scan_code, label in SCAN_CODES:
             if scan_code == "HIGH_OPT_IMP_VOLAT":
                 global PRICE_MIN, PRICE_MAX
@@ -136,11 +149,13 @@ def main():
                     PRICE_MIN, PRICE_MAX = original_min, original_max
                     all_candidates.extend(candidates)
                     logger.info(f"  → {label} ({p_min}-{p_max}): {len(candidates)} candidates")
+                    _write_incremental(all_candidates)
                     time.sleep(2)
             else:
                 candidates = run_scanner(ib, scan_code, label)
                 all_candidates.extend(candidates)
                 logger.info(f"  → {label}: {len(candidates)} candidates")
+                _write_incremental(all_candidates)
                 time.sleep(2)
 
         df = pd.DataFrame(all_candidates)

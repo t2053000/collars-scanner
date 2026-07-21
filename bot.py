@@ -5,6 +5,7 @@ Heavy logging on trade flow for debugging.
 """
 
 import asyncio
+import os
 from pathlib import Path
 import logging
 import time

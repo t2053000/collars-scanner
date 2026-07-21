@@ -343,5 +343,17 @@
     "source": "manual",
     "scan_source": "HOT_BY_OPT_VOLUME",
     "timestamp": "2026-07-21T16:33:02.724891"
+  },
+  {
+    "ticker": "TTD",
+    "strike": 17.5,
+    "exp": "2026-07-24",
+    "dte": 2,
+    "apy": 49.2,
+    "cost": 1817.0000000000002,
+    "order_id": "1007272740774",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-21T17:00:19.971323"
   }
 ]

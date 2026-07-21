@@ -355,5 +355,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-21T17:00:19.971323"
+  },
+  {
+    "ticker": "VFC",
+    "strike": 15.5,
+    "exp": "2026-07-31",
+    "dte": 9,
+    "apy": 25.6,
+    "cost": 1685.0000000000002,
+    "order_id": "1007273538643",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT_OVER_HIST",
+    "timestamp": "2026-07-21T17:20:49.629129"
   }
 ]

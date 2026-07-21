@@ -20,7 +20,6 @@ from itm            import ItmScanner
 from ritm           import RitmScanner
 from ibkr_client    import IbkrClient
 from itm_ibkr       import ItmIbkrScanner
-from hiv_fetcher      import run_hiv_fetch_job
 import github_store
 import bot as bot_module
 
@@ -102,7 +101,7 @@ def _init_ibkr_scanner(initial_div_freqs: dict,
 
 def _start_schedulers(log: logging.Logger):
     """Start APScheduler jobs:
-    - HIV (Finviz): every 15 min, always
+     HIV (Finviz): every 15 min, always
     """
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -119,7 +118,7 @@ def _start_schedulers(log: logging.Logger):
         scheduler.start()
         log.info("Schedulers started: HIV (15min)")
         # Run immediately on startup
-        run_hiv_fetch_job()
+       # run_hiv_fetch_job()
         return scheduler
     except Exception as e:
         log.warning(f"Scheduler failed to start: {e}")

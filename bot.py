@@ -1104,7 +1104,7 @@ async def cmd_itmt(update, context):
         elapsed = time.time() - (deadline - timeout_min * 60)
 
         # Reload tickers every 10 cycles to pick up new ones
-            if cycle == 1 or cycle % 10 == 0:
+        if cycle == 1 or cycle % 10 == 0:
             try:
                 hiv_tickers = await asyncio.wait_for(
                     loop.run_in_executor(None, github_store.get_latest_hiv_tickers),
@@ -1502,3 +1502,5 @@ async def handle_yes_reply(update, context):
         f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
         f"APY: *{pricing['apy']:.1f}%*\nMonitoring (8s)...")
     asyncio.create_task(monitor_order(context, user_id, order_id, status_msg))
+
+

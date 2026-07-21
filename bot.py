@@ -1104,15 +1104,27 @@ async def cmd_itmt(update, context):
         elapsed = time.time() - (deadline - timeout_min * 60)
 
         # Reload tickers every 10 cycles to pick up new ones
-        if cycle == 1 or cycle % 10 == 0:
-            hiv_tickers = github_store.get_latest_hiv_tickers()
-            tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
-            tickers = sorted(set(tickers) - TICKER_BLACKLIST)
-            ticker_sources = github_store.get_ticker_sources()
-            # Sort by priority: 1 first, 2 second, unknown last
-            tickers = sorted(tickers, key=lambda t: ticker_sources.get(t, {}).get("priority", 3))
-            p1 = sum(1 for t in tickers if ticker_sources.get(t, {}).get("priority") == 1)
-            logger.info(f"ITMT: reloaded {len(tickers)} tickers ({p1} priority 1)")
+            if cycle == 1 or cycle % 10 == 0:
+            try:
+                hiv_tickers = await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_latest_hiv_tickers),
+                    timeout=30)
+                new_list = hiv_tickers if hiv_tickers else await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_tickers),
+                    timeout=30)
+                new_list = sorted(set(new_list) - TICKER_BLACKLIST)
+                ticker_sources = await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_ticker_sources),
+                    timeout=30)
+                new_list = sorted(new_list, key=lambda t: ticker_sources.get(t, {}).get("priority", 3))
+                tickers = new_list
+                p1 = sum(1 for t in tickers if ticker_sources.get(t, {}).get("priority") == 1)
+                logger.info(f"ITMT: reloaded {len(tickers)} tickers ({p1} priority 1)")
+            except Exception as e:
+                logger.warning(f"ITMT: ticker reload failed ({e}) — keeping previous {len(tickers)} tickers")
+                if not tickers:
+                    await asyncio.sleep(10)
+                    continue
 
         # ── scan ────────────────────────────────────────
         all_hits = []

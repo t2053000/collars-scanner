@@ -101,7 +101,7 @@ def _init_ibkr_scanner(initial_div_freqs: dict,
 
 def _start_schedulers(log: logging.Logger):
     """Start APScheduler jobs:
-     HIV (Finviz): every 15 min, always
+    # HIV (Finviz): every 15 min, always
     """
     try:
         from apscheduler.schedulers.background import BackgroundScheduler

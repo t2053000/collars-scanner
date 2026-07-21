@@ -367,5 +367,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT_OVER_HIST",
     "timestamp": "2026-07-21T17:20:49.629129"
+  },
+  {
+    "ticker": "QBTS",
+    "strike": 16.0,
+    "exp": "2026-07-24",
+    "dte": 2,
+    "apy": 65.3,
+    "cost": 1764.9999999999998,
+    "order_id": "1007277059712",
+    "source": "itmt",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-21T19:17:27.181701"
   }
 ]

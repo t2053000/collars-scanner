@@ -403,5 +403,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_VOLUME_PUT_CALL_RATIO",
     "timestamp": "2026-07-22T15:36:20.276573"
+  },
+  {
+    "ticker": "RCAT",
+    "strike": 7.5,
+    "exp": "2026-07-24",
+    "dte": 1,
+    "apy": 132.1,
+    "cost": 805.0000000000001,
+    "order_id": "1007292368051",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-22T17:17:30.352976"
   }
 ]

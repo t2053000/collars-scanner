@@ -379,5 +379,17 @@
     "source": "itmt",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-21T19:17:27.181701"
+  },
+  {
+    "ticker": "APPS",
+    "strike": 7.0,
+    "exp": "2026-08-21",
+    "dte": 29,
+    "apy": 19.6,
+    "cost": 892.0,
+    "order_id": "1007287243652",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-22T15:28:08.621723"
   }
 ]

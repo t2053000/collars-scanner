@@ -415,5 +415,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-22T17:17:30.352976"
+  },
+  {
+    "ticker": "KORU",
+    "strike": 20.5,
+    "exp": "2026-07-24",
+    "dte": 1,
+    "apy": 119.8,
+    "cost": 2094.0,
+    "order_id": "1007293389797",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-22T17:55:10.645627"
   }
 ]

@@ -391,5 +391,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-22T15:28:08.621723"
+  },
+  {
+    "ticker": "DLO",
+    "strike": 12.0,
+    "exp": "2026-08-21",
+    "dte": 29,
+    "apy": 12.4,
+    "cost": 1423.0,
+    "order_id": "1007288326160",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_VOLUME_PUT_CALL_RATIO",
+    "timestamp": "2026-07-22T15:36:20.276573"
   }
 ]

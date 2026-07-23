@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ITM confirm / cancel callbacks
+# ITM confirm / cancel / refresh callbacks
 # ---------------------------------------------------------------------------
 
 @authorized_callback
@@ -87,6 +87,54 @@ async def cb_cancel_trade(update, context):
     await query.answer("Cancelled.")
     _PENDING_TRADES.pop((user_id, trade_id), None)
     await _edit_robust(query.message, "Trade cancelled.")
+
+
+@authorized_callback
+async def cb_refresh_itm(update, context):
+    query    = update.callback_query
+    user_id  = update.effective_user.id
+    trade_id = query.data.split(":")[1]
+
+    pending = _PENDING_TRADES.get((user_id, trade_id))
+    if not pending or time.time() > pending.get("expires_at", 0):
+        await query.answer("Card expired. Re-run /itm.", show_alert=True)
+        return
+
+    await query.answer("Refreshing…")
+
+    schwab  = _get_schwab_for_user(context, user_id)
+    scanner = context.application.bot_data["itm_scanner"]
+    loop    = asyncio.get_running_loop()
+    ticker  = pending["hit"]["ticker"]
+
+    try:
+        result = await loop.run_in_executor(None, scanner.scan_ticker, ticker)
+        hits = result[0] if isinstance(result, tuple) else result
+
+        target_exp    = pending["hit"]["exp_date"]
+        target_strike = pending["hit"]["strike"]
+        fresh = next(
+            (h for h in hits
+             if h["exp_date"] == target_exp and abs(h["strike"] - target_strike) < 0.01),
+            None
+        )
+        if not fresh:
+            await query.answer("No longer available at that strike/exp", show_alert=True)
+            return
+
+        # keep the counters
+        submitted = pending.get("submitted", 0)
+        filled    = pending.get("filled", 0)
+        pending["hit"] = fresh
+        _PENDING_TRADES[(user_id, trade_id)] = pending
+
+        new_text = _format_itm_card_text(fresh, submitted, filled)
+        new_kb   = _build_itm_card_keyboard(trade_id, fresh, submitted, filled)
+        await _edit_robust(query.message, new_text, reply_markup=new_kb)
+
+    except Exception as e:
+        logger.exception("cb_refresh_itm failed")
+        await query.answer(f"Refresh failed: {type(e).__name__}", show_alert=True)
 
 
 # ---------------------------------------------------------------------------

@@ -1,280 +1,268 @@
-#!/usr/bin/env python3
 """
-itmt.py — Autonomous ITM Terminal
-Scans tickers, auto-places TOP-N orders IN PARALLEL, first fill wins,
-cancels the rest, then rescans. Runs for 1 hour or until budget allocated.
+bot/itmt.py
 
-Usage:
-    python itmt.py 6000          # $6,000 budget, 35% APY min, 1 hour
-    python itmt.py 6000 40       # $6,000 budget, 40% APY min
-    python itmt.py 6000 35 120   # $6,000 budget, 35% APY min, 2 hours
+/itmt — the ITM auto-trader. Repeatedly scans, ranks candidates by APY,
+fires the top N as parallel orders, keeps the first fill and cancels
+the rest, and loops until the budget or timeout runs out.
 """
-
-import os
-import sys
-import time
-import logging
 import asyncio
-from pathlib import Path
+import logging
+import time
 from collections import Counter
-from datetime import datetime, timedelta
 
-from dotenv import load_dotenv
+from telegram.constants import ParseMode
 
-load_dotenv()
-
-# ── project imports ────────────────────────────────────────────────────
-from schwab_client import SchwabClient
-from itm import ItmScanner
-import orders
 import github_store
+import orders
 
-# ── configuration ──────────────────────────────────────────────────────
-SCAN_CONCURRENCY = 12
-TOP_N            = 3           # try top-N per scan cycle
-FILL_WAIT_SEC    = 4           # wait per order attempt
-POLL_INTERVAL    = 1           # check fill every N sec
-DEFAULT_MIN_APY  = 35.0
-DEFAULT_TIMEOUT  = 60          # minutes
+from . import state
+from .helpers import authorized_only, _get_schwab_for_user, _edit_robust, _send_robust, _maybe_save_token
+from .state import SCAN_CONCURRENCY, TICKER_BLACKLIST, _ITMT_STOP, _ITMT_RUNNING
 
-# ── logging ────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-5s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger("itmt")
+logger = logging.getLogger(__name__)
+
+# ── ITMT configuration ────────────────────────────────────────────────
+ITMT_TOP_N         = 3
+ITMT_FILL_WAIT_SEC = 4
+ITMT_POLL_SEC      = 1
+ITMT_DEFAULT_APY   = 35.0
+ITMT_DEFAULT_MIN   = 180     # minutes (3 hours)
 
 
-# ── helpers ────────────────────────────────────────────────────────────
+@authorized_only
+async def cmd_itmt(update, context):
+    """
+    /itmt 6000          — $6k budget, 35% APY, 1 hour
+    /itmt 6000 40       — $6k budget, 40% APY min
+    /itmt 6000 35 120   — $6k budget, 35% APY, 2 hours
+    """
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Usage: `/itmt <budget> [min_apy] [timeout_min]`\n"
+            "Example: `/itmt 6000` — $6k, 35% APY, 1 hour",
+            parse_mode=ParseMode.MARKDOWN)
+        return
 
-def _bootstrap_schwab() -> SchwabClient:
-    """Create and return an authenticated SchwabClient."""
-    token_json = os.getenv("SCHWAB_TOKEN_JSON")
-    token_path = Path(os.getenv("SCHWAB_TOKEN_PATH", "token.json"))
-    if token_json and not token_path.exists():
-        token_path.write_text(token_json)
-        log.info(f"Wrote Schwab token to {token_path}")
-    client = SchwabClient(token_path=str(token_path))
-    client.initialize()
-    log.info("Schwab client initialised")
-    return client
+    user_id = update.effective_user.id
+    if user_id in _ITMT_RUNNING:
+        _ITMT_STOP.add(user_id)
+        await update.message.reply_text("⏹ Stopping previous ITMT... restarting.")
+        await asyncio.sleep(15)
+        _ITMT_STOP.discard(user_id)
 
+    budget      = float(args[0])
+    min_apy     = float(args[1]) if len(args) > 1 else ITMT_DEFAULT_APY
+    timeout_min = float(args[2]) if len(args) > 2 else ITMT_DEFAULT_MIN
+    schwab  = _get_schwab_for_user(context, user_id)
+    scanner = context.application.bot_data["itm_scanner"]
+    scanner.ticker_freqs = github_store.get_div_tickers()
 
-async def _scan_all(scanner: ItmScanner, tickers: list[str]) -> list[dict]:
-    """Run the ITM scan across all tickers with concurrency."""
-    loop = asyncio.get_running_loop()
-    sem = asyncio.Semaphore(SCAN_CONCURRENCY)
-    all_hits = []
-    errors = 0
-    debug_totals = Counter()
+    tickers = []
+    ticker_sources = {}
+    logger.info(f"ITMT: budget=${budget}, min_apy={min_apy}")
 
-    async def scan_one(tk):
-        nonlocal errors
-        async with sem:
-            try:
-                result = await loop.run_in_executor(
-                    None, lambda t=tk: scanner.scan_ticker(t)
-                )
-                if isinstance(result, tuple):
-                    hits, debug = result
-                    debug_totals.update(debug)
-                else:
-                    hits = result
-                all_hits.extend(hits)
-            except Exception as e:
-                errors += 1
-                log.debug(f"  scan error {tk}: {e}")
+    status_msg = await update.message.reply_text(
+        f"🤖 *ITMT started*\n"
+        f"Budget: ${budget:,.0f} · APY ≥ {min_apy}% · Timeout: {timeout_min:.0f}min",
+        parse_mode=ParseMode.MARKDOWN)
 
-    await asyncio.gather(*(scan_one(t) for t in tickers))
-    log.info(f"  scan complete: {len(all_hits)} hits, {errors} errors | "
-             f"debug: {dict(debug_totals)}")
-    return all_hits
-
-
-def _filter_hits(hits: list[dict], budget: float, min_apy: float) -> list[dict]:
-    """Filter by budget and APY, return sorted by APY descending."""
-    qualified = []
-    for h in hits:
-        cost = h["spot"] * 100
-        if cost > budget:
-            continue
-        pricing = orders.compute_legs_pricing(h, walk_step=0)
-        if pricing["apy"] < min_apy:
-            continue
-        qualified.append((h, pricing))
-
-    qualified.sort(key=lambda x: x[1]["apy"], reverse=True)
-    return qualified
-
-
-def _try_place(schwab: SchwabClient, hit: dict, pricing: dict) -> str | None:
-    """Build and place an ITM conversion order. Returns order_id or None."""
-    try:
-        payload = orders.build_itm_conversion_order(hit, pricing)
-        order_id = schwab.place_order(payload)
-        log.info(f"  ORDER PLACED: {order_id} · {hit['ticker']} "
-                 f"strike=${hit['strike']:g} exp={hit['exp_date']} "
-                 f"APY={pricing['apy']:.1f}%")
-        return order_id
-    except Exception as e:
-        log.warning(f"  place_order failed for {hit['ticker']}: {e}")
-        return None
-
-
-def _check_fill(schwab: SchwabClient, order_id: str) -> str:
-    """Return order status string."""
-    try:
-        data = schwab.get_order_status(order_id)
-        return data.get("status", "UNKNOWN")
-    except Exception as e:
-        log.debug(f"  status check error: {e}")
-        return "UNKNOWN"
-
-
-def _cancel(schwab: SchwabClient, order_id: str):
-    """Cancel an order, swallow errors."""
-    try:
-        schwab.cancel_order(order_id)
-        log.info(f"  CANCELLED: {order_id}")
-    except Exception as e:
-        log.warning(f"  cancel failed for {order_id}: {e}")
-
-
-# ── main loop ──────────────────────────────────────────────────────────
-
-async def run(budget: float, min_apy: float, timeout_min: float):
-    schwab = _bootstrap_schwab()
-    div_tickers = github_store.get_div_tickers()
-    scanner = ItmScanner(schwab, div_tickers)
-
-    hiv_tickers = github_store.get_latest_hiv_tickers()
-    tickers = hiv_tickers if hiv_tickers else github_store.get_tickers()
-    tickers = sorted(set(tickers))
-
+    loop      = asyncio.get_running_loop()
+    _ITMT_STOP.discard(user_id)
+    _ITMT_RUNNING.add(user_id)
     remaining = budget
-    deadline = time.time() + (timeout_min * 60)
-    cycle = 0
-    fills = []
+    deadline  = time.time() + (timeout_min * 60)
+    cycle     = 0
+    fills     = []
+    sem       = asyncio.Semaphore(SCAN_CONCURRENCY)
 
-    log.info("=" * 60)
-    log.info(f"ITMT started — budget=${budget:,.0f}  min_apy={min_apy}%  "
-             f"timeout={timeout_min}min  tickers={len(tickers)}")
-    log.info("=" * 60)
-
-    while time.time() < deadline and remaining > 0:
+    try:
+      while time.time() < deadline and remaining > 0 and user_id not in _ITMT_STOP:
         cycle += 1
         elapsed = time.time() - (deadline - timeout_min * 60)
-        log.info(f"\n{'─' * 50}")
-        log.info(f"CYCLE {cycle} | remaining=${remaining:,.0f} | "
-                 f"elapsed={elapsed:.0f}s / {timeout_min * 60:.0f}s")
-        log.info(f"{'─' * 50}")
 
-        # ── scan ────────────────────────────────────────────
-        hits = await _scan_all(scanner, tickers)
-        candidates = _filter_hits(hits, remaining, min_apy)
+        # Reload tickers every 10 cycles to pick up new ones
+        if cycle == 1 or cycle % 10 == 0:
+            try:
+                hiv_tickers = await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_latest_hiv_tickers),
+                    timeout=30)
+                new_list = hiv_tickers if hiv_tickers else await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_tickers),
+                    timeout=30)
+                new_list = sorted(set(new_list) - TICKER_BLACKLIST)
+                ticker_sources = await asyncio.wait_for(
+                    loop.run_in_executor(None, github_store.get_ticker_sources),
+                    timeout=30)
+                new_list = sorted(new_list, key=lambda t: ticker_sources.get(t, {}).get("priority", 3))
+                tickers = new_list
+                p1 = sum(1 for t in tickers if ticker_sources.get(t, {}).get("priority") == 1)
+                logger.info(f"ITMT: reloaded {len(tickers)} tickers ({p1} priority 1)")
+            except Exception as e:
+                logger.warning(f"ITMT: ticker reload failed ({e}) — keeping previous {len(tickers)} tickers")
+                if not tickers:
+                    await asyncio.sleep(10)
+                    continue
+
+        # ── scan ────────────────────────────────────────
+        all_hits = []
+        debug_totals = Counter()
+        errors = 0
+
+        async def scan_one(tk):
+            nonlocal errors
+            async with sem:
+                try:
+                    result = await loop.run_in_executor(
+                        None, lambda t=tk: scanner.scan_ticker(t))
+                    if isinstance(result, tuple):
+                        hits, debug = result
+                        debug_totals.update(debug)
+                    else:
+                        hits = result
+                    all_hits.extend(hits)
+                except Exception as e:
+                    errors += 1
+                    if errors <= 3:
+                        logger.error(f"ITMT scan error {tk}: {e}")
+
+        scan_start = time.time()
+        await asyncio.gather(*(scan_one(t) for t in tickers))
+        scan_dur = time.time() - scan_start
+        logger.info(f"ITMT cycle {cycle}: scan done in {scan_dur:.1f}s — {len(all_hits)} hits, {errors} errors")
+
+        # ── filter & rank ───────────────────────────────
+        candidates = []
+        for h in all_hits:
+            if h["spot"] * 100 > remaining:
+                continue
+            p = orders.compute_legs_pricing(h, walk_step=0)
+            if p["apy"] >= min_apy:
+                candidates.append((h, p))
+        candidates.sort(key=lambda x: x[1]["apy"], reverse=True)
+        logger.info(f"ITMT cycle {cycle}: {len(candidates)} qualified (budget ${remaining:,.0f}, min_apy {min_apy}%)")
+        if candidates:
+            for i, (h, p) in enumerate(candidates[:5]):
+                logger.info(f"  #{i+1} {h['ticker']} spot=${h['spot']:.2f} strike=${h['strike']:g} APY={p['apy']:.1f}% cost=${h['spot']*100:.0f}")
+
+        await _edit_robust(status_msg,
+            f"🤖 *ITMT cycle {cycle}*\n"
+            f"Remaining: ${remaining:,.0f} · {elapsed:.0f}s elapsed\n"
+            f"Hits: {len(all_hits)} · Qualified: {len(candidates)} · Errors: {errors}")
 
         if not candidates:
-            log.info("  no qualifying hits — rescanning in 5s...")
-            await asyncio.sleep(5)
+            if errors > len(tickers) * 0.5:
+                wait = 30
+                logger.info(f"ITMT cycle {cycle}: {errors} errors — backing off {wait}s")
+            else:
+                wait = 10
+                logger.info(f"ITMT cycle {cycle}: no candidates — sleeping {wait}s")
+            await asyncio.sleep(wait)
             continue
 
-        top = candidates[:TOP_N]
-        log.info(f"  top {len(top)} candidates:")
-        for i, (h, p) in enumerate(top, 1):
-            log.info(f"    #{i}  {h['ticker']:>5}  strike=${h['strike']:>6g}  "
-                     f"exp={h['exp_date']}  spot=${h['spot']:.2f}  "
-                     f"APY={p['apy']:.1f}%  net_credit=${p['net_credit']:.2f}")
+        top = candidates[:ITMT_TOP_N]
 
-        # ── place all top-N in parallel ─────────────────────
-        placed = []   # (order_id, hit, pricing)
-        for rank, (hit, pricing) in enumerate(top, 1):
-            order_id = _try_place(schwab, hit, pricing)
-            if order_id:
+        # ── place all top-N in parallel ─────────────────
+        placed = []
+        for hit, pricing in top:
+            try:
+                payload  = orders.build_itm_conversion_order(hit, pricing)
+                order_id = await loop.run_in_executor(
+                    None, schwab.place_order, payload)
                 placed.append((order_id, hit, pricing))
+                logger.info(f"ITMT placed {order_id} · {hit['ticker']} "
+                            f"APY={pricing['apy']:.1f}%")
+            except Exception as e:
+                logger.warning(f"ITMT place failed {hit['ticker']}: {e}")
 
+        logger.info(f"ITMT cycle {cycle}: {len(placed)} orders placed")
         if not placed:
-            log.info("  all placements failed — rescanning in 3s...")
-            await asyncio.sleep(3)
+            logger.info(f"ITMT cycle {cycle}: all placements failed — sleeping 10s")
+            await asyncio.sleep(10)
             continue
 
-        log.info(f"  {len(placed)} orders live — polling for first fill "
-                 f"({FILL_WAIT_SEC}s window)...")
+        summary = " / ".join(f"{h['ticker']} {p['apy']:.0f}%"
+                             for _, h, p in placed)
+        await _edit_robust(status_msg,
+            f"🤖 *ITMT cycle {cycle}* — {len(placed)} orders live\n"
+            f"{summary}\n"
+            f"Polling {ITMT_FILL_WAIT_SEC}s for fill...")
 
-        # ── poll all orders, first fill wins ────────────────
+        # ── poll for first fill ─────────────────────────
         winner = None
-        live = list(placed)     # copy — we'll remove dead orders
+        live = list(placed)
         start = time.time()
-        while time.time() - start < FILL_WAIT_SEC and live:
-            await asyncio.sleep(POLL_INTERVAL)
-            elapsed_poll = time.time() - start
+        while time.time() - start < ITMT_FILL_WAIT_SEC and live:
+            await asyncio.sleep(ITMT_POLL_SEC)
             still_live = []
             for oid, hit, pricing in live:
-                status = _check_fill(schwab, oid)
-                log.info(f"    {oid} {hit['ticker']:>5} {status} "
-                         f"({elapsed_poll:.1f}s)")
+                try:
+                    data   = await loop.run_in_executor(
+                        None, schwab.get_order_status, oid)
+                    status = data.get("status", "UNKNOWN")
+                except Exception:
+                    status = "UNKNOWN"
                 if status == "FILLED":
                     winner = (oid, hit, pricing)
                     break
-                if status in ("CANCELED", "REJECTED", "EXPIRED"):
-                    continue   # drop from live list
-                still_live.append((oid, hit, pricing))
+                if status not in ("CANCELED", "REJECTED", "EXPIRED"):
+                    still_live.append((oid, hit, pricing))
             if winner:
                 break
             live = still_live
 
-        # ── cancel all non-winners ──────────────────────────
+        logger.info(f"ITMT cycle {cycle}: poll done — winner={'yes' if winner else 'no'}, {len(live)} still live")
+
+        # ── cancel non-winners ──────────────────────────
         winner_oid = winner[0] if winner else None
         for oid, hit, pricing in placed:
             if oid != winner_oid:
-                _cancel(schwab, oid)
+                try:
+                    await loop.run_in_executor(None, schwab.cancel_order, oid)
+                except Exception:
+                    pass
 
+        # ── handle result ───────────────────────────────
         if winner:
             oid, hit, pricing = winner
             cost = hit["spot"] * 100
             remaining -= cost
             fills.append({
-                "ticker": hit["ticker"],
-                "strike": hit["strike"],
-                "exp": hit["exp_date"],
-                "apy": pricing["apy"],
-                "cost": cost,
-                "order_id": oid,
+                "ticker": hit["ticker"], "strike": hit["strike"],
+                "exp": hit["exp_date"], "apy": pricing["apy"],
+                "cost": cost, "order_id": oid,
             })
-            log.info(f"  ✅ FILLED: {hit['ticker']} | cost=${cost:,.0f} | "
-                     f"remaining=${remaining:,.0f}")
-        else:
-            log.info("  no fills this cycle — rescanning...")
+            github_store.save_fill({
+                "ticker": hit["ticker"], "strike": hit["strike"],
+                "exp": hit["exp_date"], "dte": hit["dte"],
+                "apy": pricing["apy"], "cost": cost,
+                "order_id": oid, "source": "itmt",
+                "scan_source": ticker_sources.get(hit["ticker"], {}).get("scan_code", "unknown"),
+            })
+            await _send_robust(update.message.reply_text,
+                f"✅ *FILLED* — {hit['ticker']} · order {oid}\n"
+                f"Strike ${hit['strike']:g} · {hit['exp_date']} "
+                f"({hit['dte']}d)\n"
+                f"APY: *{pricing['apy']:.1f}%* · Cost: ${cost:,.0f}\n"
+                f"Remaining: ${remaining:,.0f}")
 
-    # ── summary ────────────────────────────────────────────────────
-    log.info(f"\n{'=' * 60}")
-    log.info(f"ITMT COMPLETE — {len(fills)} fill(s), "
-             f"${budget - remaining:,.0f} allocated of ${budget:,.0f}")
-    log.info(f"{'=' * 60}")
-    for f in fills:
-        log.info(f"  ✅ {f['ticker']:>5}  strike=${f['strike']:g}  "
-                 f"exp={f['exp']}  APY={f['apy']:.1f}%  "
-                 f"cost=${f['cost']:,.0f}  order={f['order_id']}")
-    if not fills:
-        log.info("  no orders filled")
-    log.info("=" * 60)
+    finally:
+        _ITMT_RUNNING.discard(user_id)
+        state._LAST_TOKEN_SAVE = 0  # force save, bypass 1hr throttle
+        primary_uid = context.application.bot_data.get("primary_user_id", 0)
+        _maybe_save_token(primary_uid)
+        logger.info("ITMT exited — token saved")
 
-
-# ── entry point ────────────────────────────────────────────────────────
-
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python itmt.py <budget> [min_apy] [timeout_min]")
-        print("  e.g. python itmt.py 6000          # $6k, 35% APY, 1 hour")
-        print("       python itmt.py 6000 40 120    # $6k, 40% APY, 2 hours")
-        sys.exit(1)
-
-    budget      = float(sys.argv[1])
-    min_apy     = float(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_MIN_APY
-    timeout_min = float(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_TIMEOUT
-
-    asyncio.run(run(budget, min_apy, timeout_min))
-
-
-if __name__ == "__main__":
-    main()
+    # ── final summary ───────────────────────────────────
+    if fills:
+        lines = [f"🤖 *ITMT COMPLETE* — {len(fills)} fill(s), "
+                 f"${budget - remaining:,.0f} of ${budget:,.0f} deployed\n"]
+        for f in fills:
+            lines.append(f"✅ {f['ticker']} ${f['strike']:g} "
+                         f"{f['exp']} APY={f['apy']:.1f}% "
+                         f"${f['cost']:,.0f}")
+        await _send_robust(update.message.reply_text, "\n".join(lines))
+    else:
+        await _edit_robust(status_msg,
+            f"🤖 *ITMT COMPLETE* — no fills after {cycle} cycles.\n"
+            f"Budget ${budget:,.0f} unallocated.")

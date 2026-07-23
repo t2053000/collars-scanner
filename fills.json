@@ -439,5 +439,17 @@
     "source": "manual",
     "scan_source": "HOT_BY_OPT_VOLUME",
     "timestamp": "2026-07-23T15:55:42.033382"
+  },
+  {
+    "ticker": "POET",
+    "strike": 6.0,
+    "exp": "2026-07-31",
+    "dte": 7,
+    "apy": 50.1,
+    "cost": 758.0,
+    "order_id": "1007316442571",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-23T19:47:48.753310"
   }
 ]

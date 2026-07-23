@@ -372,49 +372,90 @@ async def _run_scan(update, context, scanner, label_emoji, format_summary_fn,
 # Trade buttons
 # ---------------------------------------------------------------------------
 
+def _format_itm_card_text(hit: dict, submitted: int = 0, filled: int = 0) -> str:
+    apy = hit.get("locked_apy", 0)
+    return (
+        f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
+        f"Strike ${hit['strike']:g} · Net credit ${hit.get('net_credit', 0):.2f}/sh\n"
+        f"💳 Pay ${hit.get('primary_debit', 0):.2f}/sh → *{apy:.1f}% APY*\n"
+        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit.get('locked_total', 0):.0f}"
+    )
+
+
+def _build_itm_card_keyboard(trade_id: str, hit: dict, submitted: int, filled: int) -> InlineKeyboardMarkup:
+    buttons = []
+    seen_apys = set()
+
+    for ws in range(MAX_WALK_STEPS):
+        try:
+            p = orders.compute_legs_pricing(hit, walk_step=ws)
+            apy = p["apy"]
+            if apy < orders.MIN_APY_FLOOR_PCT:
+                continue
+            rounded = round(apy, 1)
+            if rounded in seen_apys:
+                continue
+            seen_apys.add(rounded)
+
+            emoji = "📈" if ws == 0 else "📊" if ws <= 3 else "📉"
+            buttons.append(InlineKeyboardButton(
+                f"{emoji} {apy:.0f}%",
+                callback_data=f"confirm_trade:{trade_id}:{ws}"
+            ))
+        except Exception:
+            pass
+
+    if not buttons:
+        apy = hit.get("locked_apy", 0)
+        buttons.append(InlineKeyboardButton(
+            f"✅ {apy:.0f}%", callback_data=f"confirm_trade:{trade_id}:0"
+        ))
+
+    status = f"📤{submitted} ✅{filled}"
+    action_row = [
+        InlineKeyboardButton(status, callback_data="noop"),
+        InlineKeyboardButton("🔄", callback_data=f"refresh_itm:{trade_id}"),
+    ]
+
+    rows = []
+    for i in range(0, len(buttons), 4):
+        rows.append(buttons[i:i + 4])
+    rows.append(action_row)
+    return InlineKeyboardMarkup(rows)
+
 async def _send_itm_trade_button(update, context, hit):
     trade_id = uuid.uuid4().hex[:8]
     user_id  = update.effective_user.id
     apy      = hit.get("locked_apy", 0)
     logger.info(f"_send_itm_trade_button: user={user_id} trade_id={trade_id} ticker={hit.get('ticker')} apy={apy}")
+
     _PENDING_TRADES[(user_id, trade_id)] = {
         "hit":        hit,
         "walk_step":  0,
         "expires_at": time.time() + PENDING_TIMEOUT_SEC * 30,
         "reverse":    False,
         "trade_type": "itm",
+        "submitted":  0,
+        "filled":     0,
     }
-    summary = (
-        f"🔒 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d)\n"
-        f"Strike ${hit['strike']:g} · Net credit ${hit.get('net_credit', 0):.2f}/sh\n"
-        f"💳 Pay ${hit.get('primary_debit', 0):.2f}/sh → *{apy:.1f}% APY*\n"
-        f"OI {hit['call_oi']}/{hit['put_oi']} · Locked ${hit.get('locked_total', 0):.0f}"
-    )
-    # Build multi-tier APY buttons
-    buttons = []
-    for ws in range(3):
-        try:
-            p = orders.compute_legs_pricing(hit, walk_step=ws)
-            if p["apy"] >= orders.MIN_APY_FLOOR_PCT:
-                buttons.append(InlineKeyboardButton(
-                    f"{'📈' if ws == 0 else '📊' if ws == 1 else '📉'} {p['apy']:.0f}%",
-                    callback_data=f"confirm_trade:{trade_id}:{ws}"))
-        except Exception:
-            pass
-    if not buttons:
-        buttons.append(InlineKeyboardButton(
-            f"✅ Confirm @ {apy:.1f}%", callback_data=f"confirm_trade:{trade_id}:0"))
-    buttons.append(InlineKeyboardButton("❌", callback_data=f"cancel_trade:{trade_id}"))
-    keyboard = InlineKeyboardMarkup([buttons])
+
+    summary  = _format_itm_card_text(hit, 0, 0)
+    keyboard = _build_itm_card_keyboard(trade_id, hit, 0, 0)
+
     try:
-        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
+        msg = await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
     except BadRequest as e:
         logger.warning(f"itm trade button markdown failed: {e}")
         plain = summary.replace("*", "").replace("_", "").replace("`", "")
         try:
-            await update.message.reply_text(plain, reply_markup=keyboard)
+            msg = await update.message.reply_text(plain, reply_markup=keyboard)
         except BadRequest as e2:
             logger.error(f"itm trade button failed even plain: {e2}")
+            return
+
+    # store message identity so we can edit it later
+    _PENDING_TRADES[(user_id, trade_id)]["message_id"] = msg.message_id
+    _PENDING_TRADES[(user_id, trade_id)]["chat_id"]    = msg.chat_id
 
 
 async def _send_dca_trade_button(update, context, hit):
@@ -636,27 +677,29 @@ async def cmd_itmib(update, context):
 # ---------------------------------------------------------------------------
 
 @authorized_callback
+@authorized_callback
 async def cb_confirm_trade(update, context):
     query    = update.callback_query
     user_id  = update.effective_user.id
     parts    = query.data.split(":")
     trade_id = parts[1]
-    walk_step_override = int(parts[2]) if len(parts) > 2 else None
-    logger.info(f"cb_confirm_trade FIRED user={user_id} trade_id={trade_id} ws={walk_step_override}")
+    walk_step = int(parts[2]) if len(parts) > 2 else 0
+
     await query.answer()
+
     pending = _PENDING_TRADES.get((user_id, trade_id))
     if not pending or time.time() > pending.get("expires_at", 0):
-        await _edit_robust(query.message, "Trade expired. Re-run /itm.")
+        await query.answer("Card expired. Re-run /itm.", show_alert=True)
         return
-    hit       = pending["hit"]
-    walk_step = walk_step_override if walk_step_override is not None else pending["walk_step"]
+
+    hit = pending["hit"]
     try:
         pricing = orders.compute_legs_pricing(hit, walk_step=walk_step)
     except Exception as e:
         logger.exception("cb_confirm_trade: pricing failed")
-        await _edit_robust(query.message, f"Pricing failed: {type(e).__name__}: {e}")
+        await query.answer(f"Pricing failed: {e}", show_alert=True)
         return
-    await _edit_robust(query.message, f"Submitting {hit['ticker']} ITM @ {pricing['apy']:.1f}% APY...")
+
     schwab = _get_schwab_for_user(context, user_id)
     loop   = asyncio.get_running_loop()
     try:
@@ -665,17 +708,27 @@ async def cb_confirm_trade(update, context):
         logger.info(f"cb_confirm_trade: order placed id={order_id} ticker={hit['ticker']}")
     except Exception as e:
         logger.exception("cb_confirm_trade: place_order failed")
-        await _edit_robust(query.message, f"Order rejected: {type(e).__name__}: {str(e)[:300]}")
+        await query.answer(f"Order rejected: {type(e).__name__}: {str(e)[:120]}", show_alert=True)
         return
-    del _PENDING_TRADES[(user_id, trade_id)]
+
+    # update counters on the living card
+    pending["submitted"] = pending.get("submitted", 0) + 1
+    _PENDING_TRADES[(user_id, trade_id)] = pending
+
+    new_text = _format_itm_card_text(hit, pending["submitted"], pending.get("filled", 0))
+    new_kb   = _build_itm_card_keyboard(trade_id, hit, pending["submitted"], pending.get("filled", 0))
+    await _edit_robust(query.message, new_text, reply_markup=new_kb)
+
     _ACTIVE_ORDERS[order_id] = {
-        "order_id": order_id, "user_id": user_id, "hit": hit, "pricing": pricing,
-        "walk_step": walk_step, "trade_type": "itm",
+        "order_id":   order_id,
+        "user_id":    user_id,
+        "hit":        hit,
+        "pricing":    pricing,
+        "walk_step":  walk_step,
+        "trade_type": "itm",
+        "trade_id":   trade_id,          # needed so monitor can update the card
     }
-    await _edit_robust(query.message,
-        f"Order *{order_id}* submitted · {hit['ticker']} ITM\n"
-        f"Limit: ${pricing['call_limit']:.2f} sell / ${pricing['put_limit']:.2f} buy\n"
-        f"APY: *{pricing['apy']:.1f}%*\nMonitoring (8s)...")
+    # still start the short monitor (it will only bump the filled counter)
     asyncio.create_task(monitor_order(context, user_id, order_id, query.message))
 
 
@@ -830,40 +883,39 @@ async def monitor_order(context, user_id, order_id, status_msg):
             logger.warning(f"order status poll failed: {e}")
             continue
     if filled:
-        active = _ACTIVE_ORDERS.pop(order_id, None)
-        tkr    = active["hit"]["ticker"] if active else "?"
-        await _edit_robust(status_msg, f"FILLED — order {order_id} for {tkr}")
-        if active:
-            sources = github_store.get_ticker_sources()
-            github_store.save_fill({
-                "ticker": active["hit"]["ticker"],
-                "strike": active["hit"].get("strike"),
-                "exp": active["hit"].get("exp_date"),
-                "dte": active["hit"].get("dte"),
-                "apy": active["pricing"].get("apy"),
-                "cost": active["hit"].get("spot", 0) * 100,
-                "order_id": order_id, "source": "manual",
-                "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
-            })
-        return
-    active = _ACTIVE_ORDERS.get(order_id)
+    active = _ACTIVE_ORDERS.pop(order_id, None)
     if not active:
         return
-    hit          = active["hit"]
-    walk_step    = active["walk_step"]
-    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
-    improve_ok   = orders.can_improve(next_pricing)
-    buttons = []
-    if improve_ok:
-        buttons.append([InlineKeyboardButton(
-            f"Improve -> {next_pricing['apy']:.1f}% APY", callback_data=f"improve:{order_id}")])
-    buttons.append([InlineKeyboardButton("Cancel order", callback_data=f"cancel:{order_id}")])
-    floor_note = f"\nCannot improve — below {orders.MIN_APY_FLOOR_PCT:g}% floor." if not improve_ok else ""
-    await _edit_robust(status_msg,
-        f"Order {order_id} for *{hit['ticker']}* not filled after 8s.\n"
-        f"Limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
-        f"APY: {active['pricing']['apy']:.1f}%{floor_note}",
-        reply_markup=InlineKeyboardMarkup(buttons))
+
+    # bump filled counter on the original card if we still have it
+    trade_id = active.get("trade_id")
+    if trade_id:
+        key = (user_id, trade_id)
+        pending = _PENDING_TRADES.get(key)
+        if pending:
+            pending["filled"] = pending.get("filled", 0) + 1
+            _PENDING_TRADES[key] = pending
+            new_text = _format_itm_card_text(pending["hit"], pending.get("submitted", 0), pending["filled"])
+            new_kb   = _build_itm_card_keyboard(trade_id, pending["hit"],
+                                               pending.get("submitted", 0), pending["filled"])
+            try:
+                await _edit_robust(status_msg, new_text, reply_markup=new_kb)
+            except Exception as e:
+                logger.warning(f"could not update card on fill: {e}")
+
+    # still save the fill record (existing logic)
+    sources = github_store.get_ticker_sources()
+    github_store.save_fill({
+        "ticker": active["hit"]["ticker"],
+        "strike": active["hit"].get("strike"),
+        "exp": active["hit"].get("exp_date"),
+        "dte": active["hit"].get("dte"),
+        "apy": active["pricing"].get("apy"),
+        "cost": active["hit"].get("spot", 0) * 100,
+        "order_id": order_id, "source": "manual",
+        "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
+    })
+    return
 
 
 # ---------------------------------------------------------------------------

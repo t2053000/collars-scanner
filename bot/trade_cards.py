@@ -68,6 +68,7 @@ def _build_itm_card_keyboard(trade_id: str, hit: dict, submitted: int, filled: i
     action_row = [
         InlineKeyboardButton(status, callback_data="noop"),
         InlineKeyboardButton("🔄", callback_data=f"refresh_itm:{trade_id}"),
+        InlineKeyboardButton("❌", callback_data=f"cancel_ticker:{trade_id}"),
     ]
 
     rows = []
@@ -172,26 +173,4 @@ async def _send_rtrade_button(update, context, hit):
     ex_div_warn = f"\n🚨 EX-DIV {hit.get('next_ex_div_date', '')} BEFORE EXPIRY" if hit.get("ex_div_in_window") else ""
     ex_div_str  = f" · ex-div {hit['next_ex_div_date']}" if hit.get("next_ex_div_date") and not hit.get("ex_div_in_window") else ""
     borrow_str  = f" · borrow -{hit['borrow_cost']:.2f}" if hit.get("borrow_cost", 0) > 0 else ""
-    fallback_line = f"🔄 Fallback -> {hit['fallback_apy']:.1f}% APY\n" if hit.get("fallback_apy", 0) > 0 else ""
-    summary = (
-        f"🔄 *{hit['ticker']}* @ ${hit['spot']} · {hit['exp_date']} ({hit['dte']}d){htb_flag}\n"
-        f"Strike ${hit['strike']:g} · Net credit ${hit['net_credit']:.2f}/sh{ex_div_str}{borrow_str}\n"
-        f"💰 Locked ${hit['locked_total']:.0f} → *{apy:.1f}% APY*\n"
-        f"{fallback_line}"
-        f"OI {hit['call_oi']}/{hit['put_oi']}"
-        f"{ex_div_warn}\n"
-        f"⚠️ SHORT {hit['ticker']} ON SCHWAB FIRST, then confirm"
-    )
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Confirm R @ {apy:.1f}% APY", callback_data=f"confirm_rtrade:{trade_id}"),
-        InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_rtrade:{trade_id}"),
-    ]])
-    try:
-        await update.message.reply_text(summary, parse_mode=ParseMode.MARKDOWN, reply_markup=keyboard)
-    except BadRequest as e:
-        logger.warning(f"rtrade button markdown failed: {e}")
-        plain = summary.replace("*", "").replace("_", "").replace("`", "")
-        try:
-            await update.message.reply_text(plain, reply_markup=keyboard)
-        except BadRequest as e2:
-            logger.error(f"rtrade button failed even plain: {e2}")
+    fallback_line = f"🔄 Fallback -> {hit['fallback_apy']:.1f}% APY\n" if hit.get("fallback

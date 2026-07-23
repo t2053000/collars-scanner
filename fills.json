@@ -427,5 +427,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-22T17:55:10.645627"
+  },
+  {
+    "ticker": "AAL",
+    "strike": 12.5,
+    "exp": "2026-08-07",
+    "dte": 14,
+    "apy": 14.1,
+    "cost": 1357.0,
+    "order_id": "1007308124943",
+    "source": "manual",
+    "scan_source": "HOT_BY_OPT_VOLUME",
+    "timestamp": "2026-07-23T15:55:42.033382"
   }
 ]

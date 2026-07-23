@@ -882,7 +882,8 @@ async def monitor_order(context, user_id, order_id, status_msg):
         except Exception as e:
             logger.warning(f"order status poll failed: {e}")
             continue
-                if filled:
+
+    if filled:
         active = _ACTIVE_ORDERS.pop(order_id, None)
         if not active:
             return
@@ -925,61 +926,26 @@ async def monitor_order(context, user_id, order_id, status_msg):
             "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
         })
         return
-# ---------------------------------------------------------------------------
-# Order monitoring — Reverse ITM
-# ---------------------------------------------------------------------------
 
-async def monitor_rtrade_order(context, user_id, order_id, status_msg, ticker):
-    logger.info(f"monitor_rtrade_order START: user={user_id} order={order_id}")
-    schwab = _get_schwab_for_user(context, user_id)
-    loop   = asyncio.get_running_loop()
-    start  = time.time()
-    filled = False
-    while time.time() - start < 8:
-        await asyncio.sleep(2)
-        try:
-            status     = await loop.run_in_executor(None, schwab.get_order_status, order_id)
-            status_str = status.get("status", "UNKNOWN")
-            logger.info(f"monitor_rtrade_order: id={order_id} status={status_str}")
-            if status_str == "FILLED":
-                filled = True
-                break
-            if status_str in ("CANCELED", "REJECTED", "EXPIRED"):
-                _ACTIVE_ORDERS.pop(order_id, None)
-                await _edit_robust(status_msg, f"Order {order_id} for {ticker} ended: {status_str}")
-                return
-        except Exception as e:
-            logger.warning(f"monitor_rtrade_order: poll failed: {e}")
-            continue
-    _ACTIVE_ORDERS.pop(order_id, None)
-    if filled:
-        try:
-            short_payload  = orders.build_short_stock_order(ticker)
-            short_order_id = await loop.run_in_executor(None, schwab.place_order, short_payload)
-            logger.info(f"monitor_rtrade_order: short placed id={short_order_id} ticker={ticker}")
-            await _edit_robust(status_msg,
-                f"OPTIONS FILLED — order {order_id} · {ticker}\n"
-                f"SHORT order *{short_order_id}* submitted · SELL SHORT 100 {ticker} @ MKT\n"
-                f"Check Schwab to confirm both legs are working.")
-        except Exception as e:
-            logger.exception(f"monitor_rtrade_order: short stock order failed: {e}")
-            await _edit_robust(status_msg,
-                f"OPTIONS FILLED — order {order_id} · {ticker}\n"
-                f"SHORT order FAILED: {type(e).__name__}: {str(e)[:200]}\n"
-                f"SHORT {ticker} MANUALLY ON SCHWAB NOW.")
-    else:
-        try:
-            await loop.run_in_executor(None, schwab.cancel_order, order_id)
-            await _edit_robust(status_msg,
-                f"Order {order_id} · {ticker} not filled after 8s — auto-cancelled.\n"
-                f"Re-run /itm r to try again.")
-            logger.info(f"monitor_rtrade_order: auto-cancelled {order_id} for {ticker}")
-        except Exception as e:
-            logger.warning(f"monitor_rtrade_order: auto-cancel failed: {e}")
-            await _edit_robust(status_msg,
-                f"Order {order_id} · {ticker} not filled after 8s.\n"
-                f"Auto-cancel failed — cancel manually on Schwab.\n"
-                f"Do NOT short {ticker} manually.")
+    # not filled after 8s — offer improve / cancel
+    active = _ACTIVE_ORDERS.get(order_id)
+    if not active:
+        return
+    hit          = active["hit"]
+    walk_step    = active["walk_step"]
+    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
+    improve_ok   = orders.can_improve(next_pricing)
+    buttons = []
+    if improve_ok:
+        buttons.append([InlineKeyboardButton(
+            f"Improve -> {next_pricing['apy']:.1f}% APY", callback_data=f"improve:{order_id}")])
+    buttons.append([InlineKeyboardButton("Cancel order", callback_data=f"cancel:{order_id}")])
+    floor_note = f"\nCannot improve — below {orders.MIN_APY_FLOOR_PCT:g}% floor." if not improve_ok else ""
+    await _edit_robust(status_msg,
+        f"Order {order_id} for *{hit['ticker']}* not filled after 8s.\n"
+        f"Limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
+        f"APY: {active['pricing']['apy']:.1f}%{floor_note}",
+        reply_markup=InlineKeyboardMarkup(buttons))
 
 
 # ---------------------------------------------------------------------------

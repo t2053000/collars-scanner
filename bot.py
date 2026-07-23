@@ -882,7 +882,7 @@ async def monitor_order(context, user_id, order_id, status_msg):
         except Exception as e:
             logger.warning(f"order status poll failed: {e}")
             continue
-        if filled:
+            if filled:
         active = _ACTIVE_ORDERS.pop(order_id, None)
         if not active:
             return
@@ -925,7 +925,6 @@ async def monitor_order(context, user_id, order_id, status_msg):
             "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
         })
         return
-
 # ---------------------------------------------------------------------------
 # Order monitoring — Reverse ITM
 # ---------------------------------------------------------------------------

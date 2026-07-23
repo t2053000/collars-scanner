@@ -882,41 +882,49 @@ async def monitor_order(context, user_id, order_id, status_msg):
         except Exception as e:
             logger.warning(f"order status poll failed: {e}")
             continue
-    if filled:
-    active = _ACTIVE_ORDERS.pop(order_id, None)
-    if not active:
+        if filled:
+        active = _ACTIVE_ORDERS.pop(order_id, None)
+        if not active:
+            return
+
+        # bump filled counter on the original card if we still have it
+        trade_id = active.get("trade_id")
+        if trade_id:
+            key = (user_id, trade_id)
+            pending = _PENDING_TRADES.get(key)
+            if pending:
+                pending["filled"] = pending.get("filled", 0) + 1
+                _PENDING_TRADES[key] = pending
+                new_text = _format_itm_card_text(
+                    pending["hit"],
+                    pending.get("submitted", 0),
+                    pending["filled"]
+                )
+                new_kb = _build_itm_card_keyboard(
+                    trade_id,
+                    pending["hit"],
+                    pending.get("submitted", 0),
+                    pending["filled"]
+                )
+                try:
+                    await _edit_robust(status_msg, new_text, reply_markup=new_kb)
+                except Exception as e:
+                    logger.warning(f"could not update card on fill: {e}")
+
+        # still save the fill record
+        sources = github_store.get_ticker_sources()
+        github_store.save_fill({
+            "ticker": active["hit"]["ticker"],
+            "strike": active["hit"].get("strike"),
+            "exp": active["hit"].get("exp_date"),
+            "dte": active["hit"].get("dte"),
+            "apy": active["pricing"].get("apy"),
+            "cost": active["hit"].get("spot", 0) * 100,
+            "order_id": order_id,
+            "source": "manual",
+            "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
+        })
         return
-
-    # bump filled counter on the original card if we still have it
-    trade_id = active.get("trade_id")
-    if trade_id:
-        key = (user_id, trade_id)
-        pending = _PENDING_TRADES.get(key)
-        if pending:
-            pending["filled"] = pending.get("filled", 0) + 1
-            _PENDING_TRADES[key] = pending
-            new_text = _format_itm_card_text(pending["hit"], pending.get("submitted", 0), pending["filled"])
-            new_kb   = _build_itm_card_keyboard(trade_id, pending["hit"],
-                                               pending.get("submitted", 0), pending["filled"])
-            try:
-                await _edit_robust(status_msg, new_text, reply_markup=new_kb)
-            except Exception as e:
-                logger.warning(f"could not update card on fill: {e}")
-
-    # still save the fill record (existing logic)
-    sources = github_store.get_ticker_sources()
-    github_store.save_fill({
-        "ticker": active["hit"]["ticker"],
-        "strike": active["hit"].get("strike"),
-        "exp": active["hit"].get("exp_date"),
-        "dte": active["hit"].get("dte"),
-        "apy": active["pricing"].get("apy"),
-        "cost": active["hit"].get("spot", 0) * 100,
-        "order_id": order_id, "source": "manual",
-        "scan_source": sources.get(active["hit"]["ticker"], {}).get("scan_code", "unknown"),
-    })
-    return
-
 
 # ---------------------------------------------------------------------------
 # Order monitoring — Reverse ITM

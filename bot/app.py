@@ -17,7 +17,7 @@ from .commands_scanners import (
     cmd_scan, cmd_spreads, cmd_deepcall, cmd_dca, cmd_csp, cmd_itm, cmd_ritm, cmd_itmib,
 )
 from .callbacks_trade import (
-    cb_confirm_trade, cb_cancel_trade,
+    cb_confirm_trade, cb_cancel_trade, cb_refresh_itm,
     cb_confirm_dca, cb_cancel_dca,
     cb_confirm_rtrade, cb_cancel_rtrade,
 )
@@ -32,6 +32,7 @@ def build_app(telegram_token, collar_scanner, spread_scanner, deepcall_scanner,
               dca_scanner, csp_scanner, itm_scanner, ritm_scanner,
               schwab_clients: dict, primary_user_id: int, itm_ibkr_scanner=None):
     app = Application.builder().token(telegram_token).concurrent_updates(True).build()
+    app.add_handler(CallbackQueryHandler(cb_refresh_itm, pattern=r"^refresh_itm:"))
     app.bot_data["collar_scanner"]    = collar_scanner
     app.bot_data["spread_scanner"]    = spread_scanner
     app.bot_data["deepcall_scanner"]  = deepcall_scanner

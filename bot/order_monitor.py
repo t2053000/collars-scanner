@@ -95,25 +95,13 @@ async def monitor_order(context, user_id, order_id, status_msg):
         })
         return
 
-    # not filled after 8s — offer improve / cancel
-    active = _ACTIVE_ORDERS.get(order_id)
+    # not filled after 8s — expire (main card X handles cancel; no improve/cancel card)
+    active = _ACTIVE_ORDERS.pop(order_id, None)
     if not active:
         return
-    hit          = active["hit"]
-    walk_step    = active["walk_step"]
-    next_pricing = orders.compute_legs_pricing(hit, walk_step=walk_step + 1)
-    improve_ok   = orders.can_improve(next_pricing)
-    buttons = []
-    if improve_ok:
-        buttons.append([InlineKeyboardButton(
-            f"Improve -> {next_pricing['apy']:.1f}% APY", callback_data=f"improve:{order_id}")])
-    buttons.append([InlineKeyboardButton("Cancel order", callback_data=f"cancel:{order_id}")])
-    floor_note = f"\nCannot improve — below {orders.MIN_APY_FLOOR_PCT:g}% floor." if not improve_ok else ""
+    hit = active["hit"]
     await _edit_robust(status_msg,
-        f"Order {order_id} for *{hit['ticker']}* not filled after 8s.\n"
-        f"Limit: ${active['pricing']['call_limit']:.2f} / ${active['pricing']['put_limit']:.2f}\n"
-        f"APY: {active['pricing']['apy']:.1f}%{floor_note}",
-        reply_markup=InlineKeyboardMarkup(buttons))
+        f"Order {order_id} for *{hit['ticker']}* not filled after 8s (expired).")
 
 
 # ---------------------------------------------------------------------------

@@ -499,5 +499,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-24T13:40:35.559433"
+  },
+  {
+    "ticker": "BFLY",
+    "strike": 5.0,
+    "exp": "2026-08-21",
+    "dte": 27,
+    "apy": 15.6,
+    "cost": 653.0,
+    "order_id": "1007320308376",
+    "source": "manual",
+    "scan_source": "HIGH_OPT_IMP_VOLAT",
+    "timestamp": "2026-07-24T13:58:40.941653"
   }
 ]

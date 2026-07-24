@@ -451,5 +451,17 @@
     "source": "manual",
     "scan_source": "HIGH_OPT_IMP_VOLAT",
     "timestamp": "2026-07-23T19:47:48.753310"
+  },
+  {
+    "ticker": "ONDS",
+    "strike": 6.0,
+    "exp": "2026-07-31",
+    "dte": 6,
+    "apy": 37.8,
+    "cost": 770.0,
+    "order_id": "1007318471610",
+    "source": "manual",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-24T13:39:33.211277"
   }
 ]

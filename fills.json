@@ -463,5 +463,17 @@
     "source": "manual",
     "scan_source": "unknown",
     "timestamp": "2026-07-24T13:39:33.211277"
+  },
+  {
+    "ticker": "ONDS",
+    "strike": 6.5,
+    "exp": "2026-07-31",
+    "dte": 6,
+    "apy": 25.4,
+    "cost": 770.0,
+    "order_id": "1007318471651",
+    "source": "manual",
+    "scan_source": "unknown",
+    "timestamp": "2026-07-24T13:39:46.971503"
   }
 ]
